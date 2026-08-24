@@ -2,6 +2,7 @@
 
 状态：首版验收基线
 关联设计：[design.md](design.md)
+测试环境：[testing.md](testing.md)
 
 ## 1. 验收目标
 
@@ -50,6 +51,8 @@
 
 - 临时本地 P4 Server 和临时 depot/client；或
 - 经用户明确批准、初始干净、可丢弃的专用测试 depot/client/CL。
+
+默认实现采用 [testing.md](testing.md) 定义的 loopback、每轮独立、进程与路径均可验证的一次性 `p4d`。Level C harness 不得 fallback 到用户默认 `P4PORT`、`.p4config` 或日常 workspace。
 
 禁止将日常开发 CL、共享项目资产、他人 shelved CL 或无法恢复的 workspace 用作写入 fixture。
 

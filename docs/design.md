@@ -5,6 +5,7 @@
 目标宿主：Herdr 0.8.2 或更高版本
 暂定仓库名：`herdr-perforce`
 暂定二进制名：`herdr-p4`
+测试环境：[testing.md](testing.md)
 
 ## 1. 产品定义
 
@@ -627,6 +628,7 @@ src/
 - Herdr plugin contract：<https://herdr.dev/docs/plugins/>
 - Herdr socket API：<https://herdr.dev/docs/socket-api/>
 - Architecture Decision Records：[adr/README.md](adr/README.md)
+- 本机 fake/P4D 测试环境：[testing.md](testing.md)
 - `herdr-reviewr`：<https://github.com/persiyanov/herdr-reviewr>
 - `herdr-co-review`：<https://github.com/elKei24/herdr-co-review>
 - `p4-diff`：<https://github.com/JonParr/p4-diff>
