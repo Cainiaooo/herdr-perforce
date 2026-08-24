@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local test and tool artifacts
+.link-docs.patch
+*.log
+.env
+.env.*
+!.env.example
+
+# Project-local Perforce configuration must not affect the test harness
+.p4config
+
+# Editor and operating-system artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
