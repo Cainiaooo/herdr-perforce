@@ -100,19 +100,19 @@ pub fn parse_json_records(bytes: &[u8]) -> Result<Vec<StructuredRecord>, ParseEr
                 kind: ParseErrorKind::ExpectedObject,
             });
         };
-        let code_value = object.remove("code").ok_or(ParseError {
-            line: line_number,
-            kind: ParseErrorKind::MissingCode,
-        })?;
-        let Value::String(code) = code_value else {
-            return Err(ParseError {
-                line: line_number,
-                kind: ParseErrorKind::InvalidCode,
-            });
+        let code = match object.remove("code") {
+            None => inferred_record_code(&object),
+            Some(Value::String(code)) => record_code(&code),
+            Some(_) => {
+                return Err(ParseError {
+                    line: line_number,
+                    kind: ParseErrorKind::InvalidCode,
+                });
+            }
         };
 
         records.push(StructuredRecord {
-            code: record_code(&code),
+            code,
             fields: object.into_iter().collect(),
         });
     }
@@ -409,6 +409,23 @@ fn record_code(code: &str) -> RecordCode {
     }
 }
 
+fn inferred_record_code(object: &serde_json::Map<String, Value>) -> RecordCode {
+    if let Some(severity) = object.get("severity") {
+        return match value_as_string(severity).and_then(|value| value.parse::<u8>().ok()) {
+            Some(0) => RecordCode::Text,
+            Some(1) => RecordCode::Info,
+            Some(2) => RecordCode::Warning,
+            Some(_) | None => RecordCode::Error,
+        };
+    }
+
+    if object.contains_key("data") || object.contains_key("level") {
+        RecordCode::Info
+    } else {
+        RecordCode::Stat
+    }
+}
+
 fn required_string(
     record: &StructuredRecord,
     index: usize,
@@ -468,6 +485,42 @@ mod tests {
         assert_eq!(records[0].string("futureField").as_deref(), Some("kept"));
         assert_eq!(records[1].code, RecordCode::Unknown("future".into()));
         assert_eq!(records[1].string("value").as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn real_mj_stat_record_without_code_is_accepted() {
+        let records = parse_json_records(
+            br#"{"serverAddress":"ExampleHost:1666","clientName":"ExampleClient","caseHandling":"insensitive"}"#,
+        )
+        .expect("successful -Mj records omit code");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].code, RecordCode::Stat);
+        assert_eq!(
+            records[0].string("serverAddress").as_deref(),
+            Some("ExampleHost:1666")
+        );
+    }
+
+    #[test]
+    fn real_mj_diagnostics_without_code_are_classified_by_severity() {
+        let records = parse_json_records(
+            b"{\"data\":\"can't edit exclusive file\",\"generic\":0,\"severity\":2}\n\
+              {\"data\":\"also opened by another client\",\"level\":1}",
+        )
+        .expect("real -Mj diagnostics should parse");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].code, RecordCode::Warning);
+        assert_eq!(records[1].code, RecordCode::Info);
+    }
+
+    #[test]
+    fn non_string_explicit_code_is_rejected() {
+        let error = parse_json_records(br#"{"code":7,"change":"42"}"#)
+            .expect_err("explicit code must remain a string");
+
+        assert_eq!(error.kind, ParseErrorKind::InvalidCode);
     }
 
     #[test]

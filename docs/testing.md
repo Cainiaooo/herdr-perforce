@@ -4,6 +4,15 @@
 适用范围：Windows 优先的 Herdr Perforce 侧边栏扩展  
 关联文档：[设计目标](design.md) · [验收标准](acceptance.md)
 
+## 当前验收记录
+
+| 层级 | 状态 | 执行日期 | 实际结果 |
+|---|---|---|---|
+| Level A | 已验收 | 2026-08-25 | `cargo fmt --check`、Clippy、build 和 `cargo test --workspace` 通过；共 52 个测试 |
+| Level B | 部分完成 | 2026-08-25 | 显式只读 runner 的真实 `info/changes/describe/opened` 通过；当前仓库 cwd 不在 client view，`where` 明确 skip，未回退配置 |
+
+本记录确认 Level A 离线自动化门禁与一次 Level B 部分兼容验证；Level B 的 mapped `where`、Level C 和 Herdr pane 集成尚未完成验收。
+
 ## 1. 目标
 
 本方案把测试分成三个层级，并明确本机 Perforce 环境的创建、使用和清理边界：
@@ -57,6 +66,15 @@ Level B 用于确认扩展能理解真实服务器、代理、字符集和 works
 - 测试前打印脱敏后的 server、user、client 和 charset 摘要，并再次声明“只读”。
 - 禁止 `edit`、`add`、`revert`、`shelve`、`submit`、client/spec 修改等写命令。
 - 服务器不可达、ticket 过期或路径未映射时应跳过或给出明确诊断，不得回退到其他配置。
+
+当前入口：
+
+```text
+cargo run -- level-b --read-only
+cargo run -- level-b --read-only --cwd <mapped-workspace-path>
+```
+
+`--read-only` 是必需的显式确认。相对 `--cwd` 会相对进程目录拼接为绝对路径，不 `canonicalize`。runner 固定限制 pending 查询最多返回 8 条，只对其中一条执行 `describe -s` 与 `opened -c`，并对 `<cwd>/...` 执行 `where`（探测 client view 内的路径，而不是 workspace 根目录本身）；输出中的 server、user 和 client 仅显示域分离的短指纹，不输出 changelist 编号、描述、文件名或本地路径。任何连接、认证、权限或解析错误都会停止，不尝试其他 P4 配置；cwd 未映射或 `where` 没有 Stat mapping record 则记录为 `completed-with-skip`。
 
 ### 2.3 Level C：一次性 loopback `p4d`
 

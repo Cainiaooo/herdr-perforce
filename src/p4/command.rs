@@ -8,10 +8,24 @@ use crate::domain::ChangelistId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum P4Query {
     Info,
-    PendingChanges { user: String, client: String },
-    Opened { change: ChangelistId },
-    DescribeSummary { change: u64 },
-    Where { path: PathBuf },
+    PendingChanges {
+        user: String,
+        client: String,
+    },
+    PendingChangesLimited {
+        user: String,
+        client: String,
+        max_results: u16,
+    },
+    Opened {
+        change: ChangelistId,
+    },
+    DescribeSummary {
+        change: u64,
+    },
+    Where {
+        path: PathBuf,
+    },
 }
 
 impl P4Query {
@@ -23,6 +37,23 @@ impl P4Query {
             Self::PendingChanges { user, client } => {
                 args.extend([
                     OsString::from("changes"),
+                    OsString::from("-s"),
+                    OsString::from("pending"),
+                    OsString::from("-u"),
+                    OsString::from(user),
+                    OsString::from("-c"),
+                    OsString::from(client),
+                ]);
+            }
+            Self::PendingChangesLimited {
+                user,
+                client,
+                max_results,
+            } => {
+                args.extend([
+                    OsString::from("changes"),
+                    OsString::from("-m"),
+                    OsString::from(max_results.to_string()),
                     OsString::from("-s"),
                     OsString::from("pending"),
                     OsString::from("-u"),
@@ -99,6 +130,34 @@ mod tests {
     }
 
     #[test]
+    fn bounded_pending_query_adds_a_numeric_server_limit() {
+        let args = P4Query::PendingChangesLimited {
+            user: "Example User".into(),
+            client: "ExampleClientA".into(),
+            max_results: 8,
+        }
+        .args();
+
+        assert_eq!(
+            args,
+            [
+                "-ztag",
+                "-Mj",
+                "changes",
+                "-m",
+                "8",
+                "-s",
+                "pending",
+                "-u",
+                "Example User",
+                "-c",
+                "ExampleClientA",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
     fn where_path_escapes_revision_and_wildcard_syntax() {
         let args = P4Query::Where {
             path: PathBuf::from(r"C:\Example Workspace\file#name@rev%.txt"),
@@ -113,5 +172,9 @@ mod tests {
     fn percent_is_encoded_before_other_metacharacters() {
         assert_eq!(escape_p4_file_arg_str("a%#@*"), "a%25%23%40%2A");
         assert_eq!(escape_p4_file_arg_str(r"C:\plain.txt"), r"C:\plain.txt");
+        assert_eq!(
+            escape_p4_file_arg_str(r"C:\Example Workspace\..."),
+            r"C:\Example Workspace\..."
+        );
     }
 }
