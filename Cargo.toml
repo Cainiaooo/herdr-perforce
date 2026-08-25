@@ -1,0 +1,29 @@
+[package]
+name = "herdr-perforce"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A compact Perforce review pane for Herdr"
+license = "MIT"
+publish = false
+
+[lib]
+name = "herdr_perforce"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herdr-p4"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1"
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+
