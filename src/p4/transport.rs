@@ -123,31 +123,32 @@ impl<T: P4Transport> P4Client<T> {
     }
 
     pub fn run(&self, query: &P4Query) -> Result<P4Response, P4Error> {
-        let request = P4Request {
-            executable: self.executable.clone(),
-            cwd: self.cwd.clone(),
-            args: query.args(),
-            stdin: Vec::new(),
-            environment: BTreeMap::new(),
-            removed_environment: herdr_control_variable_names(),
-            timeout: self.timeout,
-            output_limits: self.output_limits,
-        };
+        self.run_structured(query.args(), Vec::new())
+    }
 
-        let output = self
-            .transport
-            .execute(&request)
-            .map_err(map_transport_error)?;
-
-        if output.elapsed > self.timeout {
-            return Err(known_error(P4ErrorKind::TimedOut));
+    pub(crate) fn run_raw(
+        &self,
+        args: Vec<OsString>,
+        stdin: Vec<u8>,
+    ) -> Result<RawP4Output, P4Error> {
+        let output = self.execute(args, stdin)?;
+        if output.exit_code != 0 {
+            let diagnostic = if output.stderr.is_empty() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            return Err(classify_command_failure(&[], diagnostic));
         }
-        if output.stdout.len() > self.output_limits.stdout_bytes
-            || output.stderr.len() > self.output_limits.stderr_bytes
-        {
-            return Err(known_error(P4ErrorKind::OutputLimitExceeded));
-        }
+        Ok(output)
+    }
 
+    pub(crate) fn run_structured(
+        &self,
+        args: Vec<OsString>,
+        stdin: Vec<u8>,
+    ) -> Result<P4Response, P4Error> {
+        let output = self.execute(args, stdin)?;
         let records = match parse_json_records(&output.stdout) {
             Ok(records) => records,
             Err(_) if output.exit_code != 0 => {
@@ -168,6 +169,35 @@ impl<T: P4Transport> P4Client<T> {
             records,
             elapsed: output.elapsed,
         })
+    }
+
+    fn execute(&self, args: Vec<OsString>, stdin: Vec<u8>) -> Result<RawP4Output, P4Error> {
+        let request = P4Request {
+            executable: self.executable.clone(),
+            cwd: self.cwd.clone(),
+            args,
+            stdin,
+            environment: BTreeMap::new(),
+            removed_environment: herdr_control_variable_names(),
+            timeout: self.timeout,
+            output_limits: self.output_limits,
+        };
+
+        let output = self
+            .transport
+            .execute(&request)
+            .map_err(map_transport_error)?;
+
+        if output.elapsed > self.timeout {
+            return Err(known_error(P4ErrorKind::TimedOut));
+        }
+        if output.stdout.len() > self.output_limits.stdout_bytes
+            || output.stderr.len() > self.output_limits.stderr_bytes
+        {
+            return Err(known_error(P4ErrorKind::OutputLimitExceeded));
+        }
+
+        Ok(output)
     }
 }
 

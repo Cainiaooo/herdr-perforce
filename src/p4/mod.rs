@@ -1,14 +1,20 @@
 mod bounded;
 mod command;
+mod description;
 mod env;
 mod error;
 pub mod fake;
+mod form;
 pub mod level_b;
 mod parser;
 mod process;
 mod transport;
 
 pub use command::{P4Query, escape_p4_file_arg};
+pub use description::{
+    AuthorizedDescriptionApply, DescriptionApplyBlockReason, DescriptionApplyError,
+    DescriptionApplyIntent, DescriptionApplyPreview, DescriptionApplyResult, P4WriteService,
+};
 pub use env::{herdr_control_variable_names, is_herdr_control_variable};
 pub use error::{P4Error, P4ErrorKind};
 pub use level_b::{
