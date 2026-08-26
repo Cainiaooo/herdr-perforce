@@ -314,13 +314,7 @@ impl<T: P4Transport> P4WriteService<T> {
         authorization: AuthorizedSubmit,
     ) -> Result<SubmitResult, SubmitError> {
         let _flight = self.try_begin_submit().ok_or(SubmitError::AlreadyRunning)?;
-        let snapshot = self.load_submit_snapshot(authorization.change)?;
-        if snapshot.spec_token != authorization.expected_spec_token
-            || snapshot.content_token != authorization.expected_content_token
-            || snapshot.workspace != authorization.expected_workspace
-        {
-            return Err(SubmitError::Stale);
-        }
+        self.validate_authorization(&authorization)?;
 
         let change_arg = authorization.change.to_string();
         self.client
@@ -345,6 +339,15 @@ impl<T: P4Transport> P4WriteService<T> {
             submitted_change: authorization.change,
             file_count: refreshed.files.len(),
         })
+    }
+
+    /// Revalidates freshness tokens only; never issues `p4 submit`.
+    pub fn prepare_external_handoff(
+        &self,
+        authorization: AuthorizedSubmit,
+    ) -> Result<(), SubmitError> {
+        let _flight = self.try_begin_submit().ok_or(SubmitError::AlreadyRunning)?;
+        self.validate_authorization(&authorization)
     }
 
     /// Performs only `info` and `describe -s` reads. It never retries submit.
@@ -400,6 +403,17 @@ impl<T: P4Transport> P4WriteService<T> {
             });
         }
         Ok(SubmitReconciliationResult::Inconclusive)
+    }
+
+    fn validate_authorization(&self, authorization: &AuthorizedSubmit) -> Result<(), SubmitError> {
+        let snapshot = self.load_submit_snapshot(authorization.change)?;
+        if snapshot.spec_token != authorization.expected_spec_token
+            || snapshot.content_token != authorization.expected_content_token
+            || snapshot.workspace != authorization.expected_workspace
+        {
+            return Err(SubmitError::Stale);
+        }
+        Ok(())
     }
 
     fn load_submit_snapshot(&self, change: u64) -> Result<SubmitSnapshot, SubmitError> {
@@ -985,6 +999,29 @@ mod tests {
                 .is_some()
         );
         assert!(preview.authorize(SubmitIntent::CtrlEnter).is_some());
+    }
+
+    #[test]
+    fn external_handoff_revalidates_without_running_submit() {
+        let workspace = TestWorkspace::new();
+        let fake = FakeP4Transport::default();
+        push_pending_snapshot(&fake, &workspace, 0);
+        push_pending_snapshot(&fake, &workspace, 0);
+        let service = service(fake.clone(), &workspace.root);
+        let authorization = service
+            .preview_submit(42)
+            .expect("preview")
+            .authorize(SubmitIntent::CtrlEnter)
+            .expect("authorization");
+        service
+            .prepare_external_handoff(authorization)
+            .expect("external handoff preflight");
+        assert!(fake.requests().iter().all(|request| {
+            !request
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy() == "submit")
+        }));
     }
 
     #[test]

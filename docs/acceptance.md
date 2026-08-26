@@ -593,6 +593,17 @@ Submit 仅对 owned、current-client、numbered pending CL 启用。以下对象
 
 所有故障信息只显示分类后的可操作提示，不显示原始 server/user/client/path/ticket。重复 `r` 只能重复只读 reconciliation，不能隐式创建新的写授权。
 
+### ACC-SUBMIT-009（P0）外部提交 provider
+
+为要求预检查或 Review 应用的 workspace 配置 external submit provider。期望：
+
+- Review overlay 明确显示 provider 名称，确认控件显示 Open provider，而不是宣称直接 Submit。
+- 确认后仍重新验证 spec/content freshness；stale 时不启动外部工具。
+- 外部工具通过直接 argv 启动，只接收配置模板替换后的 numbered CL；不得经过 shell，也不得继承 `HERDR_*` 控制变量。
+- provider 启用时插件绝不运行 `p4 submit`、`p4 unlock` 或自动重试。
+- 启动失败为 `not-started`；启动成功为 external handoff，不等于提交成功，并保留只读 reconciliation receipt。
+- handoff 后禁止再次 Submit；只有 reconciliation 明确确认 submitted 才显示成功，确认 pending 时旧授权失效。
+
 ## 12. 配置、状态和隐私
 
 ### ACC-CONFIG-001（P0）配置热重载

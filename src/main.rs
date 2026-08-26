@@ -189,7 +189,6 @@ fn herdr_open_pane_args(context: Option<&Value>, plugin_root: Option<&Path>) -> 
         OsString::from("split"),
         OsString::from("--direction"),
         OsString::from("right"),
-        OsString::from("--focus"),
     ];
     if let Some(context) = context {
         append_context_argument(&mut args, "--workspace", context, "workspace_id");
@@ -199,20 +198,20 @@ fn herdr_open_pane_args(context: Option<&Value>, plugin_root: Option<&Path>) -> 
             args.push(cwd.into_os_string());
         }
     }
+    args.push(OsString::from("--focus"));
     args
 }
 
 fn open_herdr_pane() -> ExitCode {
     let executable = env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| OsString::from("herdr"));
-    let context = env::var("HERDR_PLUGIN_CONTEXT_JSON")
-        .ok()
-        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    let context = merge_missing_context(
+        invocation_context_from_environment(),
+        current_pane_context(&executable),
+    );
     let plugin_root = env::var_os("HERDR_PLUGIN_ROOT").map(PathBuf::from);
     let mut command = ProcessCommand::new(executable);
-    command.args(herdr_open_pane_args(
-        context.as_ref(),
-        plugin_root.as_deref(),
-    ));
+    let args = herdr_open_pane_args(context.as_ref(), plugin_root.as_deref());
+    command.args(args);
     match command.status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(
@@ -225,6 +224,113 @@ fn open_herdr_pane() -> ExitCode {
         Err(_) => {
             eprintln!("Could not invoke the Herdr binary from HERDR_BIN_PATH");
             ExitCode::from(69)
+        }
+    }
+}
+
+fn current_pane_context(executable: &OsStr) -> Option<Value> {
+    let output = ProcessCommand::new(executable)
+        .args(["pane", "current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let response = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    pane_context_from_current_response(&response)
+}
+
+fn pane_context_from_current_response(response: &Value) -> Option<Value> {
+    let pane = response.pointer("/result/pane")?;
+    let mut context = serde_json::Map::new();
+    for (target, source) in [
+        ("workspace_id", "workspace_id"),
+        ("focused_pane_id", "pane_id"),
+        ("focused_pane_cwd", "cwd"),
+    ] {
+        if let Some(value) = pane.get(source).and_then(Value::as_str) {
+            context.insert(target.to_owned(), Value::String(value.to_owned()));
+        }
+    }
+    (!context.is_empty()).then_some(Value::Object(context))
+}
+
+fn merge_missing_context(primary: Option<Value>, fallback: Option<Value>) -> Option<Value> {
+    let mut primary = match primary {
+        Some(Value::Object(context)) => context,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(Value::Object(fallback)) = fallback {
+        let conflict = workspace_ids_conflict(&primary, &fallback);
+        for (key, value) in fallback {
+            if conflict && is_pane_scoped_context_key(&key) {
+                continue;
+            }
+            primary.entry(key).or_insert(value);
+        }
+    }
+    (!primary.is_empty()).then_some(Value::Object(primary))
+}
+
+fn workspace_ids_conflict(
+    primary: &serde_json::Map<String, Value>,
+    fallback: &serde_json::Map<String, Value>,
+) -> bool {
+    match (
+        primary.get("workspace_id").and_then(Value::as_str),
+        fallback.get("workspace_id").and_then(Value::as_str),
+    ) {
+        (Some(left), Some(right)) => left != right,
+        _ => false,
+    }
+}
+
+fn is_pane_scoped_context_key(key: &str) -> bool {
+    matches!(key, "focused_pane_id" | "focused_pane_cwd")
+}
+
+fn invocation_context_from_environment() -> Option<Value> {
+    let parsed = env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    let mut context = match parsed {
+        Some(Value::Object(context)) => context,
+        _ => serde_json::Map::new(),
+    };
+
+    insert_context_fallback(
+        &mut context,
+        "workspace_id",
+        first_environment_value(&["HERDR_WORKSPACE_ID", "HERDR_ACTIVE_WORKSPACE_ID"]),
+    );
+    insert_context_fallback(
+        &mut context,
+        "focused_pane_id",
+        first_environment_value(&["HERDR_PANE_ID", "HERDR_ACTIVE_PANE_ID"]),
+    );
+    insert_context_fallback(
+        &mut context,
+        "focused_pane_cwd",
+        first_environment_value(&["HERDR_ACTIVE_PANE_CWD"]),
+    );
+
+    (!context.is_empty()).then_some(Value::Object(context))
+}
+
+fn first_environment_value(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+}
+
+fn insert_context_fallback(
+    context: &mut serde_json::Map<String, Value>,
+    key: &str,
+    fallback: Option<String>,
+) {
+    if !context.get(key).is_some_and(Value::is_string) {
+        if let Some(value) = fallback {
+            context.insert(key.to_owned(), Value::String(value));
         }
     }
 }
@@ -408,8 +514,61 @@ mod tests {
         assert!(args.contains(&pane_entrypoint().to_owned()));
         let cwd_index = args.iter().position(|arg| arg == "--cwd").expect("--cwd");
         assert_eq!(args[cwd_index + 1], current_dir.to_string_lossy());
-        assert!(args.contains(&"--workspace".to_owned()));
-        assert!(args.contains(&"ws-1".to_owned()));
+        let workspace_index = args
+            .iter()
+            .position(|arg| arg == "--workspace")
+            .expect("--workspace");
+        assert_eq!(args[workspace_index + 1], "ws-1");
+        assert_eq!(args.last().map(String::as_str), Some("--focus"));
+    }
+
+    #[test]
+    fn pane_current_from_another_workspace_is_not_merged() {
+        let primary = serde_json::json!({
+            "workspace_id": "ws-1",
+            "workspace_cwd": "E:/Project/NeonGame"
+        });
+        let fallback = serde_json::json!({
+            "workspace_id": "ws-2",
+            "focused_pane_id": "ws-2:p1",
+            "focused_pane_cwd": "E:/Other"
+        });
+        let context = merge_missing_context(Some(primary), Some(fallback)).expect("merged");
+        assert_eq!(context["workspace_id"], "ws-1");
+        assert_eq!(context["workspace_cwd"], "E:/Project/NeonGame");
+        assert!(context.get("focused_pane_id").is_none());
+        assert!(context.get("focused_pane_cwd").is_none());
+    }
+
+    #[test]
+    fn pane_current_from_the_same_workspace_fills_missing_pane_fields() {
+        let primary = serde_json::json!({ "workspace_id": "w1" });
+        let fallback = serde_json::json!({
+            "workspace_id": "w1",
+            "focused_pane_id": "w1:p1",
+            "focused_pane_cwd": "E:/Project/NeonGame"
+        });
+        let context = merge_missing_context(Some(primary), Some(fallback)).expect("merged");
+        assert_eq!(context["focused_pane_id"], "w1:p1");
+        assert_eq!(context["focused_pane_cwd"], "E:/Project/NeonGame");
+    }
+
+    #[test]
+    fn current_pane_response_supplies_missing_action_context() {
+        let response = serde_json::json!({
+            "result": {
+                "pane": {
+                    "workspace_id": "w1",
+                    "pane_id": "w1:p1",
+                    "cwd": "E:/Project/NeonGame"
+                }
+            }
+        });
+        let fallback = pane_context_from_current_response(&response);
+        let context = merge_missing_context(None, fallback).expect("pane context");
+        assert_eq!(context["workspace_id"], "w1");
+        assert_eq!(context["focused_pane_id"], "w1:p1");
+        assert_eq!(context["focused_pane_cwd"], "E:/Project/NeonGame");
     }
 
     #[test]

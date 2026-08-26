@@ -599,6 +599,8 @@ Submit UI 还必须附带结果确定性：
 - `rejected`：write 获得认证、权限或服务器明确拒绝；仍需重新 preflight 和新的显式确认，不能自动重试。
 - `unknown`：write 可能已经到达服务器；UI 禁止再次 Submit，只允许用原确认保存的 workspace/CL receipt 运行 `info` 和 `describe -s` 只读 reconciliation。只有确认 submitted 才显示成功；确认 pending 时旧确认作废；查询仍失败或环境不匹配时保持 unknown。
 
+项目可以选择 external submit provider 代替原生 `p4 submit`。该模式仍复用完整 preflight、双 token freshness 和显式确认，但确认后的动作是以无 shell 的 argv 启动配置工具。成功启动只记为 handoff，不记为 submit success；插件保留 receipt 并仅允许只读 reconciliation。配置缺失时默认使用 native provider，配置存在但无效时 fail closed，不能静默回退到原生 Submit。
+
 ## 16. 首版非目标
 
 - P4 Code Review/Swarm 评论、投票、review state。

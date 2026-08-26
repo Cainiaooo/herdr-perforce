@@ -1,0 +1,9 @@
+{
+  "mode": "external",
+  "label": "External submit tool",
+  "command": "C:\\absolute\\path\\to\\submit-tool.exe",
+  "args": [
+    "--changelist",
+    "{change}"
+  ]
+}

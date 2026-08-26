@@ -33,6 +33,8 @@ pub enum SubmitFault {
     InvalidState,
     Verification,
     ConfirmedPending,
+    ExternalTool,
+    ExternalHandoff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,9 @@ pub struct SubmitFailure {
 impl SubmitFailure {
     #[must_use]
     pub fn title(&self) -> &'static str {
+        if self.fault == SubmitFault::ExternalHandoff {
+            return "External submit handoff";
+        }
         if self.certainty == SubmitOutcomeCertainty::Unknown {
             return "Submission result unknown";
         }
@@ -62,6 +67,8 @@ impl SubmitFailure {
             SubmitFault::InvalidState => "Submit preflight failed",
             SubmitFault::Verification => "Submit verification failed",
             SubmitFault::ConfirmedPending => "Changelist is still pending",
+            SubmitFault::ExternalTool => "External submit tool failed",
+            SubmitFault::ExternalHandoff => "External submit handoff",
         }
     }
 
@@ -284,6 +291,49 @@ impl SubmitOverlay {
                     receipt: keep_receipt.then_some(receipt),
                 }
             }
+        };
+    }
+
+    pub fn complete_external_handoff(&mut self, change: u64, result: Result<String, String>) {
+        let state = std::mem::replace(&mut self.state, SubmitOverlayState::Closed);
+        let SubmitOverlayState::Running {
+            change: active,
+            receipt,
+        } = state
+        else {
+            self.state = state;
+            return;
+        };
+        if active != change {
+            self.state = SubmitOverlayState::Running {
+                change: active,
+                receipt,
+            };
+            return;
+        }
+        self.state = match result {
+            Ok(provider) => SubmitOverlayState::Failure {
+                change,
+                failure: SubmitFailure {
+                    fault: SubmitFault::ExternalHandoff,
+                    certainty: SubmitOutcomeCertainty::Unknown,
+                    detail: format!(
+                        "{provider} was opened for CL {change}. Herdr did not run p4 submit and cannot yet confirm the external result."
+                    ),
+                    next_step: "Complete or cancel the external workflow, then run read-only reconciliation.",
+                },
+                receipt: Some(receipt),
+            },
+            Err(detail) => SubmitOverlayState::Failure {
+                change,
+                failure: SubmitFailure {
+                    fault: SubmitFault::ExternalTool,
+                    certainty: SubmitOutcomeCertainty::NotStarted,
+                    detail,
+                    next_step: "Fix the submit provider configuration, then refresh preflight.",
+                },
+                receipt: None,
+            },
         };
     }
 
@@ -558,7 +608,9 @@ fn failure_detail(
             SubmitFault::Blocked
             | SubmitFault::StaleReview
             | SubmitFault::Busy
-            | SubmitFault::ConfirmedPending => unreachable!("handled above"),
+            | SubmitFault::ConfirmedPending
+            | SubmitFault::ExternalTool
+            | SubmitFault::ExternalHandoff => unreachable!("constructed outside classification"),
         },
     }
 }
@@ -597,6 +649,12 @@ fn failure_next_step(fault: SubmitFault, certainty: SubmitOutcomeCertainty) -> &
         }
         SubmitFault::ConfirmedPending => {
             "Run preflight and review a new confirmation before any new submit."
+        }
+        SubmitFault::ExternalTool => {
+            "Fix the submit provider configuration, then refresh preflight."
+        }
+        SubmitFault::ExternalHandoff => {
+            "Complete or cancel the external workflow, then run read-only reconciliation."
         }
     }
 }
@@ -797,6 +855,46 @@ mod tests {
         assert!(matches!(
             overlay.state(),
             SubmitOverlayState::Running { change: 42, .. }
+        ));
+    }
+
+    #[test]
+    fn external_handoff_never_claims_submit_success() {
+        let mut overlay = SubmitOverlay::default();
+        let preview = SubmitPreview::from_workspace_for_test(
+            42,
+            "Fix overlay",
+            crate::domain::WorkspaceIdentity {
+                server_id: "server".into(),
+                user: "user".into(),
+                client: "client".into(),
+                root: std::path::PathBuf::from("C:/Example Workspace"),
+                stream: None,
+                case_handling: crate::domain::CaseHandling::Insensitive,
+            },
+        );
+        overlay.replace_state_for_test(SubmitOverlayState::Review { preview });
+        assert!(matches!(
+            overlay.handle_intent(SubmitIntent::CtrlEnter),
+            Some(SubmitOverlayRequest::Execute { change: 42, .. })
+        ));
+        overlay.complete_external_handoff(42, Ok("P4Lab".to_owned()));
+        assert!(matches!(
+            overlay.state(),
+            SubmitOverlayState::Failure {
+                failure: SubmitFailure {
+                    fault: SubmitFault::ExternalHandoff,
+                    certainty: SubmitOutcomeCertainty::Unknown,
+                    ..
+                },
+                receipt: Some(_),
+                ..
+            }
+        ));
+        assert!(overlay.open(43).is_none());
+        assert!(matches!(
+            overlay.refresh(),
+            Some(SubmitOverlayRequest::Reconcile { .. })
         ));
     }
 }

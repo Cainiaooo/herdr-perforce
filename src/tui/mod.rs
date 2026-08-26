@@ -30,6 +30,7 @@ use crate::{
         StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview, SubmitReconciliationResult,
         SubmitResult, pending_changelists_from_changes, workspace_from_info,
     },
+    submit_provider::{ExternalLaunchError, SubmitProvider},
 };
 
 const MAX_VISIBLE_CHANGELISTS: u16 = 4_096;
@@ -42,7 +43,8 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
         &cwd,
     )));
     let (sender, receiver) = mpsc::channel();
-    let mut pane = PaneModel::new(cwd);
+    let provider = Arc::new(SubmitProvider::load_from_environment());
+    let mut pane = PaneModel::new_with_provider(cwd, provider);
     request_overview(pane.cwd.clone(), pane.overview_generation, sender.clone());
 
     let mut terminal = TerminalGuard::enter().map_err(|error| error.to_string())?;
@@ -170,11 +172,22 @@ enum PaneMessage {
         change: u64,
         result: Result<SubmitResult, SubmitError>,
     },
+    ExternalHandoff {
+        change: u64,
+        result: ExternalHandoffResult,
+    },
     Reconcile {
         change: u64,
         request_id: u64,
         result: Result<SubmitReconciliationResult, SubmitError>,
     },
+}
+
+#[derive(Debug)]
+enum ExternalHandoffResult {
+    Launched(String),
+    ValidationFailed(SubmitError),
+    LaunchFailed(String),
 }
 
 #[derive(Debug)]
@@ -191,19 +204,46 @@ struct PaneModel {
     overview_generation: u64,
     selected: usize,
     overlay: SubmitOverlay,
+    submit_provider: Arc<SubmitProvider>,
+    reload_provider_from_environment: bool,
     status: String,
 }
 
 impl PaneModel {
+    #[cfg(test)]
     fn new(cwd: PathBuf) -> Self {
+        let mut pane = Self::new_with_provider(cwd, Arc::new(SubmitProvider::Native));
+        pane.reload_provider_from_environment = false;
+        pane
+    }
+
+    fn new_with_provider(cwd: PathBuf, submit_provider: Arc<SubmitProvider>) -> Self {
         Self {
             cwd,
             overview: OverviewState::Loading,
             overview_generation: 1,
             selected: 0,
             overlay: SubmitOverlay::default(),
+            submit_provider,
+            reload_provider_from_environment: true,
             status: "Loading current Perforce workspace...".to_owned(),
         }
+    }
+
+    fn reload_submit_provider(&mut self) {
+        if self.reload_provider_from_environment {
+            self.submit_provider = Arc::new(SubmitProvider::load_from_environment());
+        }
+    }
+
+    fn issue_overlay_request<T: P4Transport + 'static>(
+        &mut self,
+        request: SubmitOverlayRequest,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        self.reload_submit_provider();
+        dispatch_overlay(request, service, &self.cwd, sender);
     }
 
     fn reload_overview(&mut self, sender: &mpsc::Sender<PaneMessage>) {
@@ -231,6 +271,20 @@ impl PaneModel {
                 let succeeded = result.is_ok();
                 self.overlay.complete_submit(change, result);
                 succeeded
+            }
+            PaneMessage::ExternalHandoff { change, result } => {
+                match result {
+                    ExternalHandoffResult::Launched(provider) => {
+                        self.overlay.complete_external_handoff(change, Ok(provider))
+                    }
+                    ExternalHandoffResult::ValidationFailed(error) => {
+                        self.overlay.complete_submit(change, Err(error));
+                    }
+                    ExternalHandoffResult::LaunchFailed(detail) => {
+                        self.overlay.complete_external_handoff(change, Err(detail))
+                    }
+                }
+                false
             }
             PaneMessage::Reconcile {
                 change,
@@ -294,7 +348,7 @@ impl PaneModel {
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(request) = self.overlay.handle_intent(SubmitIntent::CtrlEnter) {
-                        dispatch_overlay(request, service, sender);
+                        self.issue_overlay_request(request, service, sender);
                     }
                 }
                 KeyCode::Enter => {
@@ -302,7 +356,7 @@ impl PaneModel {
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     if let Some(request) = self.overlay.refresh() {
-                        dispatch_overlay(request, service, sender);
+                        self.issue_overlay_request(request, service, sender);
                     }
                 }
                 _ => {}
@@ -330,7 +384,7 @@ impl PaneModel {
                     return false;
                 };
                 if let Some(request) = self.overlay.open(change) {
-                    dispatch_overlay(request, service, sender);
+                    self.issue_overlay_request(request, service, sender);
                 }
                 false
             }
@@ -371,14 +425,14 @@ impl PaneModel {
                 .is_some_and(|target| target.contains(mouse.column, mouse.row))
             {
                 if let Some(request) = self.overlay.handle_intent(SubmitIntent::SubmitButton) {
-                    dispatch_overlay(request, service, sender);
+                    self.issue_overlay_request(request, service, sender);
                 }
             } else if hits
                 .refresh
                 .is_some_and(|target| target.contains(mouse.column, mouse.row))
             {
                 if let Some(request) = self.overlay.refresh() {
-                    dispatch_overlay(request, service, sender);
+                    self.issue_overlay_request(request, service, sender);
                 }
             }
             return false;
@@ -421,6 +475,7 @@ fn load_overview(cwd: &Path) -> Result<WorkspaceOverview, OverviewFailure> {
 fn dispatch_overlay<T: P4Transport + 'static>(
     request: SubmitOverlayRequest,
     service: &Arc<P4WriteService<T>>,
+    cwd: &Path,
     sender: &mpsc::Sender<PaneMessage>,
 ) {
     match request {
@@ -441,10 +496,43 @@ fn dispatch_overlay<T: P4Transport + 'static>(
             authorization,
         } => {
             let service = Arc::clone(service);
+            let cwd = cwd.to_path_buf();
             let sender = sender.clone();
-            thread::spawn(move || {
-                let result = service.submit_change(authorization);
-                let _ = sender.send(PaneMessage::Submit { change, result });
+            thread::spawn(move || match SubmitProvider::load_from_environment() {
+                SubmitProvider::Native => {
+                    let result = service.submit_change(authorization);
+                    let _ = sender.send(PaneMessage::Submit { change, result });
+                }
+                SubmitProvider::External(provider) => {
+                    if let Err(error) = service.prepare_external_handoff(authorization) {
+                        let _ = sender.send(PaneMessage::ExternalHandoff {
+                            change,
+                            result: ExternalHandoffResult::ValidationFailed(error),
+                        });
+                        return;
+                    }
+                    let result = match provider.launch(change, &cwd) {
+                        Ok(()) => ExternalHandoffResult::Launched(provider.label().to_owned()),
+                        Err(ExternalLaunchError::StartFailed) => {
+                            ExternalHandoffResult::LaunchFailed(format!(
+                                "{} could not be started for CL {change}. No p4 submit was run.",
+                                provider.label()
+                            ))
+                        }
+                        Err(ExternalLaunchError::InvalidConfiguration(detail)) => {
+                            ExternalHandoffResult::LaunchFailed(detail)
+                        }
+                    };
+                    let _ = sender.send(PaneMessage::ExternalHandoff { change, result });
+                }
+                SubmitProvider::Invalid(detail) => {
+                    let _ = sender.send(PaneMessage::ExternalHandoff {
+                            change,
+                            result: ExternalHandoffResult::LaunchFailed(format!(
+                                "Submit provider configuration is invalid: {detail}. No external tool or p4 submit was started."
+                            )),
+                        });
+                }
             });
         }
         SubmitOverlayRequest::Reconcile {
@@ -583,7 +671,13 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
     }
 
     if !matches!(pane.overlay.state(), SubmitOverlayState::Closed) {
-        render_overlay(&mut frame, pane.overlay.state(), width, height);
+        render_overlay(
+            &mut frame,
+            pane.overlay.state(),
+            &pane.submit_provider,
+            width,
+            height,
+        );
     }
     for line in &mut frame.lines {
         *line = truncate_and_pad(line, width);
@@ -594,9 +688,12 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
 fn render_overlay(
     frame: &mut RenderedFrame,
     state: &SubmitOverlayState,
+    provider: &SubmitProvider,
     screen_width: usize,
     screen_height: usize,
 ) {
+    let provider_label = provider.label();
+    let native_submit = provider.is_native();
     let overlay_width = screen_width
         .saturating_sub(4)
         .clamp(28, 72)
@@ -681,7 +778,12 @@ fn render_overlay(
                     inner_width,
                 ),
             );
-            put(&mut frame.lines, x, top + 6, "Preflight");
+            put(
+                &mut frame.lines,
+                x,
+                top + 6,
+                &truncate_chars(&format!("Provider: {provider_label}"), inner_width),
+            );
             put(
                 &mut frame.lines,
                 x,
@@ -698,10 +800,18 @@ fn render_overlay(
                 &mut frame.lines,
                 x,
                 top + 10,
-                "Enter/Esc: Cancel   Ctrl+Enter: Submit",
+                if native_submit {
+                    "Enter/Esc: Cancel   Ctrl+Enter: Submit"
+                } else {
+                    "Enter/Esc: Cancel   Ctrl+Enter: Open provider"
+                },
             );
             let cancel_text = ">[Cancel]<";
-            let submit_text = "[Submit]";
+            let submit_text = if native_submit {
+                "[Submit]"
+            } else {
+                "[Open provider]"
+            };
             let button_row = top + overlay_height.saturating_sub(3);
             let cancel_x = x;
             let submit_x = x + cancel_text.len() + 3;
@@ -723,13 +833,24 @@ fn render_overlay(
                 &mut frame.lines,
                 x,
                 top + 2,
-                &format!("Submitting CL {change}..."),
+                &format!(
+                    "{} CL {change}...",
+                    if native_submit {
+                        "Submitting"
+                    } else {
+                        "Opening external provider for"
+                    }
+                ),
             );
             put(
                 &mut frame.lines,
                 x,
                 top + 4,
-                "Exactly one p4 submit process is running.",
+                if native_submit {
+                    "Exactly one p4 submit process is running."
+                } else {
+                    "Herdr will not run p4 submit for this handoff."
+                },
             );
             put(
                 &mut frame.lines,
@@ -1075,6 +1196,83 @@ mod tests {
         assert!(rendered.contains("Server: perforce.example"));
         assert!(rendered.contains("User: ExampleUser"));
         assert!(rendered.contains("Client: ExampleClient"));
+        assert!(rendered.contains("Provider: Native p4 submit"));
+        assert!(rendered.contains("[Submit]"));
+        assert!(!rendered.contains("[Open provider]"));
+    }
+
+    fn pane_with_external_provider(label: &str) -> PaneModel {
+        let mut pane = pane_with_changes();
+        pane.submit_provider = Arc::new(SubmitProvider::external_for_test(
+            label,
+            PathBuf::from("C:/Tools/submit-tool.exe"),
+            vec!["--changelist".into(), "{change}".into()],
+        ));
+        pane
+    }
+
+    fn review_overlay_for(pane: &mut PaneModel) {
+        pane.overlay
+            .replace_state_for_test(SubmitOverlayState::Review {
+                preview: SubmitPreview::from_workspace_for_test(
+                    42,
+                    "Fix submit overlay",
+                    WorkspaceIdentity {
+                        server_id: "perforce.example".into(),
+                        user: "ExampleUser".into(),
+                        client: "ExampleClient".into(),
+                        root: PathBuf::from("C:/Example Workspace"),
+                        stream: None,
+                        case_handling: CaseHandling::Insensitive,
+                    },
+                ),
+            });
+    }
+
+    #[test]
+    fn external_review_overlay_offers_open_provider_not_submit() {
+        let mut pane = pane_with_external_provider("P4Lab");
+        review_overlay_for(&mut pane);
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("Provider: P4Lab"));
+        assert!(rendered.contains("[Open provider]"));
+        assert!(rendered.contains("Ctrl+Enter: Open provider"));
+        assert!(!rendered.contains("[Submit]"));
+        assert!(!rendered.contains("Ctrl+Enter: Submit"));
+    }
+
+    #[test]
+    fn external_provider_label_cannot_impersonate_native_submit() {
+        let mut pane = pane_with_external_provider("Native p4 submit");
+        review_overlay_for(&mut pane);
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("Provider: Native p4 submit"));
+        assert!(rendered.contains("[Open provider]"));
+        assert!(!rendered.contains("[Submit]"));
+        pane.overlay
+            .replace_state_for_test(SubmitOverlayState::Running {
+                change: 42,
+                receipt: SubmitPreview::from_workspace_for_test(
+                    42,
+                    "Fix submit overlay",
+                    WorkspaceIdentity {
+                        server_id: "perforce.example".into(),
+                        user: "ExampleUser".into(),
+                        client: "ExampleClient".into(),
+                        root: PathBuf::from("C:/Example Workspace"),
+                        stream: None,
+                        case_handling: CaseHandling::Insensitive,
+                    },
+                )
+                .authorize(SubmitIntent::CtrlEnter)
+                .expect("authorization")
+                .reconciliation_receipt(),
+            });
+        let running = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(running.contains("Opening external provider for CL 42"));
+        assert!(running.contains("Herdr will not run p4 submit for this handoff."));
+        assert!(!running.contains("Submitting CL 42"));
+        assert!(!running.contains("Exactly one p4 submit process is running."));
     }
 
     #[test]

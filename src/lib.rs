@@ -7,4 +7,5 @@
 pub mod app;
 pub mod domain;
 pub mod p4;
+pub mod submit_provider;
 pub mod tui;

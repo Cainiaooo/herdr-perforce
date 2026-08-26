@@ -46,6 +46,9 @@ cargo test --workspace
 - `freshness_token` 生成与 stale 拒绝。
 - 键位路由、焦点切换、窄宽度降级和空状态。
 - argv 构造：不经过 shell，不拼接用户输入。
+- submit provider fail-closed load：非法 JSON、非绝对 command、缺少 `{change}`、`.bat`/`.cmd` 不得回退到 `p4 submit`。
+- external launch：只替换 `{change}`，剥离 `HERDR_*`，stdio/console 与 TUI 分离。
+- Review overlay 按 provider 判别式显示 Open provider / Submit，不以用户可控 label 推断 native。
 - 错误分类：空 diff、无权限、未登录、未映射、binary、超时和解析失败不得混淆。
 
 fake `p4` 必须记录收到的 argv、环境和 stdin，并能按脚本返回 stdout、stderr、退出码、延迟及分块输出。测试不得依赖本机已安装的真实 `p4.exe`。
@@ -208,6 +211,9 @@ fixture builder 应返回逻辑别名到动态 changelist number 的映射，测
 | `unknown_post_write` | submit 后 refresh 的认证/权限/timeout/mismatch | unknown、禁止再次 submit |
 | `reconcile_submitted` | receipt 对应 CL 已 submitted | 只读确认成功并刷新 UI |
 | `reconcile_pending` | receipt 对应 CL 仍 pending | 旧确认失效，要求新 preflight |
+| `external_provider_invalid` | 配置缺失字段、非绝对 command 或缺少 `{change}` | fail closed、无外部进程、无 submit |
+| `external_provider_stale` | 确认后 CL 或内容变化 | 不启动外部工具、无 submit |
+| `external_provider_handoff` | 外部工具成功启动 | 显示 handoff/unknown，只允许 reconciliation，传输记录中无 submit |
 
 ## 6. 核心测试矩阵
 

@@ -103,6 +103,38 @@ Submit 只对当前 P4 用户、当前 client 的 numbered pending changelist �
 
 reconciliation 只运行当前 workspace 下的 `p4 info` 和 `p4 describe -s`。确认 submitted 才显示成功；确认仍为 pending 时旧授权作废；环境或结果无法匹配时继续保持 `unknown`。
 
+### 外部提交工具
+
+部分 Perforce 项目会禁止直接执行 `p4 submit`，要求通过独立的预检查、Review 或提交应用完成最终提交。插件支持为这类 workspace 配置 external submit provider。
+
+先查询插件配置目录：
+
+```powershell
+herdr plugin config-dir herdr.perforce
+```
+
+在该目录创建 `submit-provider.json`：
+
+```json
+{
+  "mode": "external",
+  "label": "External submit tool",
+  "command": "C:\\absolute\\path\\to\\submit-tool.exe",
+  "args": ["--changelist", "{change}"]
+}
+```
+
+配置约束：
+
+- `command` 必须是已存在的绝对可执行文件路径，不能是 `.bat` / `.cmd`。
+- `args` 是直接传给进程的 argv，不经过 PowerShell、`cmd.exe` 或其他 shell。
+- `args` 必须包含 `{change}`；启动时只会替换为已确认的 numbered CL。
+- external provider 启用后，Herdr 仍执行完整只读 preflight 和提交前 freshness 校验，但不会运行 `p4 submit`。
+- 外部工具启动成功只表示“已交接”，不表示提交成功。Overlay 会阻止再次提交，并只提供 read-only reconciliation，直到 Perforce 明确显示 submitted 或 pending。
+- 删除 `submit-provider.json`，或写入 `{ "mode": "native" }`，即可恢复原生 `p4 submit`。
+
+仓库提供了可复制修改的示例：[examples/submit-provider.external.json](examples/submit-provider.external.json)。打开 Submit overlay、刷新 preflight 或确认提交时会重新读取该配置，无需重启 Herdr 或重新打开 pane。
+
 ## 故障排查
 
 ### 插件没有出现在 Herdr 中
