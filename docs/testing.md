@@ -8,11 +8,11 @@
 
 | 层级 | 状态 | 执行日期 | 实际结果 |
 |---|---|---|---|
-| Level A | 已验收 | 2026-08-25 | `cargo fmt --check`、Clippy、build 和 `cargo test --workspace --all-targets` 通过；library 60 个、CLI 5 个，共 65 个测试 |
+| Level A | 已验收 | 2026-08-26 | `cargo fmt --check`、Clippy、build 和 `cargo test --workspace --all-targets` 通过；library 69 个、CLI 5 个，共 74 个测试 |
 | Level B | 部分完成 | 2026-08-25 | 显式只读 runner 的真实 `info/changes/describe/opened` 通过；当前仓库 cwd 不在 client view，`where` 明确 skip，未回退配置 |
-| Level C | 部分完成 | 2026-08-25 | 独立 harness 的 16 个测试和真实 loopback `p4d` 通过；产品 Description Apply 完成 stale 拒绝与只改 Description 的真实闭环，harness 直接完成 shelf、`binary+l`、numbered submit、第二 client 逐字节验证、隐私扫描和精确清理 |
+| Level C | 部分完成 | 2026-08-26 | 独立 harness 的 16 个测试和真实 loopback `p4d` 通过；产品 Description Apply 与 Submit 均完成 stale 拒绝和成功写入闭环，另含 shelf、`binary+l`、第二 client 逐字节验证、隐私扫描和精确清理 |
 
-本记录确认 Level A、一次 Level B 部分兼容验证，以及 Level C 的产品 Description Apply 切片。产品级 Submit preflight/confirmation/single-flight、Level B mapped `where` 和 Herdr pane 集成尚未完成验收；harness 直接调用 `p4 submit` 不能替代产品 Submit 闭环。
+本记录确认 Level A、一次 Level B 部分兼容验证，以及 Level C 的产品 Description Apply/Submit 核心写闭环。Submit 已包含 preflight、双 token freshness、二次确认对象、single-flight 和写后刷新；完整失败矩阵、Level B mapped `where` 和 Herdr pane/UI 集成仍未完成验收。
 
 ## 1. 目标
 
@@ -102,7 +102,7 @@ cargo run -- doctor
 cargo run -- level-c
 ```
 
-该 harness 通过产品 `P4WriteService` 执行 Description Apply；其 transport 对产品命令使用 fail-closed allowlist，并在每个 `change -i` 前执行本节定义的写授权检查。当前 numbered submit 仍由 harness 直接执行，用于保留真实 Server 闭环证据，不代表产品 Submit 已实现。
+该 harness 通过产品 `P4WriteService` 执行 Description Apply 与 numbered Submit；其 transport 对产品命令使用 fail-closed allowlist，并在每个 `change -i` 或 `submit -c` 前执行本节定义的写授权检查。Submit 先证明 spec/content freshness，再由显式确认对象执行一次写命令并刷新 submitted 状态。
 
 ## 3. 本机 `p4d` 拓扑
 

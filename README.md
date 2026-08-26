@@ -18,9 +18,10 @@ Level A 离线基础已完成，Level B 只读 runner 已落地，当前推进 L
 - 结构化只读命令、输出预算、错误分类、确定性 fake P4 transport，以及在执行中强制超时/字节预算的进程 transport；
 - `spec_token` 的稳定 BLAKE3 规范化；
 - 显式 `--read-only` 门控、命令 allowlist、结果脱敏和不回退配置的 Level B runner；
-- 产品级 Description Apply：owned/current-client/numbered-pending 门控、完整 change form 只替换 Description、显式确认对象、Apply 前 stale token 重查和写后刷新验证。
+- 产品级 Description Apply：owned/current-client/numbered-pending 门控、完整 change form 只替换 Description、显式确认对象、Apply 前 stale token 重查和写后刷新验证；
+- 产品级 Submit：4,096 文件上限、pending/open-file preflight、unresolved/out-of-date/缺失或越界本地文件门控、流式 `content_token`、spec/content 双 stale 检查、显式二次确认、workspace 级 Submit 单飞、单次 `p4 submit -c` 和提交后状态刷新。
 
-Description Apply 没有暴露为独立 CLI 写入口；它只由产品 library 的“预览 → 显式确认 → 再读校验 → 写入 → 刷新”API 进入，并已在一次性 loopback `p4d` 中验证 stale 拒绝和成功写入。Submit 目前仍只由隔离 harness 直接验证 Perforce 闭环，产品级 preflight、二次确认和 single-flight 尚未实现。
+Description Apply 和 Submit 都没有暴露为独立 CLI 写入口；二者只由产品 library 的“预览/preflight → 显式确认 → 再读校验 → 写入 → 刷新”API 进入。一次性 loopback `p4d` 已验证 Description 的 spec stale 拒绝与只改 Description，以及 Submit 的本地内容 stale 拒绝、单次产品 submit、最终 submitted 状态、第二 client 精确字节和无残留清理。Herdr pane/UI 接线仍待后续阶段完成。
 
 Level B 可通过 `cargo run -- level-b --read-only` 执行；若要验证另一个明确的映射目录，追加 `--cwd <workspace-path>`。相对路径会相对当前进程目录拼接成绝对路径，不会 `canonicalize`。该入口最多采样 8 个 pending changelist，只输出脱敏 identity、计数和检查状态。
 

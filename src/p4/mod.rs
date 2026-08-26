@@ -8,6 +8,7 @@ mod form;
 pub mod level_b;
 mod parser;
 mod process;
+mod submit;
 mod transport;
 
 pub use command::{P4Query, escape_p4_file_arg};
@@ -27,6 +28,10 @@ pub use parser::{
     parse_json_records, pending_changelists_from_changes, workspace_from_info,
 };
 pub use process::StdProcessTransport;
+pub use submit::{
+    AuthorizedSubmit, SubmitActionCounts, SubmitBlockReason, SubmitError, SubmitIntent,
+    SubmitPreview, SubmitResult,
+};
 pub use transport::{
     OutputLimits, P4Client, P4Request, P4Response, P4Transport, RawP4Output, TransportError,
 };

@@ -360,18 +360,15 @@ fn parse_revision_field(
     field: &str,
     value: &str,
 ) -> Result<Option<u64>, DomainMappingError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || is_none_revision(trimmed) {
-        return Ok(None);
-    }
-    trimmed
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|_| invalid(index, field, "expected an unsigned revision"))
+    parse_revision_value(value).map_err(|()| invalid(index, field, "expected an unsigned revision"))
 }
 
-fn is_none_revision(value: &str) -> bool {
-    value.eq_ignore_ascii_case("none")
+pub(crate) fn parse_revision_value(value: &str) -> Result<Option<u64>, ()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    trimmed.parse::<u64>().map(Some).map_err(|_| ())
 }
 
 fn parse_changelist_id(index: usize, value: &str) -> Result<ChangelistId, DomainMappingError> {

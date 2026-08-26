@@ -126,6 +126,14 @@ impl<T: P4Transport> P4Client<T> {
         self.run_structured(query.args(), Vec::new())
     }
 
+    pub(crate) fn run_with_timeout(
+        &self,
+        query: &P4Query,
+        timeout: Duration,
+    ) -> Result<P4Response, P4Error> {
+        self.run_structured_with_timeout(query.args(), Vec::new(), timeout)
+    }
+
     pub(crate) fn run_raw(
         &self,
         args: Vec<OsString>,
@@ -148,7 +156,16 @@ impl<T: P4Transport> P4Client<T> {
         args: Vec<OsString>,
         stdin: Vec<u8>,
     ) -> Result<P4Response, P4Error> {
-        let output = self.execute(args, stdin)?;
+        self.run_structured_with_timeout(args, stdin, self.timeout)
+    }
+
+    pub(crate) fn run_structured_with_timeout(
+        &self,
+        args: Vec<OsString>,
+        stdin: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<P4Response, P4Error> {
+        let output = self.execute_with_timeout(args, stdin, timeout)?;
         let records = match parse_json_records(&output.stdout) {
             Ok(records) => records,
             Err(_) if output.exit_code != 0 => {
@@ -172,6 +189,15 @@ impl<T: P4Transport> P4Client<T> {
     }
 
     fn execute(&self, args: Vec<OsString>, stdin: Vec<u8>) -> Result<RawP4Output, P4Error> {
+        self.execute_with_timeout(args, stdin, self.timeout)
+    }
+
+    fn execute_with_timeout(
+        &self,
+        args: Vec<OsString>,
+        stdin: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<RawP4Output, P4Error> {
         let request = P4Request {
             executable: self.executable.clone(),
             cwd: self.cwd.clone(),
@@ -179,7 +205,7 @@ impl<T: P4Transport> P4Client<T> {
             stdin,
             environment: BTreeMap::new(),
             removed_environment: herdr_control_variable_names(),
-            timeout: self.timeout,
+            timeout,
             output_limits: self.output_limits,
         };
 
@@ -188,7 +214,7 @@ impl<T: P4Transport> P4Client<T> {
             .execute(&request)
             .map_err(map_transport_error)?;
 
-        if output.elapsed > self.timeout {
+        if output.elapsed > timeout {
             return Err(known_error(P4ErrorKind::TimedOut));
         }
         if output.stdout.len() > self.output_limits.stdout_bytes

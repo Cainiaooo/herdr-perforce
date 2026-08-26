@@ -568,7 +568,7 @@ Submit 仅对 owned、current-client、numbered pending CL 启用。以下对象
 ### ACC-SUBMIT-006（P0）重复事件
 
 在提交进行中重复按键、双击按钮并切换 pane。
-期望：同一 CL 最多一个 submit process；UI 不产生第二次提交。
+期望：同一时刻最多一个 submit process（跨 CL 全局排他）；UI 不产生第二次提交。
 
 ### ACC-SUBMIT-007（P0）取消
 

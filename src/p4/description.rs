@@ -1,4 +1,9 @@
-use std::{error::Error, ffi::OsString, fmt};
+use std::{
+    error::Error,
+    ffi::OsString,
+    fmt,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use crate::domain::{
     Changelist, ChangelistId, ChangelistStatus, SpecToken, WorkspaceIdentity, compute_spec_token,
@@ -145,13 +150,17 @@ pub struct DescriptionApplyResult {
 }
 
 pub struct P4WriteService<T> {
-    client: P4Client<T>,
+    pub(crate) client: P4Client<T>,
+    submit_in_flight: Mutex<bool>,
 }
 
 impl<T: P4Transport> P4WriteService<T> {
     #[must_use]
     pub fn new(client: P4Client<T>) -> Self {
-        Self { client }
+        Self {
+            client,
+            submit_in_flight: Mutex::new(false),
+        }
     }
 
     pub fn preview_description_apply(
@@ -217,7 +226,10 @@ impl<T: P4Transport> P4WriteService<T> {
         })
     }
 
-    fn load_snapshot(&self, change: u64) -> Result<DescriptionSnapshot, DescriptionApplyError> {
+    pub(crate) fn load_snapshot(
+        &self,
+        change: u64,
+    ) -> Result<DescriptionSnapshot, DescriptionApplyError> {
         let info =
             self.client
                 .run(&P4Query::Info)
@@ -274,13 +286,38 @@ impl<T: P4Transport> P4WriteService<T> {
             spec_token,
         })
     }
+
+    pub(crate) fn try_begin_submit(&self) -> Option<SubmitFlightGuard<'_>> {
+        let mut in_flight = recover_mutex(&self.submit_in_flight);
+        if *in_flight {
+            return None;
+        }
+        *in_flight = true;
+        Some(SubmitFlightGuard {
+            in_flight: &self.submit_in_flight,
+        })
+    }
 }
 
-struct DescriptionSnapshot {
-    workspace: WorkspaceIdentity,
-    changelist: Changelist,
-    form: ChangeForm,
-    spec_token: SpecToken,
+pub(crate) struct DescriptionSnapshot {
+    pub(crate) workspace: WorkspaceIdentity,
+    pub(crate) changelist: Changelist,
+    pub(crate) form: ChangeForm,
+    pub(crate) spec_token: SpecToken,
+}
+
+pub(crate) struct SubmitFlightGuard<'a> {
+    in_flight: &'a Mutex<bool>,
+}
+
+impl Drop for SubmitFlightGuard<'_> {
+    fn drop(&mut self) {
+        *recover_mutex(self.in_flight) = false;
+    }
+}
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn validate_description(description: &str) -> Result<(), DescriptionApplyError> {
@@ -333,14 +370,14 @@ fn validate_form_identity(
         })
         && form
             .field("Status")
-            .is_some_and(|status| status.eq_ignore_ascii_case("pending"));
+            .is_some_and(|status| status.eq_ignore_ascii_case(changelist.status.canonical_name()));
     if !valid {
         return Err(DescriptionApplyError::InvalidForm);
     }
     Ok(())
 }
 
-fn canonical_description(description: &str) -> String {
+pub(crate) fn canonical_description(description: &str) -> String {
     description
         .replace("\r\n", "\n")
         .replace('\r', "\n")
