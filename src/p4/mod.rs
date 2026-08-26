@@ -30,7 +30,7 @@ pub use parser::{
 pub use process::StdProcessTransport;
 pub use submit::{
     AuthorizedSubmit, SubmitActionCounts, SubmitBlockReason, SubmitError, SubmitIntent,
-    SubmitPreview, SubmitResult,
+    SubmitPreview, SubmitReconciliationReceipt, SubmitReconciliationResult, SubmitResult,
 };
 pub use transport::{
     OutputLimits, P4Client, P4Request, P4Response, P4Transport, RawP4Output, TransportError,

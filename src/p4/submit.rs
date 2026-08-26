@@ -185,6 +185,51 @@ impl SubmitPreview {
     }
 
     #[must_use]
+    pub fn server_id(&self) -> &str {
+        &self.workspace.server_id
+    }
+
+    #[must_use]
+    pub fn user(&self) -> &str {
+        &self.workspace.user
+    }
+
+    #[must_use]
+    pub fn client(&self) -> &str {
+        &self.workspace.client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_workspace_for_test(
+        change: u64,
+        description: impl Into<String>,
+        workspace: WorkspaceIdentity,
+    ) -> Self {
+        let description = description.into();
+        let changelist = Changelist {
+            id: ChangelistId::Numbered(change),
+            status: ChangelistStatus::Pending,
+            owner: workspace.user.clone(),
+            client: workspace.client.clone(),
+            description: description.clone(),
+            files: Vec::new(),
+            preserved_spec_fields: Default::default(),
+            spec_token: None,
+            content_token: None,
+        };
+        Self {
+            change,
+            description,
+            file_count: 0,
+            actions: SubmitActionCounts::default(),
+            spec_token: compute_spec_token(&workspace, &changelist),
+            content_token: ContentToken::from_bytes([0; 32]),
+            workspace,
+            changelist,
+        }
+    }
+
+    #[must_use]
     pub fn authorize(self, intent: SubmitIntent) -> Option<AuthorizedSubmit> {
         matches!(intent, SubmitIntent::SubmitButton | SubmitIntent::CtrlEnter).then_some(
             AuthorizedSubmit {
@@ -207,11 +252,46 @@ pub struct AuthorizedSubmit {
     expected_changelist: Changelist,
 }
 
+impl AuthorizedSubmit {
+    #[must_use]
+    pub fn reconciliation_receipt(&self) -> SubmitReconciliationReceipt {
+        SubmitReconciliationReceipt {
+            change: self.change,
+            expected_workspace: self.expected_workspace.clone(),
+            expected_changelist: self.expected_changelist.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmitResult {
     pub requested_change: u64,
     pub submitted_change: u64,
     pub file_count: usize,
+}
+
+/// Opaque facts retained by the UI when a submit write has an uncertain result.
+/// The receipt contains no credential and can only be used for read-only
+/// reconciliation through [`P4WriteService::reconcile_submit`].
+#[derive(Debug, Clone)]
+pub struct SubmitReconciliationReceipt {
+    change: u64,
+    expected_workspace: WorkspaceIdentity,
+    expected_changelist: Changelist,
+}
+
+impl SubmitReconciliationReceipt {
+    #[must_use]
+    pub const fn change(&self) -> u64 {
+        self.change
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitReconciliationResult {
+    ConfirmedSubmitted(SubmitResult),
+    ConfirmedPending { change: u64, snapshot_changed: bool },
+    Inconclusive,
 }
 
 impl<T: P4Transport> P4WriteService<T> {
@@ -265,6 +345,61 @@ impl<T: P4Transport> P4WriteService<T> {
             submitted_change: authorization.change,
             file_count: refreshed.files.len(),
         })
+    }
+
+    /// Performs only `info` and `describe -s` reads. It never retries submit.
+    /// This is the sole recovery path offered after the write result is unknown.
+    pub fn reconcile_submit(
+        &self,
+        receipt: &SubmitReconciliationReceipt,
+    ) -> Result<SubmitReconciliationResult, SubmitError> {
+        let info = self
+            .client
+            .run(&P4Query::Info)
+            .map_err(|source| SubmitError::Query {
+                stage: "reconciliation workspace refresh",
+                source,
+            })?;
+        let workspace =
+            workspace_from_info(&info.records).map_err(|source| SubmitError::Mapping {
+                stage: "reconciliation workspace identity",
+                source,
+            })?;
+        let describe = self
+            .client
+            .run(&P4Query::DescribeSummary {
+                change: receipt.change,
+            })
+            .map_err(|source| SubmitError::Query {
+                stage: "reconciliation changelist refresh",
+                source,
+            })?;
+        let refreshed =
+            changelist_from_describe(&describe.records).map_err(|source| SubmitError::Mapping {
+                stage: "reconciliation changelist",
+                source,
+            })?;
+
+        if workspace != receipt.expected_workspace || refreshed.id != receipt.expected_changelist.id
+        {
+            return Ok(SubmitReconciliationResult::Inconclusive);
+        }
+        if submitted_matches(&refreshed, &receipt.expected_changelist) {
+            return Ok(SubmitReconciliationResult::ConfirmedSubmitted(
+                SubmitResult {
+                    requested_change: receipt.change,
+                    submitted_change: receipt.change,
+                    file_count: refreshed.files.len(),
+                },
+            ));
+        }
+        if refreshed.status == ChangelistStatus::Pending {
+            return Ok(SubmitReconciliationResult::ConfirmedPending {
+                change: receipt.change,
+                snapshot_changed: !pending_matches(&refreshed, &receipt.expected_changelist),
+            });
+        }
+        Ok(SubmitReconciliationResult::Inconclusive)
     }
 
     fn load_submit_snapshot(&self, change: u64) -> Result<SubmitSnapshot, SubmitError> {
@@ -653,6 +788,16 @@ fn action_counts(files: &[ChangedFile]) -> SubmitActionCounts {
 fn submitted_matches(refreshed: &Changelist, expected: &Changelist) -> bool {
     refreshed.id == expected.id
         && refreshed.status == ChangelistStatus::Submitted
+        && refreshed.owner == expected.owner
+        && refreshed.client == expected.client
+        && canonical_description(&refreshed.description)
+            == canonical_description(&expected.description)
+        && file_projection(&refreshed.files) == file_projection(&expected.files)
+}
+
+fn pending_matches(refreshed: &Changelist, expected: &Changelist) -> bool {
+    refreshed.id == expected.id
+        && refreshed.status == ChangelistStatus::Pending
         && refreshed.owner == expected.owner
         && refreshed.client == expected.client
         && canonical_description(&refreshed.description)
@@ -1148,6 +1293,49 @@ mod tests {
         assert_eq!(preview.actions.move_adds, 1);
         assert_eq!(preview.actions.move_deletes, 1);
         assert_eq!(preview.file_count, 2);
+    }
+
+    #[test]
+    fn reconciliation_is_read_only_and_distinguishes_pending_from_submitted() {
+        let workspace = TestWorkspace::new();
+        let fake = FakeP4Transport::default();
+        push_pending_snapshot(&fake, &workspace, 0);
+        let service = service(fake.clone(), &workspace.root);
+        let authorization = service
+            .preview_submit(42)
+            .expect("preview")
+            .authorize(SubmitIntent::SubmitButton)
+            .expect("authorization");
+        let receipt = authorization.reconciliation_receipt();
+
+        fake.push_output(output(info(&workspace.root)));
+        fake.push_output(output(describe("pending", 1)));
+        assert_eq!(
+            service.reconcile_submit(&receipt).expect("pending refresh"),
+            SubmitReconciliationResult::ConfirmedPending {
+                change: 42,
+                snapshot_changed: false,
+            }
+        );
+
+        fake.push_output(output(info(&workspace.root)));
+        fake.push_output(output(describe("submitted", 1)));
+        assert_eq!(
+            service
+                .reconcile_submit(&receipt)
+                .expect("submitted refresh"),
+            SubmitReconciliationResult::ConfirmedSubmitted(SubmitResult {
+                requested_change: 42,
+                submitted_change: 42,
+                file_count: 1,
+            })
+        );
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|request| !request.args.iter().any(|argument| argument == "submit"))
+        );
+        assert_eq!(fake.remaining_steps(), 0);
     }
 
     #[test]

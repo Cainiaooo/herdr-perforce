@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 blake3 = "1"
+crossterm = "0.28"
 serde_json = "1"
 
 [profile.release]
@@ -26,4 +27,3 @@ strip = "symbols"
 
 [lints.rust]
 unsafe_code = "forbid"
-

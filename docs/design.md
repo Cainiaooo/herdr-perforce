@@ -589,8 +589,15 @@ Description Apply 前重新查询并比较 `spec_token`；Submit confirmation �
 - Herdr context/target Agent unavailable。
 - stale CL before Apply/Submit。
 - submit rejected by server。
+- submit outcome uncertain：write timeout/连接中断，或 write 返回后刷新、认证、权限、解析、匹配验证失败。
 
 错误信息必须给出下一步，但不能建议自动执行有破坏性的修复。
+
+Submit UI 还必须附带结果确定性：
+
+- `not-started`：preflight/重新校验失败，未运行 `p4 submit`；修复原因后只能重新 preflight。
+- `rejected`：write 获得认证、权限或服务器明确拒绝；仍需重新 preflight 和新的显式确认，不能自动重试。
+- `unknown`：write 可能已经到达服务器；UI 禁止再次 Submit，只允许用原确认保存的 workspace/CL receipt 运行 `info` 和 `describe -s` 只读 reconciliation。只有确认 submitted 才显示成功；确认 pending 时旧确认作废；查询仍失败或环境不匹配时保持 unknown。
 
 ## 16. 首版非目标
 

@@ -200,6 +200,14 @@ fixture builder 应返回逻辑别名到动态 changelist number 的映射，测
 | `out_of_date` | 非 head revision | submit 预检给出明确诊断 |
 | `locked_other` | 第二用户持有 `+l` | 显示持有者且禁止错误写入 |
 | `submit_success` | 可提交的隔离 CL | 确认后提交且 UI 刷新 |
+| `auth_preflight` | preflight 返回登录过期 | not-started、提示登录、无 submit |
+| `permission_preflight` | restricted/permission denied | not-started、不泄漏内容、无 submit |
+| `timeout_preflight` | preflight transport timeout | not-started、可显式刷新、无 submit |
+| `reject_write` | submit 明确返回认证/权限/服务器拒绝 | rejected、不自动修复或重试 |
+| `unknown_write` | submit timeout/断网/输出不完整 | unknown、仅显示只读 reconciliation |
+| `unknown_post_write` | submit 后 refresh 的认证/权限/timeout/mismatch | unknown、禁止再次 submit |
+| `reconcile_submitted` | receipt 对应 CL 已 submitted | 只读确认成功并刷新 UI |
+| `reconcile_pending` | receipt 对应 CL 仍 pending | 旧确认失效，要求新 preflight |
 
 ## 6. 核心测试矩阵
 
@@ -233,6 +241,9 @@ Submit 测试还应覆盖：
 - 展示实际 server/user/client/change 摘要后才允许确认。
 - preflight、真实 submit、失败恢复和成功后的状态刷新。
 - dry-run 或 parser 测试不能替代真实 loopback submit。
+- 故障注入必须分别记录 write 是否已经启动；write 可能启动后的任何 timeout/断网/解析或验证失败都归为 unknown。
+- unknown 状态只能携带无 credential 的 opaque reconciliation receipt；恢复动作只允许运行当前 cwd 下的 `info` 和 `describe -s`，不得调用 submit 或切换到其他 P4 配置。
+- reconciliation 的 pending 结果必须使旧授权失效；submitted 结果必须与 receipt 的 workspace、CL spec 和文件投影匹配后才显示成功。
 
 ### 6.4 UI 与宿主集成
 

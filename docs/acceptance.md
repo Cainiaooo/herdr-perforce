@@ -575,6 +575,24 @@ Submit 仅对 owned、current-client、numbered pending CL 启用。以下对象
 在确认前取消。
 期望：没有任何 P4 写命令，CL 保持不变。
 
+### ACC-SUBMIT-008（P0）认证、权限、超时与不确定结果矩阵
+
+用确定性 fake transport 覆盖全部单元格；标记为 write 后的场景还需在 Level C 隔离服务器复验：
+
+| 注入点 | 故障 | UI 结果确定性 | 允许的下一步 | 禁止行为 |
+|---|---|---|---|---|
+| preflight/确认后重读 | authentication expired | `not-started` | `p4 login` 后显式刷新 preflight | 显示成功、自动登录、自动 submit |
+| preflight/确认后重读 | permission denied/restricted CL | `not-started` | 申请权限后显式刷新 | 泄漏受限 CL 内容、自动 submit |
+| preflight/确认后重读 | timeout/network unavailable | `not-started` | 恢复连接后显式刷新 | 把超时当空结果、自动 submit |
+| `p4 submit -c` 返回明确错误 | authentication/permission/server rejection | `rejected` | 修复条件后重新 preflight 和确认 | resolve/unlock/revert 或自动重试 |
+| `p4 submit -c` | timeout、连接中断、输出截断/无法解析 | `unknown` | 只读 reconciliation | 再次 submit、显示成功或显示确定失败 |
+| write 已返回后 refresh/verify | authentication、permission、timeout、network、mapping/mismatch | `unknown` | 恢复只读能力后 reconciliation | 再次 submit、覆盖旧 receipt |
+| reconciliation | 匹配的 submitted CL | confirmed success | 刷新 pane | 再次 submit |
+| reconciliation | pending CL | confirmed pending；旧确认失效 | 新 preflight + 新显式确认 | 复用旧确认 |
+| reconciliation | 查询失败/环境或内容不匹配 | 保持 `unknown` | 人工检查 P4 server | 再次 submit |
+
+所有故障信息只显示分类后的可操作提示，不显示原始 server/user/client/path/ticket。重复 `r` 只能重复只读 reconciliation，不能隐式创建新的写授权。
+
 ## 12. 配置、状态和隐私
 
 ### ACC-CONFIG-001（P0）配置热重载

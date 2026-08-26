@@ -4,5 +4,7 @@
 //! implementation, or Herdr transport. This keeps P4 parsing, freshness and
 //! state-transition contracts testable without touching a real workspace.
 
+pub mod app;
 pub mod domain;
 pub mod p4;
+pub mod tui;
