@@ -1,6 +1,6 @@
 # Herdr Perforce 扩展测试方案
 
-状态：开发前基线  
+状态：当前实现验证记录
 适用范围：Windows 优先的 Herdr Perforce 侧边栏扩展  
 关联文档：[设计目标](design.md) · [验收标准](acceptance.md)
 
@@ -8,7 +8,7 @@
 
 | 层级 | 状态 | 执行日期 | 实际结果 |
 |---|---|---|---|
-| Level A | 已验收 | 2026-08-26 | `cargo fmt --check`、Clippy、release build 和 `cargo test --workspace --all-targets` 通过；library 115 个、CLI 16 个，共 131 个测试 |
+| Level A | 已验收 | 2026-08-27 | `cargo fmt --check`、Clippy、release build 和 `cargo test --workspace --all-targets` 通过；library 177 个、CLI 17 个，共 194 个测试 |
 | Level B | 部分完成 | 2026-08-25 | 显式只读 runner 的真实 `info/changes/describe/opened` 通过；当前仓库 cwd 不在 client view，`where` 明确 skip，未回退配置 |
 | Level C | 部分完成 | 2026-08-26 | 独立 harness 的 16 个测试和真实 loopback `p4d` 通过；产品 Description Apply 与 Submit 均完成 stale 拒绝和成功写入闭环，另含 shelf、`binary+l`、第二 client 逐字节验证、隐私扫描和精确清理 |
 
@@ -253,8 +253,9 @@ Submit 测试还应覆盖：
 
 ### 6.4 UI 与宿主集成
 
-- 右侧 pane 内保持“两列”：左侧主区域为 diff，右侧窄列为 changelist/files 树。
-- 宽度不足时按设计定义降级，不把 pane 扩成全屏工作台。
+- 默认保持 `Agent CLI | 最右导航`，导航约占 20%；打开内容后保持 `Agent CLI | Content | 最右导航`，前两栏近似等宽。
+- File/Diff/CL 复用同一个 Content pane；关闭 Content 后 split 正常折叠，不替换或关闭 Agent pane。
+- 验证 Content 按 pane 宽度自动换行、文件续行保留空白行号 gutter 并与正文对齐、换行后完整纵向滚动、语法高亮、CL→Diff→返回，以及长行不会改变导航树宽度。
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。

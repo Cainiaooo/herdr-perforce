@@ -13,11 +13,11 @@
 
 ## Decision
 
-- 工作区 File Explorer（本地目录树、文本预览、只读 P4 装饰）在 `herdr-perforce` **同一 plugin pane 内**实现，作为与 Review 并列的内部 view。
+- 工作区 File Explorer（本地目录树、只读 P4 装饰）在 `herdr-perforce` 的**导航 pane** 内实现，作为与 Review 并列的内部 view；文件内容在 [ADR-0006](0006-standalone-content-pane.md) 定义的独立内容 pane 中显示。
 - 不安装、不调用、不 fork 社区 File/Git 插件来提供这棵树。
 - Explorer 根默认为当前 Herdr workspace **cwd**（不是 Client root，也不是 depot 根）。列举不得走出 Client root / client view。
-- 首版 Explorer 只读：不从树上执行 `add` / `edit` / `delete` / `sync` / `revert`。点 opened 文件可跳到现有 Review/Diff。
-- Review 模式继续遵守 [ADR-0001](0001-right-sidebar-layout.md)：左 Diff、右 CL 树。
+- 首版 Explorer 只读：不从树上执行 `add` / `edit` / `delete` / `sync` / `revert`。选择文件可在内容 pane 查看 File；opened 文件还可查看 Diff。
+- Explorer 与 Review 共用最右侧窄导航 pane；File、Diff 和 CL 文件列表共用中间内容 pane。
 - 树控件和预览可以借鉴 `herdr-sidebar` / `herdr-reviewr` 的交互，代码在本仓库重写，不抽跨插件 crate 作为首版完成条件。
 
 ## Rejected alternatives

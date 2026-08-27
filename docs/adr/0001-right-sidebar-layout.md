@@ -1,6 +1,6 @@
 # ADR-0001：右侧紧凑 pane 与左 Diff、右导航
 
-状态：Accepted
+状态：Superseded by [ADR-0006](0006-standalone-content-pane.md)
 日期：2026-08-24
 
 ## Context

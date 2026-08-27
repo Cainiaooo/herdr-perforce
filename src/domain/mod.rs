@@ -1,7 +1,13 @@
+mod explorer;
 mod freshness;
 
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
+pub use explorer::{
+    ExplorerDecoration, ExplorerEntry, ExplorerEntryKind, FileP4Facts, MAX_DIRECTORY_ENTRIES,
+    MAX_PREVIEW_BYTES, MAX_PREVIEW_LINES, PreviewContent, PreviewTruncation, VisibleExplorerRow,
+    decoration_from_facts, flatten_explorer_tree, preview_from_bytes,
+};
 pub use freshness::{ContentToken, SpecToken, compute_spec_token};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -166,6 +166,33 @@ impl<T: P4Transport> P4Client<T> {
         self.run_structured(query.args(), Vec::new())
     }
 
+    /// Parses structured records even when some paths are unmapped or missing.
+    ///
+    /// Explorer decorations need per-path `where`/`fstat` errors. Authentication,
+    /// network, trust, timeout, and malformed output still fail closed.
+    pub(crate) fn run_records(&self, query: &P4Query) -> Result<P4Response, P4Error> {
+        let output = self.execute(query.args(), Vec::new())?;
+        match parse_json_records(&output.stdout) {
+            Ok(records) => {
+                if let Some(error) = fatal_structured_failure(&records, &output.stderr) {
+                    return Err(error);
+                }
+                Ok(P4Response {
+                    records,
+                    elapsed: output.elapsed,
+                })
+            }
+            Err(_) if output.stdout.is_empty() && output.exit_code != 0 => {
+                Err(classify_command_failure(&[], &output.stderr))
+            }
+            Err(_) if output.stdout.is_empty() => Ok(P4Response {
+                records: Vec::new(),
+                elapsed: output.elapsed,
+            }),
+            Err(_) => Err(known_error(P4ErrorKind::MalformedOutput)),
+        }
+    }
+
     pub(crate) fn run_with_timeout(
         &self,
         query: &P4Query,
@@ -264,6 +291,29 @@ impl<T: P4Transport> P4Client<T> {
         }
 
         Ok(output)
+    }
+}
+
+fn fatal_structured_failure(records: &[StructuredRecord], stderr: &[u8]) -> Option<P4Error> {
+    if !records
+        .iter()
+        .any(|record| matches!(record.code, super::parser::RecordCode::Error))
+    {
+        return None;
+    }
+    let error = classify_command_failure(records, stderr);
+    match error.kind {
+        P4ErrorKind::AuthenticationExpired
+        | P4ErrorKind::NetworkUnavailable
+        | P4ErrorKind::TrustRequired
+        | P4ErrorKind::PermissionDenied
+        | P4ErrorKind::TimedOut
+        | P4ErrorKind::Cancelled
+        | P4ErrorKind::OutputLimitExceeded
+        | P4ErrorKind::ExecutableMissing => Some(error),
+        P4ErrorKind::NotInClientView
+        | P4ErrorKind::MalformedOutput
+        | P4ErrorKind::CommandFailed => None,
     }
 }
 
@@ -379,6 +429,52 @@ mod tests {
             .run(&P4Query::Info)
             .expect_err("output should exceed budget");
         assert_eq!(error.kind, P4ErrorKind::OutputLimitExceeded);
+    }
+
+    #[test]
+    fn run_records_keeps_per_path_view_errors() {
+        let fake = FakeP4Transport::default();
+        fake.push_output(RawP4Output {
+            stdout: br#"{"code":"stat","depotFile":"//d/a.txt","path":"C:/ws/a.txt"}
+{"code":"error","data":"C:/ws/skip.txt - file(s) not in client view.\n"}"#
+                .to_vec(),
+            stderr: Vec::new(),
+            exit_code: 1,
+            elapsed: Duration::from_millis(1),
+        });
+        let client = isolated_client(fake, "C:/ws");
+        let response = client
+            .run_records(&P4Query::WhereMany {
+                paths: vec!["C:/ws/a.txt".into(), "C:/ws/skip.txt".into()],
+            })
+            .expect("mixed where output is usable");
+        assert_eq!(response.records.len(), 2);
+        assert!(matches!(
+            response.records[0].code,
+            crate::p4::RecordCode::Stat
+        ));
+        assert!(matches!(
+            response.records[1].code,
+            crate::p4::RecordCode::Error
+        ));
+    }
+
+    #[test]
+    fn run_records_rejects_structured_permission_errors() {
+        let fake = FakeP4Transport::default();
+        fake.push_output(RawP4Output {
+            stdout: br#"{"code":"error","generic":"6","data":"access denied"}"#.to_vec(),
+            stderr: Vec::new(),
+            exit_code: 1,
+            elapsed: Duration::from_millis(1),
+        });
+        let client = isolated_client(fake, "C:/ws");
+        let error = client
+            .run_records(&P4Query::Fstat {
+                paths: vec!["C:/ws/secret.txt".into()],
+            })
+            .expect_err("permission failure must not become a decoration");
+        assert_eq!(error.kind, P4ErrorKind::PermissionDenied);
     }
 
     #[test]

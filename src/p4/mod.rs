@@ -4,6 +4,7 @@ mod config;
 mod description;
 mod env;
 mod error;
+pub mod explorer;
 pub mod fake;
 mod form;
 pub mod level_b;
@@ -20,6 +21,10 @@ pub use description::{
 };
 pub use env::{herdr_control_variable_names, is_herdr_control_variable};
 pub use error::{P4Error, P4ErrorKind};
+pub use explorer::{
+    ExplorerError, LoadedDirectory, cwd_is_in_client_view, decorate_entries, list_local_directory,
+    load_explorer_directory, load_opened_records, load_workspace_diff, read_workspace_preview,
+};
 pub use level_b::{
     LevelBError, LevelBIdentitySummary, LevelBReport, LevelBSampleStatus, LevelBWhereStatus,
     MAX_LEVEL_B_CHANGES, run_level_b_read_only,

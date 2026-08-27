@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode, ExitStatus},
+    process::{Command as ProcessCommand, ExitCode, ExitStatus, Output},
 };
 
 use herdr_perforce::p4::{P4Client, StdProcessTransport, run_level_b_read_only};
@@ -12,6 +12,7 @@ use herdr_perforce::panel_restore::{
     opened_pane_id, pane_process_is_active, parse_pane_list, perforce_pane_candidates,
     remember_workspace, target_pane_id,
 };
+use herdr_perforce::tui::navigation_resize_args_for_layout;
 use serde_json::Value;
 
 const HELP: &str = concat!(
@@ -21,6 +22,7 @@ const HELP: &str = concat!(
     "  herdr-p4 --help\n",
     "  herdr-p4 level-b --read-only [--cwd <workspace-path>]\n",
     "  herdr-p4 pane [--cwd <workspace-path>]\n",
+    "  herdr-p4 viewer [--cwd <workspace-path>]\n",
     "  herdr-p4 open-pane\n",
     "  herdr-p4 restore-panes\n\n",
     "Level B is explicitly opt-in and only runs bounded info, changes, describe, opened,\n",
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         }
         Ok(Command::LevelB { cwd }) => run_level_b(cwd),
         Ok(Command::Pane { cwd }) => run_pane(cwd),
+        Ok(Command::Viewer { cwd }) => run_viewer(cwd),
         Ok(Command::OpenPane) => open_herdr_pane(),
         Ok(Command::RestorePanes) => restore_herdr_panes(),
         Err(message) => {
@@ -56,6 +59,7 @@ enum Command {
     Version,
     LevelB { cwd: Option<PathBuf> },
     Pane { cwd: Option<PathBuf> },
+    Viewer { cwd: Option<PathBuf> },
     OpenPane,
     RestorePanes,
 }
@@ -86,6 +90,13 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, &'static str> {
             cwd: Some(PathBuf::from(cwd)),
         }),
         [pane, ..] if pane == "pane" => Err("pane accepts only [--cwd <workspace-path>]"),
+        [viewer] if viewer == "viewer" => Ok(Command::Viewer { cwd: None }),
+        [viewer, cwd_flag, cwd] if viewer == "viewer" && cwd_flag == "--cwd" => {
+            Ok(Command::Viewer {
+                cwd: Some(PathBuf::from(cwd)),
+            })
+        }
+        [viewer, ..] if viewer == "viewer" => Err("viewer accepts only [--cwd <workspace-path>]"),
         [open] if open == "open-pane" => Ok(Command::OpenPane),
         [open, ..] if open == "open-pane" => Err("open-pane accepts no arguments"),
         [restore] if restore == "restore-panes" => Ok(Command::RestorePanes),
@@ -105,6 +116,22 @@ fn run_pane(requested: Option<PathBuf>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Herdr pane failed: {error}");
+            ExitCode::from(70)
+        }
+    }
+}
+
+fn run_viewer(requested: Option<PathBuf>) -> ExitCode {
+    let Some(cwd) = resolve_pane_cwd(requested) else {
+        eprintln!(
+            "Herdr content pane could not resolve a workspace cwd from --cwd or HERDR_PLUGIN_CONTEXT_JSON"
+        );
+        return ExitCode::from(66);
+    };
+    match herdr_perforce::tui::run_content_pane(cwd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Herdr content pane failed: {error}");
             ExitCode::from(70)
         }
     }
@@ -233,11 +260,12 @@ fn open_herdr_pane() -> ExitCode {
         current_pane_context(&executable),
     );
     let plugin_root = env::var_os("HERDR_PLUGIN_ROOT").map(PathBuf::from);
-    let mut command = ProcessCommand::new(executable);
+    let mut command = ProcessCommand::new(&executable);
     let args = herdr_open_pane_args(context.as_ref(), plugin_root.as_deref());
     command.args(args);
     match command.output() {
         Ok(output) if output.status.success() => {
+            resize_opened_navigation_pane(&executable, &output.stdout);
             remember_opened_pane(context.as_ref(), &output.stdout, plugin_root.as_deref());
             println!("Herdr Perforce pane opened");
             ExitCode::SUCCESS
@@ -396,6 +424,7 @@ fn restore_herdr_panes() -> ExitCode {
                 continue;
             }
         };
+        resize_opened_navigation_pane(&executable, &output.stdout);
         restored += 1;
         let cleanup = close_stale_panes(&executable, &stale_pane_ids);
         stale_closed += cleanup.closed;
@@ -427,6 +456,65 @@ fn restore_herdr_panes() -> ExitCode {
     } else {
         ExitCode::from(70)
     }
+}
+
+fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
+    let Some(pane_id) = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .as_ref()
+        .and_then(opened_pane_id)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    // Query actual geometry instead of assuming the opening ratio. This also
+    // absorbs terminal chrome and any future Herdr default-ratio change.
+    for attempt in 0..4 {
+        let layout_args = herdr_navigation_layout_args(&pane_id);
+        if let Ok(layout) = run_herdr_json(executable, &layout_args) {
+            let Some(resize_args) = navigation_resize_args_for_layout(&layout, &pane_id) else {
+                return;
+            };
+            if ProcessCommand::new(executable)
+                .args(&resize_args)
+                .output()
+                .is_ok_and(|output| herdr_output_succeeded(&output))
+            {
+                return;
+            }
+        }
+        if attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    // A just-created plugin pane is a 50/50 split in Herdr 0.8.2. If layout
+    // metadata never becomes available, retain the bounded legacy fallback
+    // instead of leaving navigation at half the tab.
+    let _ = ProcessCommand::new(executable)
+        .args(herdr_navigation_resize_fallback_args(&pane_id))
+        .output();
+}
+
+fn herdr_navigation_layout_args(pane_id: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("pane"),
+        OsString::from("layout"),
+        OsString::from("--pane"),
+        OsString::from(pane_id),
+    ]
+}
+
+fn herdr_navigation_resize_fallback_args(pane_id: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("pane"),
+        OsString::from("resize"),
+        OsString::from("--direction"),
+        OsString::from("right"),
+        OsString::from("--amount"),
+        OsString::from("0.3"),
+        OsString::from("--pane"),
+        OsString::from(pane_id),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -505,10 +593,17 @@ fn run_herdr_json(executable: &OsStr, args: &[OsString]) -> Result<Value, &'stat
         .args(args)
         .output()
         .map_err(|_| "Herdr binary could not be invoked")?;
-    if !output.status.success() {
+    if !herdr_output_succeeded(&output) {
         return Err("Herdr command was rejected");
     }
     serde_json::from_slice(&output.stdout).map_err(|_| "Herdr response is invalid")
+}
+
+fn herdr_output_succeeded(output: &Output) -> bool {
+    output.status.success()
+        && serde_json::from_slice::<Value>(&output.stdout)
+            .map(|response| response.get("error").is_none())
+            .unwrap_or_else(|_| output.stdout.is_empty())
 }
 
 fn exit_code_from_status(status: &ExitStatus) -> ExitCode {
@@ -740,6 +835,12 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command(strings(&["viewer", "--cwd", "C:/Example Workspace"])),
+            Ok(Command::Viewer {
+                cwd: Some(PathBuf::from("C:/Example Workspace"))
+            })
+        );
+        assert_eq!(
             parse_command(strings(&["open-pane"])),
             Ok(Command::OpenPane)
         );
@@ -748,6 +849,27 @@ mod tests {
             Ok(Command::RestorePanes)
         );
         assert!(parse_command(strings(&["submit", "42"])).is_err());
+    }
+
+    #[test]
+    fn opened_navigation_pane_layout_is_queried_by_id() {
+        assert_eq!(
+            herdr_navigation_layout_args("workspace:p2"),
+            strings(&["pane", "layout", "--pane", "workspace:p2",])
+        );
+        assert_eq!(
+            herdr_navigation_resize_fallback_args("workspace:p2"),
+            strings(&[
+                "pane",
+                "resize",
+                "--direction",
+                "right",
+                "--amount",
+                "0.3",
+                "--pane",
+                "workspace:p2",
+            ])
+        );
     }
 
     #[test]

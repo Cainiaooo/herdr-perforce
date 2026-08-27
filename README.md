@@ -2,7 +2,7 @@
 
 `herdr-perforce` 是运行在 [Herdr](https://herdr.dev/) 右侧 terminal pane 中的紧凑 Perforce 插件。它让你留在当前 Herdr workspace 内查看 pending changelist，并通过可见、可取消、显式授权的 Submit overlay 提交 numbered changelist。
 
-> 当前版本是开发预览。Submit 的产品写流程和隔离 `p4d` 闭环已经验证；完整 diff/navigator 与真实 Herdr 宿主内的最终 UI 验收仍在推进。
+> 当前版本是开发预览。Submit 的产品写流程和隔离 `p4d` 闭环已经验证；独立内容 pane 的真实 Herdr 宿主 UI 验收仍在推进。
 
 ## 功能
 
@@ -57,7 +57,7 @@ herdr plugin action invoke open-windows --plugin herdr.perforce
 herdr plugin action invoke open --plugin herdr.perforce
 ```
 
-也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开 split pane，并把打开前的 workspace/pane context 交给插件。
+也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
 
 ### Panel 加载与自动恢复
 
@@ -96,6 +96,10 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 | 按键 | 行为 |
 |---|---|
 | `j` / `k`、方向键 | 选择 changelist |
+| `1` / `2` | 切换 Explorer / Review 导航 |
+| `Enter` | Explorer 中打开 File；Review 中打开 CL 文件列表 |
+| `d` | Explorer 中为 opened file 打开 Diff |
+| `o` | 使用系统默认应用打开 Explorer 选中路径 |
 | `s` | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
 | `r` | 重新执行只读 workspace/CL 刷新 |
 | `q` | 在没有阻塞 overlay 时关闭插件 pane |
@@ -111,6 +115,8 @@ Submit overlay：
 | `r` | 失败后重新 preflight；结果未知时仅运行只读 reconciliation |
 
 overlay 打开时，背景列表不会响应 Submit 或导航快捷键。SubmitRunning 期间无法从插件内取消、关闭或启动第二次提交。
+
+内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；从 CL 文件列表进入 Diff 后，`Esc` 返回列表。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 使用 `📂`、`📁`、`📄` 区分展开目录、折叠目录和文件。
 
 ## Submit 安全模型
 
@@ -226,7 +232,7 @@ herdr plugin unlink herdr.perforce
 
 ## 当前限制
 
-- 当前 pane 重点覆盖 pending CL 列表和 Submit overlay；完整文件树、diff、review comment 和 Description Apply UI 尚未接完。
+- 当前版本已接入本地目录树、独立 File/Diff/CL 内容 pane 和滚动/高亮；review comment 与 Description Apply UI 尚未接完。
 - 自动打开只覆盖成功手动打开过的 remembered workspaces；当前版本不会扫描全部 Herdr workspace 并运行 `p4 info` 自动判定。
 - 不支持 default changelist、部分文件、其他用户或其他 client 的 Submit。
 - 不支持自动 resolve、lock 修复或任何自主提交。

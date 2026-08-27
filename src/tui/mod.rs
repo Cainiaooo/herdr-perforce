@@ -1,4 +1,9 @@
-//! Minimal terminal pane for the first Herdr Submit integration slice.
+//! Terminal pane: workspace File Explorer and Submit review views.
+
+mod content;
+mod explorer;
+mod syntax;
+mod wrap;
 
 use std::{
     io::{self, Write},
@@ -26,12 +31,21 @@ use crate::{
     app::{SubmitOutcomeCertainty, SubmitOverlay, SubmitOverlayRequest, SubmitOverlayState},
     domain::{Changelist, ChangelistId, WorkspaceIdentity},
     p4::{
-        DomainMappingError, P4Client, P4Error, P4Query, P4Transport, P4WriteService,
-        StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview, SubmitReconciliationResult,
-        SubmitResult, WorkspaceCwdError, pending_changelists_from_changes, workspace_owning_cwd,
+        DomainMappingError, ExplorerError, LoadedDirectory, P4Client, P4Error, P4Query,
+        P4Transport, P4WriteService, StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview,
+        SubmitReconciliationResult, SubmitResult, WorkspaceCwdError, cwd_is_in_client_view,
+        load_explorer_directory, load_opened_records, pending_changelists_from_changes,
+        workspace_owning_cwd,
     },
     submit_provider::{ExternalLaunchError, SubmitProvider},
 };
+
+use self::content::ContentPaneClient;
+use self::explorer::{
+    ExplorerAction, ExplorerLoadState, ExplorerModel, connection_message, open_with_default_app,
+};
+
+pub use self::content::{navigation_resize_args_for_layout, run_content_pane};
 
 const MAX_VISIBLE_CHANGELISTS: u16 = 4_096;
 const EVENT_POLL: Duration = Duration::from_millis(50);
@@ -56,11 +70,9 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
     let mut dirty = false;
     loop {
         while let Ok(message) = receiver.try_recv() {
-            let refresh_after = pane.handle_message(message);
+            let effect = pane.handle_message(message);
             dirty = true;
-            if refresh_after {
-                pane.reload_overview(&sender);
-            }
+            apply_message_effect(&mut pane, effect, &sender);
         }
 
         if dirty {
@@ -181,6 +193,35 @@ enum PaneMessage {
         request_id: u64,
         result: Result<SubmitReconciliationResult, SubmitError>,
     },
+    ExplorerRoot {
+        generation: u64,
+        result: Result<LoadedDirectory, ExplorerRootFailure>,
+    },
+    ExplorerDirectory {
+        generation: u64,
+        path: PathBuf,
+        result: Result<LoadedDirectory, ExplorerError>,
+    },
+}
+
+#[derive(Debug)]
+enum ExplorerRootFailure {
+    NotInView,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneView {
+    Explorer,
+    Review,
+}
+
+enum MessageEffect {
+    None,
+    ReloadOverview,
+    LoadExplorerRoot,
+    LoadExplorerExpanded,
+    LoadExplorerDirectory,
 }
 
 #[derive(Debug)]
@@ -200,9 +241,12 @@ enum OverviewState {
 #[derive(Debug)]
 struct PaneModel {
     cwd: PathBuf,
+    view: PaneView,
     overview: OverviewState,
     overview_generation: u64,
     selected: usize,
+    explorer: ExplorerModel,
+    content: ContentPaneClient,
     overlay: SubmitOverlay,
     submit_provider: Arc<SubmitProvider>,
     reload_provider_from_environment: bool,
@@ -219,10 +263,13 @@ impl PaneModel {
 
     fn new_with_provider(cwd: PathBuf, submit_provider: Arc<SubmitProvider>) -> Self {
         Self {
-            cwd,
+            cwd: cwd.clone(),
+            view: PaneView::Review,
             overview: OverviewState::Loading,
             overview_generation: 1,
             selected: 0,
+            explorer: ExplorerModel::new(cwd.clone()),
+            content: ContentPaneClient::new(cwd.clone()),
             overlay: SubmitOverlay::default(),
             submit_provider,
             reload_provider_from_environment: true,
@@ -251,13 +298,16 @@ impl PaneModel {
         request_overview(self.cwd.clone(), self.overview_generation, sender.clone());
     }
 
-    fn handle_message(&mut self, message: PaneMessage) -> bool {
+    fn handle_message(&mut self, message: PaneMessage) -> MessageEffect {
         match message {
             PaneMessage::Overview { generation, result } => {
                 if generation == self.overview_generation {
                     self.install_overview(result);
+                    if matches!(self.overview, OverviewState::Ready(_)) {
+                        return MessageEffect::LoadExplorerRoot;
+                    }
                 }
-                false
+                MessageEffect::None
             }
             PaneMessage::Preflight {
                 change,
@@ -265,12 +315,16 @@ impl PaneModel {
                 result,
             } => {
                 self.overlay.complete_preflight(change, request_id, *result);
-                false
+                MessageEffect::None
             }
             PaneMessage::Submit { change, result } => {
                 let succeeded = result.is_ok();
                 self.overlay.complete_submit(change, result);
-                succeeded
+                if succeeded {
+                    MessageEffect::ReloadOverview
+                } else {
+                    MessageEffect::None
+                }
             }
             PaneMessage::ExternalHandoff { change, result } => {
                 match result {
@@ -284,7 +338,7 @@ impl PaneModel {
                         self.overlay.complete_external_handoff(change, Err(detail))
                     }
                 }
-                false
+                MessageEffect::None
             }
             PaneMessage::Reconcile {
                 change,
@@ -297,7 +351,37 @@ impl PaneModel {
                 );
                 self.overlay
                     .complete_reconciliation(change, request_id, result);
-                submitted
+                if submitted {
+                    MessageEffect::ReloadOverview
+                } else {
+                    MessageEffect::None
+                }
+            }
+            PaneMessage::ExplorerRoot { generation, result } => {
+                match result {
+                    Ok(listing) => self.explorer.install_root(generation, Ok(listing)),
+                    Err(ExplorerRootFailure::NotInView) => {
+                        self.explorer.install_not_in_view(generation);
+                    }
+                    Err(ExplorerRootFailure::Failed(message)) => {
+                        self.explorer.install_failure(generation, message);
+                    }
+                }
+                if matches!(self.explorer.load_state(), ExplorerLoadState::Ready)
+                    && !self.explorer.remaining_expanded_directories().is_empty()
+                {
+                    MessageEffect::LoadExplorerExpanded
+                } else {
+                    MessageEffect::None
+                }
+            }
+            PaneMessage::ExplorerDirectory {
+                generation,
+                path,
+                result,
+            } => {
+                self.explorer.install_directory(generation, path, result);
+                MessageEffect::None
             }
         }
     }
@@ -316,13 +400,47 @@ impl PaneModel {
                     })
                     .unwrap_or(0);
                 self.status = format!("Loaded {} changelist(s)", overview.changes.len());
+                self.explorer
+                    .begin_workspace_load(overview.identity.clone());
                 self.overview = OverviewState::Ready(overview);
             }
             Err(error) => {
                 self.status = "Workspace refresh failed".to_owned();
+                self.explorer.on_overview_failed(error.message());
                 self.overview = OverviewState::Failed(error.message());
             }
         }
+    }
+
+    fn open_selected_diff(&mut self) -> bool {
+        let Some((change, path)) = self.explorer.jump_target() else {
+            self.status = "Selected file is not opened in a changelist".to_owned();
+            return false;
+        };
+        self.status = self
+            .content
+            .show_diff(change, path)
+            .unwrap_or_else(|error| error);
+        true
+    }
+
+    fn open_selected_file(&mut self) -> bool {
+        let Some(path) = self.explorer.selected_file_path() else {
+            return false;
+        };
+        self.status = self.content.show_file(path).unwrap_or_else(|error| error);
+        true
+    }
+
+    fn open_selected_changelist(&mut self) -> bool {
+        let Some(change) = self.selected_changelist().map(|change| change.id) else {
+            return false;
+        };
+        self.status = self
+            .content
+            .show_changelist(change)
+            .unwrap_or_else(|error| error);
+        true
     }
 
     fn selected_changelist(&self) -> Option<&Changelist> {
@@ -366,6 +484,14 @@ impl PaneModel {
 
         match key.code {
             KeyCode::Char('q') => true,
+            KeyCode::Char('1') => {
+                self.view = PaneView::Explorer;
+                false
+            }
+            KeyCode::Char('2') => {
+                self.view = PaneView::Review;
+                false
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.overview = OverviewState::Loading;
                 self.status = "Refreshing current Perforce workspace...".to_owned();
@@ -373,6 +499,10 @@ impl PaneModel {
                 false
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
+                if self.view != PaneView::Review {
+                    self.status = "Switch to Review (2) to submit".to_owned();
+                    return false;
+                }
                 let Some(change) = self
                     .selected_changelist()
                     .and_then(|change| match change.id {
@@ -388,6 +518,11 @@ impl PaneModel {
                 }
                 false
             }
+            _ if self.view == PaneView::Explorer => self.handle_explorer_key(key, sender),
+            KeyCode::Enter => {
+                self.open_selected_changelist();
+                false
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 false
@@ -401,6 +536,64 @@ impl PaneModel {
                 false
             }
             _ => false,
+        }
+    }
+
+    fn handle_explorer_key(&mut self, key: KeyEvent, sender: &mpsc::Sender<PaneMessage>) -> bool {
+        match key.code {
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                if let Some(path) = self.explorer.selected_path() {
+                    match open_with_default_app(path) {
+                        Ok(()) => self.status = format!("Opened {}", path.display()),
+                        Err(error) => self.status = error,
+                    }
+                }
+                false
+            }
+            KeyCode::Left => {
+                let action = self.explorer.expand_or_collapse(false);
+                self.apply_explorer_action(action, sender);
+                false
+            }
+            KeyCode::Right => {
+                let action = self.explorer.expand_or_collapse(true);
+                self.apply_explorer_action(action, sender);
+                false
+            }
+            KeyCode::Enter => {
+                let action = self.explorer.activate_selection();
+                self.apply_explorer_action(action, sender);
+                false
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.open_selected_diff();
+                false
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.explorer.move_selection(-1);
+                false
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.explorer.move_selection(1);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_explorer_action(
+        &mut self,
+        action: ExplorerAction,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        match action {
+            ExplorerAction::None => {}
+            ExplorerAction::LoadDirectory => {
+                apply_message_effect(self, MessageEffect::LoadExplorerDirectory, sender);
+            }
+            ExplorerAction::OpenFile => {
+                self.open_selected_file();
+            }
         }
     }
 
@@ -437,15 +630,147 @@ impl PaneModel {
             }
             return false;
         }
+        if hits
+            .view_explorer
+            .is_some_and(|target| target.contains(mouse.column, mouse.row))
+        {
+            self.view = PaneView::Explorer;
+            return false;
+        }
+        if hits
+            .view_review
+            .is_some_and(|target| target.contains(mouse.column, mouse.row))
+        {
+            self.view = PaneView::Review;
+            return false;
+        }
+        if self.view == PaneView::Explorer {
+            if let Some(index) = hits
+                .explorer_rows
+                .iter()
+                .position(|target| target.contains(mouse.column, mouse.row))
+            {
+                let action = self
+                    .explorer
+                    .activate_index(hits.explorer_offset.saturating_add(index));
+                self.apply_explorer_action(action, sender);
+            }
+            return false;
+        }
         if let Some(index) = hits
             .changelists
             .iter()
             .position(|target| target.contains(mouse.column, mouse.row))
         {
             self.selected = hits.changelist_offset.saturating_add(index);
+            self.open_selected_changelist();
         }
         false
     }
+}
+
+fn apply_message_effect(
+    pane: &mut PaneModel,
+    effect: MessageEffect,
+    sender: &mpsc::Sender<PaneMessage>,
+) {
+    match effect {
+        MessageEffect::None => {}
+        MessageEffect::ReloadOverview => pane.reload_overview(sender),
+        MessageEffect::LoadExplorerRoot => request_explorer_root(pane, sender),
+        MessageEffect::LoadExplorerExpanded => {
+            let generation = pane.explorer.generation();
+            let identity = match &pane.overview {
+                OverviewState::Ready(overview) => overview.identity.clone(),
+                OverviewState::Loading | OverviewState::Failed(_) => return,
+            };
+            for path in pane.explorer.remaining_expanded_directories() {
+                request_explorer_directory(
+                    pane.cwd.clone(),
+                    identity.clone(),
+                    generation,
+                    path,
+                    sender.clone(),
+                );
+            }
+        }
+        MessageEffect::LoadExplorerDirectory => {
+            if let Some(path) = pane.explorer.take_pending_directory() {
+                let OverviewState::Ready(overview) = &pane.overview else {
+                    return;
+                };
+                request_explorer_directory(
+                    pane.cwd.clone(),
+                    overview.identity.clone(),
+                    pane.explorer.generation(),
+                    path,
+                    sender.clone(),
+                );
+            }
+        }
+    }
+}
+
+fn request_explorer_root(pane: &PaneModel, sender: &mpsc::Sender<PaneMessage>) {
+    let OverviewState::Ready(overview) = &pane.overview else {
+        return;
+    };
+    request_explorer_root_with(
+        pane.cwd.clone(),
+        overview.identity.clone(),
+        pane.explorer.generation(),
+        sender.clone(),
+    );
+}
+
+fn request_explorer_root_with(
+    cwd: PathBuf,
+    identity: WorkspaceIdentity,
+    generation: u64,
+    sender: mpsc::Sender<PaneMessage>,
+) {
+    thread::spawn(move || {
+        let result = load_explorer_root(&cwd, &identity);
+        let _ = sender.send(PaneMessage::ExplorerRoot { generation, result });
+    });
+}
+
+fn load_explorer_root(
+    cwd: &Path,
+    identity: &WorkspaceIdentity,
+) -> Result<LoadedDirectory, ExplorerRootFailure> {
+    let client = P4Client::new(StdProcessTransport, "p4", cwd);
+    match cwd_is_in_client_view(&client, cwd) {
+        Ok(false) => return Err(ExplorerRootFailure::NotInView),
+        Err(error) => return Err(ExplorerRootFailure::Failed(error.to_string())),
+        Ok(true) => {}
+    }
+    let opened = load_opened_records(&client).unwrap_or_default();
+    load_explorer_directory(&client, identity, cwd, &opened).map_err(|error| match error {
+        ExplorerError::Query(source) if source.kind == crate::p4::P4ErrorKind::NotInClientView => {
+            ExplorerRootFailure::NotInView
+        }
+        other => ExplorerRootFailure::Failed(other.to_string()),
+    })
+}
+
+fn request_explorer_directory(
+    cwd: PathBuf,
+    identity: WorkspaceIdentity,
+    generation: u64,
+    path: PathBuf,
+    sender: mpsc::Sender<PaneMessage>,
+) {
+    thread::spawn(move || {
+        let client = P4Client::new(StdProcessTransport, "p4", &cwd);
+        let opened = load_opened_records(&client).unwrap_or_default();
+        let result = load_explorer_directory(&client, &identity, &path, &opened);
+        let _ = sender.send(PaneMessage::ExplorerDirectory {
+            generation,
+            path,
+            result,
+        });
+    });
 }
 
 fn request_overview(cwd: PathBuf, generation: u64, sender: mpsc::Sender<PaneMessage>) {
@@ -578,6 +903,10 @@ struct HitTargets {
     refresh: Option<Rect>,
     changelists: Vec<Rect>,
     changelist_offset: usize,
+    view_explorer: Option<Rect>,
+    view_review: Option<Rect>,
+    explorer_rows: Vec<Rect>,
+    explorer_offset: usize,
 }
 
 #[derive(Debug, Default)]
@@ -593,7 +922,7 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         lines: vec![" ".repeat(width); height],
         hits: HitTargets::default(),
     };
-    put(&mut frame.lines, 0, 0, "Herdr Perforce - Submit review");
+    render_view_tabs(&mut frame, pane.view, width);
     put(
         &mut frame.lines,
         0,
@@ -601,6 +930,62 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         &format!("Workspace path: {}", pane.cwd.display()),
     );
 
+    match pane.view {
+        PaneView::Explorer => render_explorer(&mut frame, pane, width, height),
+        PaneView::Review => render_review(&mut frame, pane, width, height),
+    }
+    if height >= 1 {
+        put(&mut frame.lines, 0, height - 1, &pane.status);
+    }
+
+    if !matches!(pane.overlay.state(), SubmitOverlayState::Closed) {
+        render_overlay(
+            &mut frame,
+            pane.overlay.state(),
+            &pane.submit_provider,
+            width,
+            height,
+        );
+    }
+    for line in &mut frame.lines {
+        *line = truncate_and_pad(line, width);
+    }
+    frame
+}
+
+fn render_view_tabs(frame: &mut RenderedFrame, view: PaneView, _width: usize) {
+    let prefix = "Herdr Perforce  ";
+    let explorer = if view == PaneView::Explorer {
+        "[1 Explorer]"
+    } else {
+        " 1 Explorer "
+    };
+    let review = if view == PaneView::Review {
+        "[2 Review]"
+    } else {
+        " 2 Review "
+    };
+    put(
+        &mut frame.lines,
+        0,
+        0,
+        &format!("{prefix}{explorer}  {review}"),
+    );
+    let explorer_x = prefix.chars().count() as u16;
+    let explorer_width = explorer.chars().count() as u16;
+    frame.hits.view_explorer = Some(Rect {
+        x: explorer_x,
+        y: 0,
+        width: explorer_width,
+    });
+    frame.hits.view_review = Some(Rect {
+        x: explorer_x + explorer_width + 2,
+        y: 0,
+        width: review.chars().count() as u16,
+    });
+}
+
+fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
     match &pane.overview {
         OverviewState::Loading => put(&mut frame.lines, 0, 3, "Loading changelists..."),
         OverviewState::Failed(message) => {
@@ -665,28 +1050,110 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
                     &mut frame.lines,
                     0,
                     height - 2,
-                    "j/k: select   s: Submit review   r: refresh   q: close pane",
+                    "1/2: views   Enter: files   j/k: select   s: Submit review   r: refresh   q: close",
                 );
             }
         }
     }
-    if height >= 1 {
-        put(&mut frame.lines, 0, height - 1, &pane.status);
-    }
+}
 
-    if !matches!(pane.overlay.state(), SubmitOverlayState::Closed) {
-        render_overlay(
-            &mut frame,
-            pane.overlay.state(),
-            &pane.submit_provider,
-            width,
-            height,
-        );
+fn render_explorer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
+    if height >= 2 {
+        put(&mut frame.lines, 0, height - 2, explorer_help(pane));
     }
-    for line in &mut frame.lines {
-        *line = truncate_and_pad(line, width);
+    match pane.explorer.load_state() {
+        ExplorerLoadState::Idle | ExplorerLoadState::Checking => {
+            put(&mut frame.lines, 0, 3, "Loading workspace files...");
+        }
+        ExplorerLoadState::NotInClientView => {
+            put(
+                &mut frame.lines,
+                0,
+                3,
+                "Workspace is not in the current client view",
+            );
+            put(&mut frame.lines, 0, 5, connection_message());
+        }
+        ExplorerLoadState::Failed(message) => {
+            put(&mut frame.lines, 0, 3, "Explorer refresh failed");
+            put(&mut frame.lines, 0, 4, message);
+        }
+        ExplorerLoadState::Ready => {
+            if let OverviewState::Ready(overview) = &pane.overview {
+                put(
+                    &mut frame.lines,
+                    0,
+                    3,
+                    &format!(
+                        "Client: {}   User: {}",
+                        overview.identity.client, overview.identity.user
+                    ),
+                );
+            }
+            let body_top = 5;
+            let body_bottom = height.saturating_sub(2);
+            if body_bottom <= body_top {
+                return;
+            }
+            let body_height = body_bottom - body_top;
+            render_tree_column(frame, pane, 0, body_top, width, body_height);
+        }
     }
-    frame
+}
+
+fn explorer_help(pane: &PaneModel) -> &'static str {
+    if pane.explorer.jump_target().is_some() {
+        "1/2: views   Enter: file   d: diff   j/k: select   o: external   r: refresh   q: close"
+    } else {
+        "1/2: views   Enter: file   j/k: select   o: external   r: refresh   q: close"
+    }
+}
+
+fn render_tree_column(
+    frame: &mut RenderedFrame,
+    pane: &PaneModel,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) {
+    if height == 0 || width == 0 {
+        return;
+    }
+    put_clipped(&mut frame.lines, x, y, "> Files", width);
+    let (offset, visible, rows) = pane.explorer.tree_window(height.saturating_sub(1));
+    frame.hits.explorer_offset = offset;
+    let selected = pane.explorer.selected_path();
+    for (visible_index, row) in rows.iter().skip(offset).take(visible).enumerate() {
+        let screen_row = y + 1 + visible_index;
+        let caret = if selected.is_some_and(|path| path == row.path) {
+            ">"
+        } else {
+            " "
+        };
+        let glyph = match row.kind {
+            crate::domain::ExplorerEntryKind::Directory if row.expanded => "📂",
+            crate::domain::ExplorerEntryKind::Directory => "📁",
+            crate::domain::ExplorerEntryKind::File => "📄",
+        };
+        let indent = "  ".repeat(row.depth);
+        let badge = row
+            .decoration
+            .as_ref()
+            .map(|decoration| decoration.badge())
+            .unwrap_or("");
+        let line = if badge.is_empty() {
+            format!("{caret}{indent}{glyph} {}", row.name)
+        } else {
+            format!("{caret}{indent}{glyph} {}  {badge}", row.name)
+        };
+        put_clipped(&mut frame.lines, x, screen_row, &line, width);
+        frame.hits.explorer_rows.push(Rect {
+            x: x as u16,
+            y: screen_row as u16,
+            width: width as u16,
+        });
+    }
 }
 
 fn render_overlay(
@@ -981,6 +1448,11 @@ fn action_summary(actions: &crate::p4::SubmitActionCounts) -> String {
     }
 }
 
+fn put_clipped(lines: &mut [String], column: usize, row: usize, value: &str, width: usize) {
+    let clipped: String = value.chars().take(width).collect();
+    put(lines, column, row, &clipped);
+}
+
 fn put(lines: &mut [String], column: usize, row: usize, value: &str) {
     let Some(line) = lines.get_mut(row) else {
         return;
@@ -1033,9 +1505,12 @@ fn wrap_words(value: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use crate::{
         app::{SubmitFailure, SubmitFault},
         domain::{CaseHandling, ChangelistStatus},
+        p4::LoadedDirectory,
     };
 
     fn pane_with_changes() -> PaneModel {
@@ -1280,6 +1755,155 @@ mod tests {
         assert!(running.contains("Herdr will not run p4 submit for this handoff."));
         assert!(!running.contains("Submitting CL 42"));
         assert!(!running.contains("Exactly one p4 submit process is running."));
+    }
+
+    #[test]
+    fn explorer_view_switch_preserves_review_and_tree_selection() {
+        let mut pane = pane_with_changes();
+        pane.selected = 0;
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: PathBuf::from("C:/Example Workspace"),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "Foo.cpp".into(),
+                    path: PathBuf::from("C:/Example Workspace/Foo.cpp"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: Some(crate::domain::ExplorerDecoration::Opened {
+                        action: crate::domain::FileAction::Edit,
+                        change: Some(ChangelistId::Numbered(42)),
+                    }),
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        pane.view = PaneView::Explorer;
+        pane.explorer.select_index(1);
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        );
+        assert_eq!(pane.view, PaneView::Review);
+        assert_eq!(pane.selected, 0);
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        );
+        assert_eq!(pane.view, PaneView::Explorer);
+        assert_eq!(
+            pane.explorer.selected_path(),
+            Some(Path::new("C:/Example Workspace/Foo.cpp"))
+        );
+    }
+
+    #[test]
+    fn submit_shortcut_is_ignored_in_explorer() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Explorer;
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert!(matches!(pane.overlay.state(), SubmitOverlayState::Closed));
+        assert!(pane.status.contains("Review"));
+        pane.view = PaneView::Review;
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert!(!matches!(pane.overlay.state(), SubmitOverlayState::Closed));
+    }
+
+    #[test]
+    fn explorer_file_activation_keeps_the_navigation_pane_tree_only() {
+        let mut pane = pane_with_changes();
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: PathBuf::from("C:/Example Workspace"),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "Foo.cpp".into(),
+                    path: PathBuf::from("C:/Example Workspace/Foo.cpp"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: Some(crate::domain::ExplorerDecoration::Opened {
+                        action: crate::domain::FileAction::Edit,
+                        change: Some(ChangelistId::Numbered(42)),
+                    }),
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        pane.view = PaneView::Explorer;
+        pane.content.disable_host_for_test();
+        pane.explorer.select_index(1);
+        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(pane.view, PaneView::Explorer);
+        assert!(pane.status.contains("HERDR_PANE_ID"));
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("[1 Explorer]"));
+        assert!(rendered.contains("Foo.cpp"));
+        assert!(!rendered.contains("File diff:"));
+    }
+
+    #[test]
+    fn explorer_not_in_view_shows_connection_message_without_a_tree() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Explorer;
+        pane.explorer
+            .install_not_in_view(pane.explorer.generation());
+        let frame = render_frame(&pane, 80, 24);
+        let rendered = frame.lines.join("\n");
+        assert!(rendered.contains("[1 Explorer]"));
+        assert!(rendered.contains("not in the current client view"));
+        assert!(frame.hits.explorer_rows.is_empty());
+        assert!(!rendered.contains("p4 add"));
+        assert!(!rendered.contains("git status"));
+    }
+
+    #[test]
+    fn explorer_ready_tree_renders_local_names_and_readonly_badges() {
+        let mut pane = pane_with_changes();
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: PathBuf::from("C:/Example Workspace"),
+                entries: vec![
+                    crate::domain::ExplorerEntry {
+                        name: "src".into(),
+                        path: PathBuf::from("C:/Example Workspace/src"),
+                        kind: crate::domain::ExplorerEntryKind::Directory,
+                        decoration: None,
+                        file_type: None,
+                        have_rev: None,
+                        head_rev: None,
+                    },
+                    crate::domain::ExplorerEntry {
+                        name: "Foo.cpp".into(),
+                        path: PathBuf::from("C:/Example Workspace/Foo.cpp"),
+                        kind: crate::domain::ExplorerEntryKind::File,
+                        decoration: Some(crate::domain::ExplorerDecoration::Opened {
+                            action: crate::domain::FileAction::Edit,
+                            change: Some(ChangelistId::Numbered(42)),
+                        }),
+                        file_type: Some(crate::domain::FileType::new("text")),
+                        have_rev: Some(1),
+                        head_rev: Some(1),
+                    },
+                ],
+                truncated: false,
+            });
+        pane.view = PaneView::Explorer;
+        let rendered = render_frame(&pane, 100, 24).lines.join("\n");
+        assert!(rendered.contains("[1 Explorer]"));
+        assert!(rendered.contains("Foo.cpp"));
+        assert!(rendered.contains("src"));
+        assert!(rendered.contains("📂"));
+        assert!(rendered.contains("📁"));
+        assert!(rendered.contains("📄"));
+        assert!(rendered.contains("  M"));
+        assert!(!rendered.contains("p4 add"));
+        assert!(!rendered.contains("p4 edit"));
     }
 
     #[test]

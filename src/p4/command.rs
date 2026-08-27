@@ -26,6 +26,13 @@ pub enum P4Query {
     Where {
         path: PathBuf,
     },
+    WhereMany {
+        paths: Vec<PathBuf>,
+    },
+    Fstat {
+        paths: Vec<PathBuf>,
+    },
+    OpenedOnClient,
 }
 
 impl P4Query {
@@ -80,6 +87,23 @@ impl P4Query {
                 args.push(OsString::from("where"));
                 args.push(escape_p4_file_arg(path.as_os_str()));
             }
+            Self::WhereMany { paths } => {
+                args.push(OsString::from("where"));
+                args.extend(
+                    paths
+                        .iter()
+                        .map(|path| escape_p4_file_arg(path.as_os_str())),
+                );
+            }
+            Self::Fstat { paths } => {
+                args.extend([OsString::from("fstat"), OsString::from("-Ol")]);
+                args.extend(
+                    paths
+                        .iter()
+                        .map(|path| escape_p4_file_arg(path.as_os_str())),
+                );
+            }
+            Self::OpenedOnClient => args.push(OsString::from("opened")),
         }
         args
     }
@@ -166,6 +190,41 @@ mod tests {
 
         assert_eq!(args.len(), 4);
         assert_eq!(args[3], r"C:\Example Workspace\file%23name%40rev%25.txt");
+    }
+
+    #[test]
+    fn fstat_and_where_many_keep_each_path_as_one_argv_element() {
+        let paths = vec![
+            PathBuf::from(r"C:\Example Workspace\a.txt"),
+            PathBuf::from(r"C:\Example Workspace\file#name.txt"),
+        ];
+        let fstat = P4Query::Fstat {
+            paths: paths.clone(),
+        }
+        .args();
+        assert_eq!(
+            fstat,
+            [
+                "-ztag",
+                "-Mj",
+                "fstat",
+                "-Ol",
+                r"C:\Example Workspace\a.txt",
+                r"C:\Example Workspace\file%23name.txt",
+            ]
+            .map(OsString::from)
+        );
+
+        let where_many = P4Query::WhereMany { paths }.args();
+        assert_eq!(where_many[2], "where");
+        assert_eq!(where_many[3], r"C:\Example Workspace\a.txt");
+        assert_eq!(where_many[4], r"C:\Example Workspace\file%23name.txt");
+    }
+
+    #[test]
+    fn opened_on_client_does_not_pass_a_changelist_filter() {
+        let args = P4Query::OpenedOnClient.args();
+        assert_eq!(args, ["-ztag", "-Mj", "opened"].map(OsString::from));
     }
 
     #[test]

@@ -130,7 +130,7 @@ pub(crate) fn ensure_cwd_in_client_root(
     }
 }
 
-fn path_comparison_is_case_insensitive(case_handling: &CaseHandling) -> bool {
+pub(crate) fn path_comparison_is_case_insensitive(case_handling: &CaseHandling) -> bool {
     if cfg!(windows) {
         return true;
     }
@@ -256,7 +256,7 @@ fn is_volume_root(path: &Path) -> bool {
     )
 }
 
-fn path_is_within_root(path: &Path, root: &Path, ignore_case: bool) -> bool {
+pub(crate) fn path_is_within_root(path: &Path, root: &Path, ignore_case: bool) -> bool {
     let path = strip_verbatim_prefix(path);
     let root = strip_verbatim_prefix(root);
     if root.as_os_str().is_empty() {
@@ -279,7 +279,7 @@ fn path_is_within_root(path: &Path, root: &Path, ignore_case: bool) -> bool {
     true
 }
 
-fn components_equal(left: &OsStr, right: &OsStr, ignore_case: bool) -> bool {
+pub(crate) fn components_equal(left: &OsStr, right: &OsStr, ignore_case: bool) -> bool {
     if left == right {
         return true;
     }
@@ -291,7 +291,7 @@ fn components_equal(left: &OsStr, right: &OsStr, ignore_case: bool) -> bool {
     }
 }
 
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let Some(raw) = path.to_str() else {
         return path.to_path_buf();
     };
@@ -301,6 +301,22 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
         return PathBuf::from(format!(r"\\{rest}"));
     }
     PathBuf::from(raw.strip_prefix(VERBATIM).unwrap_or(raw))
+}
+
+#[must_use]
+pub(crate) fn path_lookup_key(path: &Path, ignore_case: bool) -> String {
+    strip_verbatim_prefix(path)
+        .components()
+        .map(|component| {
+            let text = component.as_os_str().to_string_lossy();
+            if ignore_case {
+                text.to_ascii_lowercase()
+            } else {
+                text.into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\0")
 }
 
 #[cfg(test)]

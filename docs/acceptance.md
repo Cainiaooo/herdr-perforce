@@ -78,7 +78,7 @@ P0/P1 表示场景本身的正确性优先级，不再等同于“第一个版�
 Dogfood Gate 证明核心工作流在开发者自己的 Windows + Herdr + P4 环境中可安全日用。必须满足：
 
 - Windows build、质量门禁和本地 plugin link。
-- 真实 Herdr 右侧 pane、两列布局和极窄降级。
+- 真实 Herdr 的最右导航 pane、按需中间 Content pane 和 40/40/20 布局。
 - 当前 client 的 CL/File 树、工作区 Explorer（树/预览/只读装饰）和 pending/shelved/submitted diff。
 - binary metadata 和锁信息的可用降级。
 - Agent 审阅消息闭环。
@@ -165,34 +165,34 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 证据：打开前后终端截图或结构化 Herdr pane snapshot。
 
-### ACC-UI-002（P0）标准两列布局
+### ACC-UI-002（P0）标准宿主布局
 
-步骤：将 P4 pane 调整到标准侧边栏宽度。
+步骤：打开 P4 导航，再依次打开 File、Diff 和 CL 文件列表。
 期望：
 
-- Diff 在左、CL/File 树在右。
-- Diff 明显占主要宽度。
-- 两列均无重叠、越界和裁切 chrome。
-- footer 始终可见。
+- 无内容时是 `Agent CLI 80% | Navigation 20%`。
+- 有内容时是 `Agent CLI 40% | Content 40% | Navigation 20%`，Navigation 始终在最右。
+- File、Diff 和 CL 原地复用同一 Content pane，不连续产生新 pane。
+- 各 pane 无重叠、越界和裁切 chrome；footer 始终可见。
 
-### ACC-UI-003（P0）分隔线调整
+### ACC-UI-003（P0）Content 生命周期
 
-步骤：用鼠标拖动分隔线并关闭/重新打开 pane。
+步骤：关闭 Content pane，再从 Navigation 打开另一文件。
 期望：
 
-- 比例实时变化且保持合法最小宽度。
-- 重新打开后恢复上次比例。
-- 不写入项目目录。
+- 关闭后 split 正常折叠，Agent 与 Navigation 继续运行。
+- 再次打开时 Content 仍插入 Agent 与最右 Navigation 之间。
+- control file 只写入插件私有临时目录，不写入项目目录，路径不经过 shell quoting。
 
-### ACC-UI-004（P0）极窄降级
+### ACC-UI-004（P0）内容滚动与导航隔离
 
-步骤：将 pane 缩窄到无法容纳两列。
+步骤：打开超过一屏且含超长行的文本与 diff。
 期望：
 
-- 自动进入单视图模式。
-- `Tab` 可在导航和 Diff 间切换。
-- 当前 CL、文件、hunk 和滚动状态不丢失。
-- 恢复宽度后回到两列布局。
+- `↑`/`↓`、PageUp/PageDown 和鼠标滚轮可到达加载预算内的全部行。
+- File、Diff 和 CL 长行按 Content pane 的当前宽度自动换成多行，并且所有换行后的显示行均可纵向滚动到达；文件续行不重复行号，但保留等宽空白 gutter，正文起点与首行一致。
+- 文件按类型高亮，diff 的 header/hunk/add/delete 可区分。
+- 长行和滚动不改变最右 Navigation 的宽度或树对齐。
 
 ### ACC-UI-005（P1）终端适配矩阵
 
@@ -349,7 +349,7 @@ Explorer 是 Dogfood Gate 能力（ADR-0005）。不替代 ACC-TREE；CL 树与�
 ### ACC-EXPLORER-002（P0）文本预览
 
 步骤：单击文本文件。
-期望：左侧显示工作区当前内容、行号；过大/超行数截断并说明原因；不得把读取失败显示成空文件。
+期望：中间 Content pane 显示工作区当前内容、行号和语法高亮；过大/超行数截断并说明原因；不得把读取失败显示成空文件。
 
 ### ACC-EXPLORER-003（P0）只读 P4 装饰
 
@@ -358,8 +358,8 @@ fixture 覆盖：unopened、opened edit/add/delete、out-of-date、not in view�
 
 ### ACC-EXPLORER-004（P0）与 Review view 切换
 
-步骤：在 Explorer 选中已 opened 文件，切到 Review（`2` 或等价 UI），再切回 Explorer（`1`）。
-期望：两边选择不丢；opened 文件提供跳转到对应 CL/文件 diff 的入口。Submit overlay 只存在于 Review。
+步骤：在 Explorer 选中已 opened 文件并打开 Diff，切到 Review（`2`），打开 CL 文件列表，再切回 Explorer（`1`）。
+期望：两边选择不丢；File/Diff/CL 复用 Content pane。Submit overlay 只存在于 Review。
 
 ## 8. Diff
 
@@ -784,7 +784,7 @@ Submit 已经获得显式确认并开始后的关闭策略必须在实现时单�
 
 - Dogfood Gate 所列 P0 的离线自动化通过。
 - Windows release build、lint、test 和 manifest 校验通过。
-- Herdr 中的真实右侧 pane、两列布局、极窄降级和 Agent 消息闭环通过。
+- Herdr 中的真实最右导航、按需 Content、40/40/20 布局、滚动/高亮和 Agent 消息闭环通过。
 - 至少一次 Level B 只读真实 P4 验证通过，或明确记录为发布阻断缺口。
 - Agent description generation 和失败矩阵通过。
 - 在 Level C 隔离 P4 环境完成一次 Description Apply 和一次 numbered CL submit。

@@ -14,13 +14,13 @@
 1. 浏览当前 P4 client 本地目录树并预览文件（本插件内独立实现，不依赖社区 File Explorer）。
 2. 查看当前 P4 workspace 的 changelist。
 3. 展开 changelist 并选择其中的文件。
-4. 在同一侧边栏中查看文件 diff。
+4. 在 Agent CLI 与导航树之间的独立内容 pane 查看文件或 diff。
 5. 将选中行或审阅意见发送给当前 Herdr Agent。
 6. 使用可配置的 Agent CLI one-shot 命令生成 changelist 描述。
 7. 人工检查、编辑并应用生成的描述。
 8. 经过预检和二次确认后提交指定的 numbered pending changelist。
 
-它不是一个独占 Workspace 的 P4V 替代品，也不是一个占据全屏的三列工作台。CL 文件树 ≠ 工作区 File Explorer，两者都在本插件内，但是两个 view。
+它不是一个独占 Workspace 的 P4V 替代品，也不会永久占据三列。CL 文件树 ≠ 工作区 File Explorer，两者都在本插件的最右导航 pane 内，但是两个 view；内容 pane 只在需要阅读 File、Diff 或 CL 文件列表时出现。
 
 ## 2. 已确认的产品决策
 
@@ -28,9 +28,9 @@
 |---|---|---|
 | 宿主形态 | Herdr 右侧可切换 plugin pane | 保留 Agent CLI 主区域；否决独占 Workspace |
 | 页面占用 | 不创建独占 Workspace，不替换 Agent CLI 主区域 | P4 是辅助 Agent 的工具，不是 P4V 替代品 |
-| 面板布局 | Review：左侧 Diff，右侧 Changelist/File 树 | Diff 靠近 Agent CLI；完整理由见 [ADR-0001](adr/0001-right-sidebar-layout.md) |
-| 工作区 Explorer | 同一 pane 的独立 view：本地树 + 预览 + 只读 P4 装饰 | P4 与 Git 宿主互斥，不能依赖社区插件；见 [ADR-0005](adr/0005-in-plugin-file-explorer.md) |
-| 默认比例 | Diff 约 70%，导航约 30%，允许拖动 | 审阅内容优先；极窄时改为单视图而非继续压缩 |
+| 面板布局 | Agent CLI → Content → 最右导航；Content 按需出现 | 长文本与树尺寸解耦；见 [ADR-0006](adr/0006-standalone-content-pane.md) |
+| 工作区 Explorer | 最右导航 pane 的独立 view：本地树 + 只读 P4 装饰 | P4 与 Git 宿主互斥，不能依赖社区插件；见 [ADR-0005](adr/0005-in-plugin-file-explorer.md) |
+| 默认比例 | 无内容时 80/20；有内容时 Agent 40%、Content 40%、导航 20% | Agent 与正文同宽，树保持窄列 |
 | 首版 SCM | 原生 P4 changelist，不依赖 P4 Code Review/Swarm | 避免把可选服务器产品变成基础依赖 |
 | 实现语言 | 独立 Rust 项目 | 适合单 binary、Windows TUI 和有界并发；否决清理 Git 耦合的直接 fork |
 | P4 接口 | 调用用户现有的 `p4` CLI，不引入 P4API.NET | 复用现有 ticket/trust/config，减少 native SDK 发布依赖 |
@@ -42,75 +42,45 @@
 
 ## 3. 宿主布局
 
-Herdr 的整体布局保持不变：
+没有打开具体内容时：
 
 ```text
-┌────────────┬──────────────────────────┬──────────────────────────┐
-│ Herdr 左栏  │ Agent CLI                │ 右侧工具面板              │
-│            │                          │                          │
-│ Spaces     │ Codex / Claude / Shell   │ P4 Explorer / Review     │
-│ Workspaces │                          │ （同一插件，内部切 view） │
-│ Agents     │                          │                          │
-│ Threads    │                          │                          │
-└────────────┴──────────────────────────┴──────────────────────────┘
+┌────────────┬────────────────────────────────────────┬──────────────┐
+│ Herdr 左栏  │ Agent CLI                              │ P4 Navigation│
+│            │ Codex / Claude / Shell                 │ Explorer/CL  │
+└────────────┴────────────────────────────────────────┴──────────────┘
 ```
 
-P4 workspace 中，本插件占据右侧工具区域：内部用 activity bar 或 `1` / `2` 在 **Explorer** 与 **Review** 之间切换。不依赖社区 Files/Git pane。用户关闭本面板后不应终止 Agent CLI，也不应改变当前 P4 workspace。非 P4 workspace 不自动打开本插件。
+选择 File、Diff 或 CL 后：
+
+```text
+┌────────────┬───────────────────┬───────────────────┬──────────────┐
+│ Herdr 左栏  │ Agent CLI         │ P4 Content        │ P4 Navigation│
+│            │                   │ File / Diff / CL  │ Explorer/CL  │
+└────────────┴───────────────────┴───────────────────┴──────────────┘
+```
+
+导航 pane 内用 `1` / `2` 在 **Explorer** 与 **Review** 之间切换。不依赖社区 Files/Git pane。用户关闭本面板后不应终止 Agent CLI，也不应改变当前 P4 workspace。非 P4 workspace 不自动打开本插件。
 
 ## 4. P4 面板布局
 
-### 4.1 标准宽度
-
-```text
-+--------------------------------------+----------------------+
-| Diff                                 | Changelists          |
-+--------------------------------------+----------------------+
-| Foo.cpp                              | v CL 123456 pending  |
-| @@ -42,7 +42,9 @@                    |   M Foo.cpp          |
-|                                      |   A Bar.cpp          |
-|  42  fn update() {                   |   D Old.cpp          |
-|- 43      old();                      | > CL 123450 shelved  |
-|+ 43      new();                      | > default            |
-|  44  }                               |                      |
-+--------------------------------------+----------------------+
-| CL 123456 / Foo.cpp / edit / +2 -1 / ?                      |
-+-------------------------------------------------------------+
-```
-
-- Diff 位于左侧，占主要宽度。
-- Changelist/File 树位于右侧。
-- 分隔线可通过鼠标拖动。
-- 面板尺寸变化后，比例在合法范围内保持。
-- 用户调整后的比例保存在插件状态目录，而不是项目目录。
-
-### 4.2 中等宽度
-
-- 导航列缩窄。
-- 文件路径优先显示 basename；完整路径通过 tooltip、状态栏或详情 overlay 查看。
-- 隐藏非关键统计，不隐藏文件动作和选中状态。
-- Diff 默认软换行；用户可以切换为水平滚动。
-
-### 4.3 极窄宽度
-
-当两列均无法保持可用最小宽度时：
-
-- 一次只显示 Diff 或 Changelist/File 树。
-- `Tab` 在两者之间切换（仍停留在当前 Explorer 或 Review view）。
-- `z` 隐藏或恢复导航，让 Diff 临时占满插件 pane。
-- 当前 CL、文件和模式必须保留，切换不能重置选择。
-
-具体宽度阈值由实现期通过终端快照测试确定，不把某个固定列数写入产品契约。
-
-### 4.4 内部 view
+### 4.1 导航 pane
 
 同一 plugin pane 两个 view，不拆成两个 Herdr 插件：
 
 | View | 布局 | 职责 |
 |---|---|---|
-| Explorer | 左预览，右本地目录树 | 浏览 client 内未 opened 的文件；只读 P4 装饰 |
-| Review | 左 Diff，右 CL 树（§4.1） | 审阅 pending CL、备注、生成描述、Submit |
+| Explorer | 本地目录树 | 浏览 client 内未 opened 的文件；只读 P4 装饰；Enter 打开 File，`d` 打开 opened-file Diff |
+| Review | CL 树 | Enter 在 Content pane 打开 CL 文件列表；保留生成描述和 Submit 入口 |
 
-切换 view 不得重置当前 CL/文件选择，也不得重置 Explorer 的展开和滚动。`1` / `2` 只切换 Explorer 与 Review；`Tab` 只在**当前 view 内**切换预览/Diff 与树（极窄时同样如此），不切换 view。极窄时各 view 仍按 §4.3 单列降级。
+切换 view 不得重置当前 CL/文件选择，也不得重置 Explorer 的展开和滚动。`1` / `2` 只切换 Explorer 与 Review；Content pane 的滚动和返回栈独立于导航。
+
+### 4.2 Content pane
+
+- File：显示行号和按扩展名/首行选择的语法高亮。
+- Diff：统一 diff 头、hunk、增加和删除使用不同颜色。
+- CL：显示描述和文件列表，Enter 下钻 Diff，`Esc` 返回。
+- File、Diff 和 CL 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动。
 
 ## 5. Changelist/File 树
 
@@ -177,13 +147,13 @@ Explorer 根：
 
 - 懒展开本地目录；遵守常见忽略（如 `.git` 目录可显示但默认折叠策略由实现决定，不读取 Git status）。
 - 装饰只读，来自对该路径的 `p4 fstat`/`opened`/`have`：unopened、opened（及 action）、out-of-date、not in view、unmapped。查询失败时装饰为空，不假装是 Git。
-- 单击文件：左侧预览 **工作区当前内容**（文本 + 行号）；首版不做语法高亮。binary 用与 §6.3 同类的 metadata card，不解析资产内容。
-- 若该文件已 opened：提供跳转到 Review view 并选中对应 CL/文件的入口，不在 Explorer 里再画一份 submit UI。
+- 单击文件：在中间 Content pane 预览 **工作区当前内容**（文本 + 行号 + 语法高亮）。binary 用与 §6.3 同类的 metadata card，不解析资产内容。
+- 若该文件已 opened：提供在同一 Content pane 查看对应 Diff 的入口，不在 Explorer 里再画一份 submit UI。
 - 双击或 “Open with default app” 可交给 OS；首版不在树里执行 `p4 add/edit/delete/sync/revert`。
 
 预览预算与 Review diff 类似：过大/超行数显示截断原因。刷新后尽量保持展开、选中和滚动。
 
-## 6. 左侧内容区
+## 6. 中间 Content pane
 
 ### 6.1 CL 概览
 
@@ -251,10 +221,11 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 
 | 键 | 行为 |
 |---|---|
-| `1` / `2` | 切换 Explorer / Review view；不改变当前 view 内的列焦点 |
-| `j` / `k`、方向键 | 移动选择或滚动 |
+| `1` / `2` | 在最右导航 pane 切换 Explorer / Review view |
+| `j` / `k`、方向键 | 在当前 pane 移动选择或滚动 |
 | `Left` / `Right` | 折叠或展开节点 |
-| `Enter` | 选择节点或文件 |
+| `Enter` | Explorer 打开 File；Review 打开 CL 文件列表；Content 的 CL 列表下钻 Diff |
+| `d` | 为 Explorer 中已 opened 的文件打开 Diff |
 | `[` / `]` | 上一个/下一个 hunk |
 | `f` / `F` | 下一个/上一个文件 |
 | `v` | 开始或结束 diff 行选择 |
@@ -265,13 +236,11 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 | `o` | 按编号打开 CL |
 | `/` | 搜索 CL 或文件 |
 | `r` | 刷新 |
-| `w` | 切换软换行 |
-| `z` | 隐藏或恢复导航 |
-| `Tab` | 当前 view 内切换 Diff（或预览）/导航焦点；极窄模式下在这两列之间切换，不切换 Explorer/Review |
+| `PageUp` / `PageDown` | Content pane 按当前可见高度翻页 |
 | `?` | 打开帮助 overlay |
 | `q` | 关闭 P4 pane，不退出 Herdr |
 
-所有键位最终都应可配置。鼠标应支持节点选择、展开、滚动、diff 行选择和分隔线拖动。
+所有键位最终都应可配置。鼠标应支持节点选择、展开、滚动和宿主 split 分隔线拖动。
 
 按键路由优先级为 Herdr 宿主保留键、当前 overlay/文本输入、获得焦点的 P4 pane。Submit overlay 默认 Cancel，最终提交只能通过明确点击 Submit 或 `Ctrl+Enter`；`Enter` 不构成最终提交授权。
 
@@ -661,7 +630,7 @@ Submit UI 还必须附带结果确定性：
 
 - P4 Code Review/Swarm 评论、投票、review state。
 - P4V 的完整替代；depot 浏览器；从 Explorer 树上执行 write 命令。
-- sync、reconcile、edit、add、delete、reopen。工作区 File Explorer（只读树 + 预览）属于目标，见 §5.5。
+- sync、reconcile、edit、add、delete、reopen。工作区 File Explorer（只读树 + 独立内容预览）属于目标，见 §5.5。
 - shelve、unshelve、revert、resolve。
 - stream graph 或 integration 工作台。
 - default changelist submit。
