@@ -18,9 +18,10 @@ use crate::domain::{
 
 use super::{
     DescriptionApplyError, DomainMappingError, P4Error, P4ErrorKind, P4Query, P4Transport,
-    RecordCode, changed_files_from_opened, changelist_from_describe,
+    RecordCode, WorkspaceCwdError, changed_files_from_opened, changelist_from_describe,
     description::{P4WriteService, canonical_description},
-    parser::{parse_revision_value, workspace_from_info},
+    parser::parse_revision_value,
+    workspace_owning_cwd,
 };
 
 const MAX_SUBMIT_FILES: usize = 4_096;
@@ -363,11 +364,11 @@ impl<T: P4Transport> P4WriteService<T> {
                 stage: "reconciliation workspace refresh",
                 source,
             })?;
-        let workspace =
-            workspace_from_info(&info.records).map_err(|source| SubmitError::Mapping {
-                stage: "reconciliation workspace identity",
-                source,
-            })?;
+        let workspace = workspace_for_cwd(
+            self.client.cwd(),
+            &info.records,
+            "reconciliation workspace identity",
+        )?;
         let describe = self
             .client
             .run(&P4Query::DescribeSummary {
@@ -474,11 +475,11 @@ impl<T: P4Transport> P4WriteService<T> {
             .client
             .run(&P4Query::Info)
             .map_err(|source| map_submit_command_error("post-submit workspace refresh", source))?;
-        let workspace =
-            workspace_from_info(&info.records).map_err(|source| SubmitError::Mapping {
-                stage: "post-submit workspace identity",
-                source,
-            })?;
+        let workspace = workspace_for_cwd(
+            self.client.cwd(),
+            &info.records,
+            "post-submit workspace identity",
+        )?;
         let describe = self
             .client
             .run_with_timeout(&P4Query::DescribeSummary { change }, SUBMIT_TIMEOUT)
@@ -509,6 +510,18 @@ fn map_description_snapshot_error(error: DescriptionApplyError) -> SubmitError {
         | DescriptionApplyError::Ineligible(_)
         | DescriptionApplyError::Stale
         | DescriptionApplyError::VerificationFailed => SubmitError::InvalidSnapshot,
+    }
+}
+
+fn workspace_for_cwd(
+    cwd: &Path,
+    records: &[super::parser::StructuredRecord],
+    stage: &'static str,
+) -> Result<WorkspaceIdentity, SubmitError> {
+    match workspace_owning_cwd(cwd, records) {
+        Ok(workspace) => Ok(workspace),
+        Err(WorkspaceCwdError::Mapping(source)) => Err(SubmitError::Mapping { stage, source }),
+        Err(WorkspaceCwdError::Query(source)) => Err(SubmitError::Query { stage, source }),
     }
 }
 
@@ -971,7 +984,12 @@ mod tests {
     }
 
     fn service(fake: FakeP4Transport, root: &Path) -> P4WriteService<FakeP4Transport> {
-        P4WriteService::new(P4Client::new(fake, "p4", root))
+        P4WriteService::new(P4Client::new_with_directory_environment(
+            fake,
+            "p4",
+            root,
+            BTreeMap::new(),
+        ))
     }
 
     #[test]

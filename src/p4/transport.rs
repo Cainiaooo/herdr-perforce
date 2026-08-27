@@ -1,7 +1,13 @@
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use super::{
     command::P4Query,
+    config::discover_directory_p4_settings,
     env::herdr_control_variable_names,
     error::{P4Error, P4ErrorKind, classify_command_failure, known_error},
     parser::{StructuredRecord, parse_json_records},
@@ -89,6 +95,9 @@ pub struct P4Client<T> {
     transport: T,
     executable: PathBuf,
     cwd: PathBuf,
+    /// P4* values from a cwd-scoped config file. Overlaid on each request so
+    /// inherited process defaults cannot select a different client.
+    directory_environment: BTreeMap<OsString, OsString>,
     timeout: Duration,
     output_limits: OutputLimits,
 }
@@ -96,13 +105,39 @@ pub struct P4Client<T> {
 impl<T: P4Transport> P4Client<T> {
     #[must_use]
     pub fn new(transport: T, executable: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let directory_environment = discover_directory_p4_settings(&cwd);
+        Self::new_with_directory_environment(transport, executable, cwd, directory_environment)
+    }
+
+    /// Builds a client without walking the host filesystem for p4config files.
+    ///
+    /// Production pane/Level B entrypoints use [`Self::new`]. Tests must use
+    /// this constructor so fixtures cannot pick up the developer's `p4config`.
+    #[must_use]
+    pub fn new_with_directory_environment(
+        transport: T,
+        executable: impl Into<PathBuf>,
+        cwd: impl Into<PathBuf>,
+        directory_environment: BTreeMap<OsString, OsString>,
+    ) -> Self {
         Self {
             transport,
             executable: executable.into(),
             cwd: cwd.into(),
+            directory_environment,
             timeout: Duration::from_secs(30),
             output_limits: OutputLimits::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_directory_environment(
+        mut self,
+        directory_environment: BTreeMap<OsString, OsString>,
+    ) -> Self {
+        self.directory_environment = directory_environment;
+        self
     }
 
     #[must_use]
@@ -120,6 +155,11 @@ impl<T: P4Transport> P4Client<T> {
     #[must_use]
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     pub fn run(&self, query: &P4Query) -> Result<P4Response, P4Error> {
@@ -203,7 +243,7 @@ impl<T: P4Transport> P4Client<T> {
             cwd: self.cwd.clone(),
             args,
             stdin,
-            environment: BTreeMap::new(),
+            environment: self.directory_environment.clone(),
             removed_environment: herdr_control_variable_names(),
             timeout,
             output_limits: self.output_limits,
@@ -244,6 +284,10 @@ mod tests {
     use super::*;
     use crate::p4::fake::FakeP4Transport;
 
+    fn isolated_client<T: P4Transport>(transport: T, cwd: impl Into<PathBuf>) -> P4Client<T> {
+        P4Client::new_with_directory_environment(transport, "p4", cwd, BTreeMap::new())
+    }
+
     fn stat_output() -> RawP4Output {
         RawP4Output {
             stdout: br#"{"code":"stat","clientName":"ExampleClientA"}"#.to_vec(),
@@ -257,7 +301,7 @@ mod tests {
     fn fake_records_exact_argv_and_cwd() {
         let fake = FakeP4Transport::default();
         fake.push_output(stat_output());
-        let client = P4Client::new(fake.clone(), "p4", "C:/Example Workspace");
+        let client = isolated_client(fake.clone(), "C:/Example Workspace");
 
         client
             .run(&P4Query::PendingChanges {
@@ -287,12 +331,36 @@ mod tests {
     }
 
     #[test]
+    fn directory_p4_settings_are_overlaid_on_every_request() {
+        let fake = FakeP4Transport::default();
+        fake.push_output(stat_output());
+        let mut environment = BTreeMap::new();
+        environment.insert(OsString::from("P4CLIENT"), OsString::from("ExampleClientB"));
+        environment.insert(
+            OsString::from("P4PORT"),
+            OsString::from("ssl:p4.example:1666"),
+        );
+        let client = P4Client::new_with_directory_environment(
+            fake.clone(),
+            "p4",
+            "C:/Example Workspace",
+            environment.clone(),
+        );
+
+        client.run(&P4Query::Info).expect("query should succeed");
+
+        let requests = fake.requests();
+        assert_eq!(requests[0].cwd, PathBuf::from("C:/Example Workspace"));
+        assert_eq!(requests[0].environment, environment);
+    }
+
+    #[test]
     fn timeout_is_deterministic_without_sleeping() {
         let fake = FakeP4Transport::default();
         let mut output = stat_output();
         output.elapsed = Duration::from_secs(2);
         fake.push_output(output);
-        let client = P4Client::new(fake, "p4", ".").with_timeout(Duration::from_secs(1));
+        let client = isolated_client(fake, ".").with_timeout(Duration::from_secs(1));
 
         let error = client.run(&P4Query::Info).expect_err("request is late");
         assert_eq!(error.kind, P4ErrorKind::TimedOut);
@@ -302,7 +370,7 @@ mod tests {
     fn output_budget_failure_is_not_an_empty_result() {
         let fake = FakeP4Transport::default();
         fake.push_output(stat_output());
-        let client = P4Client::new(fake, "p4", ".").with_output_limits(OutputLimits {
+        let client = isolated_client(fake, ".").with_output_limits(OutputLimits {
             stdout_bytes: 4,
             stderr_bytes: 4,
         });
@@ -328,7 +396,7 @@ mod tests {
             exit_code: 1,
             elapsed: Duration::ZERO,
         });
-        let client = P4Client::new(fake, "p4", ".");
+        let client = isolated_client(fake, ".");
 
         let empty = client.run(&P4Query::Info).expect("empty success is valid");
         assert!(empty.records.is_empty());

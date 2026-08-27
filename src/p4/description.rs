@@ -10,9 +10,10 @@ use crate::domain::{
 };
 
 use super::{
-    P4Client, P4Error, P4Query, P4Transport,
+    P4Client, P4Error, P4Query, P4Transport, WorkspaceCwdError,
     form::ChangeForm,
-    parser::{DomainMappingError, changelist_from_describe, workspace_from_info},
+    parser::{DomainMappingError, changelist_from_describe},
+    workspace_owning_cwd,
 };
 
 const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
@@ -237,12 +238,21 @@ impl<T: P4Transport> P4WriteService<T> {
                     stage: "workspace refresh",
                     source,
                 })?;
-        let workspace = workspace_from_info(&info.records).map_err(|source| {
-            DescriptionApplyError::Mapping {
-                stage: "workspace identity",
-                source,
+        let workspace = match workspace_owning_cwd(self.client.cwd(), &info.records) {
+            Ok(workspace) => workspace,
+            Err(WorkspaceCwdError::Mapping(source)) => {
+                return Err(DescriptionApplyError::Mapping {
+                    stage: "workspace identity",
+                    source,
+                });
             }
-        })?;
+            Err(WorkspaceCwdError::Query(source)) => {
+                return Err(DescriptionApplyError::Query {
+                    stage: "workspace identity",
+                    source,
+                });
+            }
+        };
 
         let describe = self
             .client
@@ -414,7 +424,12 @@ mod tests {
     }
 
     fn service(fake: FakeP4Transport) -> P4WriteService<FakeP4Transport> {
-        P4WriteService::new(P4Client::new(fake, "p4", PathBuf::from("C:/Example")))
+        P4WriteService::new(P4Client::new_with_directory_environment(
+            fake,
+            "p4",
+            PathBuf::from("C:/Example"),
+            Default::default(),
+        ))
     }
 
     #[test]

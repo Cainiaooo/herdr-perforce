@@ -11,15 +11,16 @@
 
 `herdr-perforce` 是 Herdr 右侧工具区域中的紧凑 P4 审阅面板。它在不遮挡 Agent CLI 主工作区的前提下，提供以下闭环：
 
-1. 查看当前 P4 workspace 的 changelist。
-2. 展开 changelist 并选择其中的文件。
-3. 在同一侧边栏中查看文件 diff。
-4. 将选中行或审阅意见发送给当前 Herdr Agent。
-5. 使用可配置的 Agent CLI one-shot 命令生成 changelist 描述。
-6. 人工检查、编辑并应用生成的描述。
-7. 经过预检和二次确认后提交指定的 numbered pending changelist。
+1. 浏览当前 P4 client 本地目录树并预览文件（本插件内独立实现，不依赖社区 File Explorer）。
+2. 查看当前 P4 workspace 的 changelist。
+3. 展开 changelist 并选择其中的文件。
+4. 在同一侧边栏中查看文件 diff。
+5. 将选中行或审阅意见发送给当前 Herdr Agent。
+6. 使用可配置的 Agent CLI one-shot 命令生成 changelist 描述。
+7. 人工检查、编辑并应用生成的描述。
+8. 经过预检和二次确认后提交指定的 numbered pending changelist。
 
-它不是一个独占 Workspace 的 P4V 替代品，也不是一个占据全屏的三列工作台。
+它不是一个独占 Workspace 的 P4V 替代品，也不是一个占据全屏的三列工作台。CL 文件树 ≠ 工作区 File Explorer，两者都在本插件内，但是两个 view。
 
 ## 2. 已确认的产品决策
 
@@ -27,7 +28,8 @@
 |---|---|---|
 | 宿主形态 | Herdr 右侧可切换 plugin pane | 保留 Agent CLI 主区域；否决独占 Workspace |
 | 页面占用 | 不创建独占 Workspace，不替换 Agent CLI 主区域 | P4 是辅助 Agent 的工具，不是 P4V 替代品 |
-| 面板布局 | 左侧 Diff，右侧 Changelist/File 树 | Diff 靠近 Agent CLI；完整理由见 [ADR-0001](adr/0001-right-sidebar-layout.md) |
+| 面板布局 | Review：左侧 Diff，右侧 Changelist/File 树 | Diff 靠近 Agent CLI；完整理由见 [ADR-0001](adr/0001-right-sidebar-layout.md) |
+| 工作区 Explorer | 同一 pane 的独立 view：本地树 + 预览 + 只读 P4 装饰 | P4 与 Git 宿主互斥，不能依赖社区插件；见 [ADR-0005](adr/0005-in-plugin-file-explorer.md) |
 | 默认比例 | Diff 约 70%，导航约 30%，允许拖动 | 审阅内容优先；极窄时改为单视图而非继续压缩 |
 | 首版 SCM | 原生 P4 changelist，不依赖 P4 Code Review/Swarm | 避免把可选服务器产品变成基础依赖 |
 | 实现语言 | 独立 Rust 项目 | 适合单 binary、Windows TUI 和有界并发；否决清理 Git 耦合的直接 fork |
@@ -46,14 +48,14 @@ Herdr 的整体布局保持不变：
 ┌────────────┬──────────────────────────┬──────────────────────────┐
 │ Herdr 左栏  │ Agent CLI                │ 右侧工具面板              │
 │            │                          │                          │
-│ Spaces     │ Codex / Claude / Shell   │ P4 Changelist            │
-│ Workspaces │                          │ Files / Browser / ...     │
+│ Spaces     │ Codex / Claude / Shell   │ P4 Explorer / Review     │
+│ Workspaces │                          │ （同一插件，内部切 view） │
 │ Agents     │                          │                          │
 │ Threads    │                          │                          │
 └────────────┴──────────────────────────┴──────────────────────────┘
 ```
 
-P4 是右侧工具面板中的一种工具。用户可以打开、关闭或切换该面板，面板关闭后不应终止 Agent CLI，也不应改变当前 P4 workspace。
+P4 workspace 中，本插件占据右侧工具区域：内部用 activity bar 或 `1` / `2` 在 **Explorer** 与 **Review** 之间切换。不依赖社区 Files/Git pane。用户关闭本面板后不应终止 Agent CLI，也不应改变当前 P4 workspace。非 P4 workspace 不自动打开本插件。
 
 ## 4. P4 面板布局
 
@@ -93,11 +95,22 @@ P4 是右侧工具面板中的一种工具。用户可以打开、关闭或切�
 当两列均无法保持可用最小宽度时：
 
 - 一次只显示 Diff 或 Changelist/File 树。
-- `Tab` 在两者之间切换。
+- `Tab` 在两者之间切换（仍停留在当前 Explorer 或 Review view）。
 - `z` 隐藏或恢复导航，让 Diff 临时占满插件 pane。
 - 当前 CL、文件和模式必须保留，切换不能重置选择。
 
 具体宽度阈值由实现期通过终端快照测试确定，不把某个固定列数写入产品契约。
+
+### 4.4 内部 view
+
+同一 plugin pane 两个 view，不拆成两个 Herdr 插件：
+
+| View | 布局 | 职责 |
+|---|---|---|
+| Explorer | 左预览，右本地目录树 | 浏览 client 内未 opened 的文件；只读 P4 装饰 |
+| Review | 左 Diff，右 CL 树（§4.1） | 审阅 pending CL、备注、生成描述、Submit |
+
+切换 view 不得重置当前 CL/文件选择，也不得重置 Explorer 的展开和滚动。`1` / `2` 只切换 Explorer 与 Review；`Tab` 只在**当前 view 内**切换预览/Diff 与树（极窄时同样如此），不切换 view。极窄时各 view 仍按 §4.3 单列降级。
 
 ## 5. Changelist/File 树
 
@@ -145,6 +158,30 @@ P4 是右侧工具面板中的一种工具。用户可以打开、关闭或切�
 - binary/非文本类型
 
 移动文件应尽量成对呈现；无法确定配对时保留两个原始动作，不猜测关系。
+
+### 5.4 与工作区 Explorer 的区别
+
+本节的树是 **changelist → opened/described 文件**，数据来自 `p4 opened` / `describe`，不是磁盘目录。不能把 depot 路径拼成假文件夹来冒充 Explorer。工作区目录树见 §5.5。
+
+### 5.5 Workspace File Explorer
+
+完整决策见 [ADR-0005](adr/0005-in-plugin-file-explorer.md)。
+
+Explorer 根：
+
+- 默认是当前 Herdr workspace cwd。
+- 不得列出 Client root 之外、或不在 client view 内的路径。
+- cwd 不属于 client view 时不画树，显示与 §11.2 相同的连接说明。
+
+树行为：
+
+- 懒展开本地目录；遵守常见忽略（如 `.git` 目录可显示但默认折叠策略由实现决定，不读取 Git status）。
+- 装饰只读，来自对该路径的 `p4 fstat`/`opened`/`have`：unopened、opened（及 action）、out-of-date、not in view、unmapped。查询失败时装饰为空，不假装是 Git。
+- 单击文件：左侧预览 **工作区当前内容**（文本 + 行号）；首版不做语法高亮。binary 用与 §6.3 同类的 metadata card，不解析资产内容。
+- 若该文件已 opened：提供跳转到 Review view 并选中对应 CL/文件的入口，不在 Explorer 里再画一份 submit UI。
+- 双击或 “Open with default app” 可交给 OS；首版不在树里执行 `p4 add/edit/delete/sync/revert`。
+
+预览预算与 Review diff 类似：过大/超行数显示截断原因。刷新后尽量保持展开、选中和滚动。
 
 ## 6. 左侧内容区
 
@@ -214,8 +251,9 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 
 | 键 | 行为 |
 |---|---|
+| `1` / `2` | 切换 Explorer / Review view；不改变当前 view 内的列焦点 |
 | `j` / `k`、方向键 | 移动选择或滚动 |
-| `Left` / `Right` | 折叠或展开 CL |
+| `Left` / `Right` | 折叠或展开节点 |
 | `Enter` | 选择节点或文件 |
 | `[` / `]` | 上一个/下一个 hunk |
 | `f` / `F` | 下一个/上一个文件 |
@@ -229,7 +267,7 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 | `r` | 刷新 |
 | `w` | 切换软换行 |
 | `z` | 隐藏或恢复导航 |
-| `Tab` | 切换 Diff/导航焦点；极窄模式下切换视图 |
+| `Tab` | 当前 view 内切换 Diff（或预览）/导航焦点；极窄模式下在这两列之间切换，不切换 Explorer/Review |
 | `?` | 打开帮助 overlay |
 | `q` | 关闭 P4 pane，不退出 Herdr |
 
@@ -423,7 +461,16 @@ prompt = """
 
 ### 11.2 Workspace 解析
 
-每次 pane 打开时，从 Herdr plugin context 得到 workspace cwd，再使用 P4 查询确定：
+每次 pane 打开时，从 Herdr plugin context 得到 workspace cwd。身份解析分两步，**不扫描**本机其他 client 名称：
+
+1. **目录配置 overlay。** 从 cwd 向上读取 p4config，把其中的 `P4CLIENT` / `P4PORT` / `P4USER` 等 `P4*` 变量叠到每次 `p4` 子进程上（不清空继承环境里的 ticket / trust）。
+   - 若进程设置了 `P4CONFIG`：按官方 `p4` 行为搜索该文件名，可以走到卷根（`D:\`、`/`）。
+   - 若未设置 `P4CONFIG`：为兼容游戏/Helix 树，仍搜索 `p4config.txt`、`.p4config`、`.p4config.txt`。这与官方 `p4`（未设置则不搜索）不同；兼容搜索**不包含卷根**，避免 `D:\p4config.txt` 绑到同盘所有目录。
+2. **运行 `p4 info`，再做 Client root 守卫。** cwd 必须落在该 client 的 Root 下（Windows 大小写不敏感；路径存在时会 canonicalize，以覆盖 junction / subst）。这是「选错了另一个 client」的防护，**不是**完整的 `p4 where` view 测试：Root 下但未映射的路径仍显示 Review（pending CL）。Explorer 列举目录项时再用 view 过滤。
+
+若 root 守卫失败，或 `p4 info` 不能给出有效 client，面板显示连接说明，不回退到任意其他 client。
+
+解析结果包括：
 
 - server identity
 - user
@@ -431,9 +478,7 @@ prompt = """
 - client root
 - stream（如果存在）
 - case handling
-- client view/path mapping
-
-若 cwd 不属于有效 P4 client view，面板显示连接说明，不回退到任意其他 client。
+- client view/path mapping（Explorer 与 `p4 where` 使用；Review 的错误 client 守卫只用 root）
 
 ### 11.3 Diff 来源
 
@@ -615,8 +660,8 @@ Submit UI 还必须附带结果确定性：
 ## 16. 首版非目标
 
 - P4 Code Review/Swarm 评论、投票、review state。
-- P4V 的完整替代。
-- sync、reconcile、edit、add、delete、reopen。
+- P4V 的完整替代；depot 浏览器；从 Explorer 树上执行 write 命令。
+- sync、reconcile、edit、add、delete、reopen。工作区 File Explorer（只读树 + 预览）属于目标，见 §5.5。
 - shelve、unshelve、revert、resolve。
 - stream graph 或 integration 工作台。
 - default changelist submit。
@@ -631,8 +676,8 @@ Submit UI 还必须附带结果确定性：
 ```text
 src/
   app/          UI state and commands
-  tui/          rendering, input, overlays
-  domain/       changelist, file, diff, review models
+  tui/          rendering, input, overlays, explorer tree/preview
+  domain/       changelist, file, diff, review, explorer decoration models
   p4/           executor, structured parser, repository, diff assembler
   herdr/        context and agent messaging
   generator/    one-shot Agent CLI runner and prompt building
@@ -649,7 +694,8 @@ src/
 - Herdr socket API：<https://herdr.dev/docs/socket-api/>
 - Architecture Decision Records：[adr/README.md](adr/README.md)
 - 本机 fake/P4D 测试环境：[testing.md](testing.md)
-- `herdr-reviewr`：<https://github.com/persiyanov/herdr-reviewr>
+- `herdr-sidebar`（树/预览交互可借鉴，不作为依赖）：<https://github.com/alexarthurs/herdr-sidebar>
+- `herdr-reviewr`（审阅备注交互可借鉴，不作为依赖）：<https://github.com/persiyanov/herdr-reviewr>
 - `herdr-co-review`：<https://github.com/elKei24/herdr-co-review>
 - `p4-diff`：<https://github.com/JonParr/p4-diff>
 - Perforce P4VS：<https://github.com/perforce/P4VS>

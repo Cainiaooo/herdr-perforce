@@ -79,7 +79,7 @@ Dogfood Gate 证明核心工作流在开发者自己的 Windows + Herdr + P4 环
 
 - Windows build、质量门禁和本地 plugin link。
 - 真实 Herdr 右侧 pane、两列布局和极窄降级。
-- 当前 client 的 CL/File 树和 pending/shelved/submitted diff。
+- 当前 client 的 CL/File 树、工作区 Explorer（树/预览/只读装饰）和 pending/shelved/submitted diff。
 - binary metadata 和锁信息的可用降级。
 - Agent 审阅消息闭环。
 - Agent CLI one-shot 生成、preview、Apply 的失败矩阵。
@@ -88,7 +88,7 @@ Dogfood Gate 证明核心工作流在开发者自己的 Windows + Herdr + P4 环
 - stale token、异步 epoch、重复提交和写入残留检查。
 - 用户级配置边界和基本秘密扫描。
 
-对应场景以 ACC-BUILD、ACC-UI-001 至 004 及 006/007、ACC-P4、ACC-TREE、ACC-DIFF、ACC-BINARY、ACC-REVIEW、ACC-GEN、ACC-SUBMIT、ACC-CONFIG、ACC-STATE、ACC-PRIVACY、ACC-PERF-003 至 005、ACC-STABILITY 和 ACC-RELEASE-001 为主。
+对应场景以 ACC-BUILD、ACC-UI-001 至 004 及 006/007、ACC-P4、ACC-TREE、ACC-EXPLORER、ACC-DIFF、ACC-BINARY、ACC-REVIEW、ACC-GEN、ACC-SUBMIT、ACC-CONFIG、ACC-STATE、ACC-PRIVACY、ACC-PERF-003 至 005、ACC-STABILITY 和 ACC-RELEASE-001 为主。
 
 Dogfood Gate 不要求他人能够在无 Rust 环境中安装，也不要求完整公开发布/卸载体验。
 
@@ -243,6 +243,8 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 - 使用该 cwd 对应的 server/user/client/root。
 - 不选择另一个可用 client。
+- 若 cwd 或其祖先有 `p4config.txt` / `.p4config`（或 `P4CONFIG` 指定的文件），overlay 后的 identity 必须与该文件一致，而不是 Herdr 进程默认的 `P4CLIENT`。
+- 未设置 `P4CONFIG` 时，不得因为盘符根上的 `p4config.txt` 而选中一个无关 client。
 - UI 中的 identity 与只读 P4 查询一致。
 
 ### ACC-P4-002（P0）非 P4 目录
@@ -330,6 +332,34 @@ fixture 至少包含：
 - binary
 
 期望：图标、标签、统计和排序稳定；未知动作以 unknown 显示，不当成 edit。
+
+## 7.1 Workspace File Explorer
+
+Explorer 是 Dogfood Gate 能力（ADR-0005）。不替代 ACC-TREE；CL 树与目录树必须分开验收。
+
+### ACC-EXPLORER-001（P0）client 内本地树
+
+前置：cwd 在 client view 内。
+期望：
+
+- 显示 workspace cwd 下的目录树，不列出 Client root 之外的路径。
+- 懒展开；刷新后尽量保持展开和选中。
+- 不属于 client view 时不画树，显示连接说明。
+
+### ACC-EXPLORER-002（P0）文本预览
+
+步骤：单击文本文件。
+期望：左侧显示工作区当前内容、行号；过大/超行数截断并说明原因；不得把读取失败显示成空文件。
+
+### ACC-EXPLORER-003（P0）只读 P4 装饰
+
+fixture 覆盖：unopened、opened edit/add/delete、out-of-date、not in view。
+期望：装饰来自 P4 只读查询；查询失败时无装饰，不显示 Git status。树上不能发起 add/edit/delete/sync/revert。
+
+### ACC-EXPLORER-004（P0）与 Review view 切换
+
+步骤：在 Explorer 选中已 opened 文件，切到 Review（`2` 或等价 UI），再切回 Explorer（`1`）。
+期望：两边选择不丢；opened 文件提供跳转到对应 CL/文件 diff 的入口。Submit overlay 只存在于 Review。
 
 ## 8. Diff
 

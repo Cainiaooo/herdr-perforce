@@ -282,7 +282,12 @@ mod tests {
     }
 
     fn client(fake: FakeP4Transport) -> P4Client<FakeP4Transport> {
-        P4Client::new(fake, "p4", "C:/Secret Workspace")
+        P4Client::new_with_directory_environment(
+            fake,
+            "p4",
+            "C:/Secret Workspace",
+            Default::default(),
+        )
     }
 
     fn info_fixture() -> &'static [u8] {

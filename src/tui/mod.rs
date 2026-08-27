@@ -28,7 +28,7 @@ use crate::{
     p4::{
         DomainMappingError, P4Client, P4Error, P4Query, P4Transport, P4WriteService,
         StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview, SubmitReconciliationResult,
-        SubmitResult, pending_changelists_from_changes, workspace_from_info,
+        SubmitResult, WorkspaceCwdError, pending_changelists_from_changes, workspace_owning_cwd,
     },
     submit_provider::{ExternalLaunchError, SubmitProvider},
 };
@@ -458,7 +458,11 @@ fn request_overview(cwd: PathBuf, generation: u64, sender: mpsc::Sender<PaneMess
 fn load_overview(cwd: &Path) -> Result<WorkspaceOverview, OverviewFailure> {
     let client = P4Client::new(StdProcessTransport, "p4", cwd);
     let info = client.run(&P4Query::Info).map_err(OverviewFailure::Query)?;
-    let identity = workspace_from_info(&info.records).map_err(OverviewFailure::Mapping)?;
+    let identity = match workspace_owning_cwd(cwd, &info.records) {
+        Ok(identity) => identity,
+        Err(WorkspaceCwdError::Mapping(error)) => return Err(OverviewFailure::Mapping(error)),
+        Err(WorkspaceCwdError::Query(error)) => return Err(OverviewFailure::Query(error)),
+    };
     let changes = client
         .run(&P4Query::PendingChangesLimited {
             user: identity.user.clone(),
@@ -1133,11 +1137,14 @@ mod tests {
     }
 
     fn dispatch_key(pane: &mut PaneModel, key: KeyEvent) {
-        let service = Arc::new(P4WriteService::new(P4Client::new(
-            crate::p4::fake::FakeP4Transport::default(),
-            "p4",
-            &pane.cwd,
-        )));
+        let service = Arc::new(P4WriteService::new(
+            P4Client::new_with_directory_environment(
+                crate::p4::fake::FakeP4Transport::default(),
+                "p4",
+                &pane.cwd,
+                Default::default(),
+            ),
+        ));
         let (sender, _receiver) = mpsc::channel();
         pane.handle_key(key, &service, &sender);
     }

@@ -1,5 +1,6 @@
 mod bounded;
 mod command;
+mod config;
 mod description;
 mod env;
 mod error;
@@ -12,6 +13,7 @@ mod submit;
 mod transport;
 
 pub use command::{P4Query, escape_p4_file_arg};
+pub(crate) use config::{WorkspaceCwdError, workspace_owning_cwd};
 pub use description::{
     AuthorizedDescriptionApply, DescriptionApplyBlockReason, DescriptionApplyError,
     DescriptionApplyIntent, DescriptionApplyPreview, DescriptionApplyResult, P4WriteService,
