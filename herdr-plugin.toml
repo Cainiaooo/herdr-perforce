@@ -1,12 +1,30 @@
 id = "herdr.perforce"
 name = "Perforce Review"
 version = "0.1.0"
-min_herdr_version = "0.7.0"
+min_herdr_version = "0.8.2"
 description = "Compact Perforce review and explicitly confirmed numbered changelist submit"
 platforms = ["linux", "macos", "windows"]
 
 [[build]]
 command = ["cargo", "build", "--release"]
+
+# Herdr runs startup hooks after it restores the server session and exposes the
+# plugin API socket. The command is idempotent and only restores workspaces that
+# have previously opened this pane successfully.
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-p4", "restore-panes"]
+
+[[startup]]
+platforms = ["windows"]
+command = [
+  "powershell",
+  "-NoProfile",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-Command",
+  '''$root = $env:HERDR_PLUGIN_ROOT; if (-not $root) { Write-Error "HERDR_PLUGIN_ROOT is missing"; exit 69 }; if ($root.StartsWith('\\?\')) { $root = $root.Substring(4) }; & (Join-Path $root "target\release\herdr-p4.exe") restore-panes''',
+]
 
 # Unix action/pane argv is plugin-root relative. Windows pane spawn does not
 # append .exe and resolves relative programs against the Herdr process directory.

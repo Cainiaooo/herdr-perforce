@@ -7,6 +7,7 @@
 ## 功能
 
 - 从 `HERDR_PLUGIN_CONTEXT_JSON` 读取打开插件前的 pane/workspace 路径，不依赖插件安装目录推断 P4 workspace。
+- 首次手动打开成功后记住该 Herdr workspace；Herdr server 下次启动恢复 session 时幂等恢复 pane，不重复打开，也不抢走当前焦点。
 - 使用当前用户的 `p4` 配置列出 current-client pending changelist。
 - 在 Submit 前重新读取 workspace、CL spec、opened files 和本地内容，不使用可能过期的 UI 缓存。
 - 检查 owner/client、描述、文件数量、unresolved、out-of-date、本地文件映射和内容 freshness。
@@ -19,7 +20,7 @@
 
 ## 环境要求
 
-- Herdr `0.7.0` 或更高版本；本地开发环境当前使用 Herdr `0.8.2`。
+- Herdr `0.8.2` 或更高版本。
 - Helix Command-Line Client `p4` 可从 `PATH` 启动。
 - 当前 workspace 已配置有效的 `P4PORT`、`P4USER`、`P4CLIENT`/config，并处于 client view 内。
 - 需要提交时，当前用户必须已经 `p4 login` 且具有目标 CL 的读取和提交权限。
@@ -57,6 +58,36 @@ herdr plugin action invoke open --plugin herdr.perforce
 ```
 
 也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开 split pane，并把打开前的 workspace/pane context 交给插件。
+
+### Panel 加载与自动恢复
+
+`herdr plugin link` 持久注册插件，但不会让 terminal pane 永久驻留。首次仍需在目标 workspace 手动执行一次 **Open Perforce review**；打开成功后，插件把该 workspace 记录到 Herdr 提供的 `HERDR_PLUGIN_STATE_DIR`。
+
+之后 Herdr server 启动并恢复 session 时，manifest 的 startup hook 会：
+
+1. 读取已记住的 workspace，不扫描其他目录，也不在启动阶段运行 `p4`。
+2. 只处理本次 session 中仍存在且 cwd 匹配的 Herdr workspace。
+3. 对已有 `Perforce` pane 调用 `pane process-info`；只有前台确实运行 `herdr-p4 ... pane` 才视为健康并保持现状。
+4. 只有 PowerShell/shell prompt 的失活 pane 不算恢复成功；插件会打开新的 split，成功后再次确认旧 pane 仍无插件进程，再用普通 pane close 清理它，并使用 `--no-focus` 保持当前焦点。
+
+关闭并重新打开一个连接到同一 Herdr server 的客户端，不会重复运行 startup hook；要验证恢复行为，需要真正重启 Herdr server。仅关闭当前 Perforce pane 不会删除 workspace 记录，因此下次 server 启动仍会恢复它。
+
+默认模式是 `remembered`。如果希望所有 workspace 始终手动打开，在插件配置目录创建 `panel.json`：
+
+```powershell
+$config = herdr plugin config-dir herdr.perforce
+Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
+```
+
+对应内容为：
+
+```json
+{
+  "open_mode": "manual"
+}
+```
+
+删除该文件，或改为 `{ "open_mode": "remembered" }`，即可恢复默认行为。配置损坏、包含未知字段或未知 mode 时会失败关闭，不自动恢复 pane；已保存的 workspace 记录不会被覆盖。
 
 ## 使用方法
 
@@ -147,6 +178,18 @@ herdr plugin log list --plugin herdr.perforce
 
 确认已经运行 `cargo build --release`，并检查 `target/release/herdr-p4.exe`（Windows）或 `target/release/herdr-p4`（Linux/macOS）是否存在。
 
+### Panel 可以手动打开，但重启后没有恢复
+
+先确认该 workspace 至少成功手动打开过一次，并检查 startup log：
+
+```powershell
+herdr plugin log list --plugin herdr.perforce
+```
+
+`no remembered workspaces` 表示还没有成功记录；`manual mode` 表示 `panel.json` 禁用了恢复；`unavailable` 表示记录的 cwd 在本次 Herdr session 中没有匹配 workspace。Startup log 只输出数量和分类，不输出 workspace 绝对路径。
+
+如果 pane 边框显示 `Perforce`，内容却只是 `PS ...>` 或其他 shell prompt，表示 Herdr 恢复了 pane 布局但插件进程没有存活。当前版本会用 process-info 将它识别为 stale，并在下一次 startup 恢复真正的插件 pane；日志中的 `stale-closed` 是成功清理的旧 pane 数量。清理只作用于同 workspace、同 cwd、标题匹配且二次 process-info 仍确认失活的候选；失败会计入 `failed`，不会静默宣称恢复完成。
+
 ### `p4` 找不到或 workspace 不可用
 
 在目标 workspace 的普通 terminal 中先验证：
@@ -184,6 +227,7 @@ herdr plugin unlink herdr.perforce
 ## 当前限制
 
 - 当前 pane 重点覆盖 pending CL 列表和 Submit overlay；完整文件树、diff、review comment 和 Description Apply UI 尚未接完。
+- 自动打开只覆盖成功手动打开过的 remembered workspaces；当前版本不会扫描全部 Herdr workspace 并运行 `p4 info` 自动判定。
 - 不支持 default changelist、部分文件、其他用户或其他 client 的 Submit。
 - 不支持自动 resolve、lock 修复或任何自主提交。
 - 插件内会阻止 SubmitRunning/unknown 状态下关闭或再次提交，但 Herdr 宿主强制终止 pane 时的独立 worker 监管仍待实现。

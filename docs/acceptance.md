@@ -222,6 +222,18 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 步骤：在浏览态按 `s`。
 期望：仅打开 Submit review overlay，没有 P4 写命令。overlay 默认 Cancel；`Enter` 不提交，只有明确点击 Submit 或 `Ctrl+Enter` 才进入提交执行状态。
 
+### ACC-UI-008（P0）Remembered workspace 启动恢复
+
+步骤：在两个 Herdr workspace 中只对其中一个成功执行一次 Open Perforce review，重启 Herdr server，并再次触发一次 startup/handoff。
+期望：
+
+- 只恢复被记住且本次 session 仍存在的 workspace；不扫描其他目录、不运行 `p4`。
+- 已有匹配且 process-info 确认运行 `herdr-p4 ... pane` 的健康 pane 时不重复打开。
+- 只有 PowerShell/shell prompt 的同 workspace/cwd 同名 pane 视为 stale；新 pane 成功后必须二次确认仍无插件进程，再用 pane close 清理，失败不得静默忽略。
+- 缺失 workspace 计为 unavailable 并安全跳过。
+- 新恢复 pane 不抢焦点，且不会替换或关闭 Agent pane。
+- 连接到同一 server 的新客户端、配置 reload、link/enable 不被误记为 server startup。
+
 ## 6. Workspace 识别
 
 ### ACC-P4-001（P0）正确识别当前 client
@@ -623,6 +635,16 @@ Submit 仅对 owned、current-client、numbered pending CL 启用。以下对象
 ### ACC-STATE-001（P0）状态位置
 
 期望：布局、展开节点和本地备注仅写入 `HERDR_PLUGIN_STATE_DIR`；项目目录无运行时杂项。
+
+### ACC-STATE-002（P0）Pane 恢复状态
+
+期望：
+
+- 成功手动打开才 upsert workspace；失败打开不写状态。
+- 同一 cwd 大小写差异和 Windows `\\?\` 前缀不会产生重复记录。
+- 状态最多 128 个 workspace/64 KiB，只包含 cwd 和短期 Herdr id hint。
+- 损坏、超限、相对路径或未知版本失败关闭，原文件不被空状态覆盖。
+- `panel.json` 的 `manual` 禁止记录和恢复；缺失配置默认 `remembered`；未知字段/mode 不生效。
 
 ### ACC-PRIVACY-001（P0）秘密扫描
 

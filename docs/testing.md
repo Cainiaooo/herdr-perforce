@@ -8,7 +8,7 @@
 
 | 层级 | 状态 | 执行日期 | 实际结果 |
 |---|---|---|---|
-| Level A | 已验收 | 2026-08-26 | `cargo fmt --check`、Clippy、build 和 `cargo test --workspace --all-targets` 通过；library 69 个、CLI 5 个，共 74 个测试 |
+| Level A | 已验收 | 2026-08-26 | `cargo fmt --check`、Clippy、release build 和 `cargo test --workspace --all-targets` 通过；library 115 个、CLI 16 个，共 131 个测试 |
 | Level B | 部分完成 | 2026-08-25 | 显式只读 runner 的真实 `info/changes/describe/opened` 通过；当前仓库 cwd 不在 client view，`where` 明确 skip，未回退配置 |
 | Level C | 部分完成 | 2026-08-26 | 独立 harness 的 16 个测试和真实 loopback `p4d` 通过；产品 Description Apply 与 Submit 均完成 stale 拒绝和成功写入闭环，另含 shelf、`binary+l`、第二 client 逐字节验证、隐私扫描和精确清理 |
 
@@ -258,6 +258,9 @@ Submit 测试还应覆盖：
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。
+- 首次成功手动打开后检查状态只写入 `HERDR_PLUGIN_STATE_DIR`；重启 Herdr server 后恢复 remembered workspace，重复 startup 不创建第二个 Perforce pane。
+- 同一 server 上仅重新连接客户端不应重复执行 startup；缺失 workspace 安全 skip，恢复 pane 使用 `--no-focus`。
+- startup 期间用 fake `herdr` 捕获 argv，确认只执行 workspace/pane/process-info 查询、plugin pane open 和对二次确认仍 stale pane 的 pane close；不运行 `p4`，也不同时传 `--workspace` 与 `--target-pane`。
 
 ### 6.5 故障注入
 

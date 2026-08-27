@@ -3,10 +3,15 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode},
+    process::{Command as ProcessCommand, ExitCode, ExitStatus},
 };
 
 use herdr_perforce::p4::{P4Client, StdProcessTransport, run_level_b_read_only};
+use herdr_perforce::panel_restore::{
+    PanelOpenMode, load_panel_open_mode, load_remembered_workspaces, matching_workspace,
+    opened_pane_id, pane_process_is_active, parse_pane_list, perforce_pane_candidates,
+    remember_workspace, target_pane_id,
+};
 use serde_json::Value;
 
 const HELP: &str = concat!(
@@ -16,7 +21,8 @@ const HELP: &str = concat!(
     "  herdr-p4 --help\n",
     "  herdr-p4 level-b --read-only [--cwd <workspace-path>]\n",
     "  herdr-p4 pane [--cwd <workspace-path>]\n",
-    "  herdr-p4 open-pane\n\n",
+    "  herdr-p4 open-pane\n",
+    "  herdr-p4 restore-panes\n\n",
     "Level B is explicitly opt-in and only runs bounded info, changes, describe, opened,\n",
     "and where queries. It never runs a write command or retries through another config.\n\n",
     "The pane command is the Herdr terminal entrypoint. Submit remains available only\n",
@@ -36,6 +42,7 @@ fn main() -> ExitCode {
         Ok(Command::LevelB { cwd }) => run_level_b(cwd),
         Ok(Command::Pane { cwd }) => run_pane(cwd),
         Ok(Command::OpenPane) => open_herdr_pane(),
+        Ok(Command::RestorePanes) => restore_herdr_panes(),
         Err(message) => {
             eprintln!("{message}; run herdr-p4 --help");
             ExitCode::from(64)
@@ -50,6 +57,7 @@ enum Command {
     LevelB { cwd: Option<PathBuf> },
     Pane { cwd: Option<PathBuf> },
     OpenPane,
+    RestorePanes,
 }
 
 fn parse_command(args: Vec<OsString>) -> Result<Command, &'static str> {
@@ -80,6 +88,8 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, &'static str> {
         [pane, ..] if pane == "pane" => Err("pane accepts only [--cwd <workspace-path>]"),
         [open] if open == "open-pane" => Ok(Command::OpenPane),
         [open, ..] if open == "open-pane" => Err("open-pane accepts no arguments"),
+        [restore] if restore == "restore-panes" => Ok(Command::RestorePanes),
+        [restore, ..] if restore == "restore-panes" => Err("restore-panes accepts no arguments"),
         _ => Err("unsupported arguments"),
     }
 }
@@ -176,6 +186,13 @@ fn pane_cwd_from_context(context: &Value, plugin_root: Option<&Path>) -> Option<
         .filter(|path| !is_plugin_directory(path, plugin_root))
 }
 
+fn workspace_cwd_from_context(context: &Value, plugin_root: Option<&Path>) -> Option<PathBuf> {
+    context_directory(context, "workspace_cwd")
+        .or_else(|| context_directory(context, "/workspace/cwd"))
+        .filter(|path| !is_plugin_directory(path, plugin_root))
+        .or_else(|| pane_cwd_from_context(context, plugin_root))
+}
+
 fn herdr_open_pane_args(context: Option<&Value>, plugin_root: Option<&Path>) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("plugin"),
@@ -191,8 +208,15 @@ fn herdr_open_pane_args(context: Option<&Value>, plugin_root: Option<&Path>) -> 
         OsString::from("right"),
     ];
     if let Some(context) = context {
-        append_context_argument(&mut args, "--workspace", context, "workspace_id");
-        append_context_argument(&mut args, "--target-pane", context, "focused_pane_id");
+        if context
+            .get("focused_pane_id")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            append_context_argument(&mut args, "--target-pane", context, "focused_pane_id");
+        } else {
+            append_context_argument(&mut args, "--workspace", context, "workspace_id");
+        }
         if let Some(cwd) = pane_cwd_from_context(context, plugin_root) {
             args.push(OsString::from("--cwd"));
             args.push(cwd.into_os_string());
@@ -212,20 +236,289 @@ fn open_herdr_pane() -> ExitCode {
     let mut command = ProcessCommand::new(executable);
     let args = herdr_open_pane_args(context.as_ref(), plugin_root.as_deref());
     command.args(args);
-    match command.status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(
-            status
-                .code()
-                .and_then(|code| u8::try_from(code).ok())
-                .filter(|code| *code != 0)
-                .unwrap_or(70),
-        ),
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            remember_opened_pane(context.as_ref(), &output.stdout, plugin_root.as_deref());
+            println!("Herdr Perforce pane opened");
+            ExitCode::SUCCESS
+        }
+        Ok(output) => {
+            eprintln!("Herdr refused to open the Perforce pane");
+            exit_code_from_status(&output.status)
+        }
         Err(_) => {
             eprintln!("Could not invoke the Herdr binary from HERDR_BIN_PATH");
             ExitCode::from(69)
         }
     }
+}
+
+fn remember_opened_pane(context: Option<&Value>, stdout: &[u8], plugin_root: Option<&Path>) {
+    let config_dir = env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from);
+    match load_panel_open_mode(config_dir.as_deref()) {
+        Ok(PanelOpenMode::Manual) => return,
+        Err(error) => {
+            eprintln!("Perforce pane was opened but not remembered: {error}");
+            return;
+        }
+        Ok(PanelOpenMode::Remembered) => {}
+    }
+    let Some(state_dir) = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) else {
+        eprintln!("Perforce pane was opened but not remembered: HERDR_PLUGIN_STATE_DIR is missing");
+        return;
+    };
+    let Some(context) = context else {
+        eprintln!("Perforce pane was opened but not remembered: workspace context is missing");
+        return;
+    };
+    let Some(cwd) = pane_cwd_from_context(context, plugin_root) else {
+        eprintln!("Perforce pane was opened but not remembered: workspace cwd is unavailable");
+        return;
+    };
+    let Some(workspace_cwd) = workspace_cwd_from_context(context, plugin_root) else {
+        eprintln!(
+            "Perforce pane was opened but not remembered: Herdr workspace cwd is unavailable"
+        );
+        return;
+    };
+    let response = serde_json::from_slice::<Value>(stdout).ok();
+    let pane_id = response.as_ref().and_then(opened_pane_id);
+    let workspace_id = context.get("workspace_id").and_then(Value::as_str);
+    if let Err(error) = remember_workspace(&state_dir, &cwd, &workspace_cwd, workspace_id, pane_id)
+    {
+        eprintln!("Perforce pane was opened but not remembered: {error}");
+    }
+}
+
+fn restore_herdr_panes() -> ExitCode {
+    let config_dir = env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from);
+    match load_panel_open_mode(config_dir.as_deref()) {
+        Ok(PanelOpenMode::Manual) => {
+            println!("Herdr Perforce pane restore: manual mode");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            eprintln!("Herdr Perforce pane restore disabled: {error}");
+            return ExitCode::from(78);
+        }
+        Ok(PanelOpenMode::Remembered) => {}
+    }
+
+    let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from);
+    let remembered = match load_remembered_workspaces(state_dir.as_deref()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Herdr Perforce pane restore disabled: {error}");
+            return ExitCode::from(65);
+        }
+    };
+    if remembered.is_empty() {
+        println!("Herdr Perforce pane restore: no remembered workspaces");
+        return ExitCode::SUCCESS;
+    }
+
+    let executable = env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| OsString::from("herdr"));
+    let pane_args = [OsString::from("pane"), OsString::from("list")];
+    let pane_response = match run_herdr_json(&executable, &pane_args) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("Herdr Perforce pane restore failed: {error}");
+            return ExitCode::from(69);
+        }
+    };
+    let panes = match parse_pane_list(&pane_response) {
+        Ok(panes) => panes,
+        Err(error) => {
+            eprintln!("Herdr Perforce pane restore failed: {error}");
+            return ExitCode::from(65);
+        }
+    };
+
+    let mut restored = 0usize;
+    let mut already_open = 0usize;
+    let mut unavailable = 0usize;
+    let mut failed = 0usize;
+    let mut stale_closed = 0usize;
+    for entry in &remembered {
+        let Some(workspace) = matching_workspace(entry, &panes) else {
+            unavailable += 1;
+            continue;
+        };
+        let mut active_pane_id = None;
+        let mut stale_pane_ids = Vec::new();
+        let mut inspection_failed = false;
+        for pane in perforce_pane_candidates(entry, &workspace, &panes) {
+            let process_args = herdr_pane_process_info_args(&pane.id);
+            match run_herdr_json(&executable, &process_args)
+                .and_then(|response| pane_process_is_active(&response))
+            {
+                Ok(true) => active_pane_id = Some(pane.id.clone()),
+                Ok(false) if pane.label.as_deref() == Some("Perforce") => {
+                    stale_pane_ids.push(pane.id.clone());
+                }
+                Ok(false) => inspection_failed = true,
+                Err(_) => inspection_failed = true,
+            }
+        }
+        if let Some(active_pane_id) = active_pane_id {
+            let cleanup = close_stale_panes(&executable, &stale_pane_ids);
+            stale_closed += cleanup.closed;
+            failed += cleanup.failed;
+            if let Some(state_dir) = state_dir.as_deref() {
+                remember_workspace(
+                    state_dir,
+                    &entry.cwd,
+                    &entry.workspace_cwd,
+                    Some(&workspace.id),
+                    Some(&active_pane_id),
+                )
+                .ok();
+            }
+            already_open += 1;
+            continue;
+        }
+        if inspection_failed {
+            failed += 1;
+            continue;
+        }
+        let target_pane = target_pane_id(entry, &workspace, &panes)
+            .map(ToOwned::to_owned)
+            .or_else(|| stale_pane_ids.first().cloned());
+        let Some(target_pane) = target_pane else {
+            unavailable += 1;
+            continue;
+        };
+        let args = herdr_restore_pane_args(&target_pane, &entry.cwd);
+        let output = match ProcessCommand::new(&executable).args(&args).output() {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                failed += 1;
+                continue;
+            }
+        };
+        restored += 1;
+        let cleanup = close_stale_panes(&executable, &stale_pane_ids);
+        stale_closed += cleanup.closed;
+        failed += cleanup.failed;
+        if let (Some(state_dir), Ok(response)) = (
+            state_dir.as_deref(),
+            serde_json::from_slice::<Value>(&output.stdout),
+        ) {
+            let pane_id = opened_pane_id(&response);
+            if remember_workspace(
+                state_dir,
+                &entry.cwd,
+                &entry.workspace_cwd,
+                Some(&workspace.id),
+                pane_id,
+            )
+            .is_err()
+            {
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, unavailable={unavailable}, failed={failed}"
+    );
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(70)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StalePaneCleanup {
+    closed: usize,
+    failed: usize,
+}
+
+fn close_stale_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCleanup {
+    let mut result = StalePaneCleanup::default();
+    for pane_id in pane_ids {
+        let process_args = herdr_pane_process_info_args(pane_id);
+        match run_herdr_json(executable, &process_args)
+            .and_then(|response| pane_process_is_active(&response))
+        {
+            Ok(true) => continue,
+            Err(_) => {
+                result.failed += 1;
+                continue;
+            }
+            Ok(false) => {}
+        }
+        let closed = ProcessCommand::new(executable)
+            .args(herdr_pane_close_args(pane_id))
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if closed {
+            result.closed += 1;
+        } else {
+            result.failed += 1;
+        }
+    }
+    result
+}
+
+fn herdr_pane_process_info_args(pane_id: &str) -> [OsString; 4] {
+    [
+        OsString::from("pane"),
+        OsString::from("process-info"),
+        OsString::from("--pane"),
+        OsString::from(pane_id),
+    ]
+}
+
+fn herdr_pane_close_args(pane_id: &str) -> [OsString; 3] {
+    [
+        OsString::from("pane"),
+        OsString::from("close"),
+        OsString::from(pane_id),
+    ]
+}
+
+fn herdr_restore_pane_args(target_pane: &str, cwd: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("plugin"),
+        OsString::from("pane"),
+        OsString::from("open"),
+        OsString::from("--plugin"),
+        OsString::from("herdr.perforce"),
+        OsString::from("--entrypoint"),
+        OsString::from(pane_entrypoint()),
+        OsString::from("--placement"),
+        OsString::from("split"),
+        OsString::from("--direction"),
+        OsString::from("right"),
+        OsString::from("--target-pane"),
+        OsString::from(target_pane),
+        OsString::from("--cwd"),
+        cwd.as_os_str().to_os_string(),
+        OsString::from("--no-focus"),
+    ]
+}
+
+fn run_herdr_json(executable: &OsStr, args: &[OsString]) -> Result<Value, &'static str> {
+    let output = ProcessCommand::new(executable)
+        .args(args)
+        .output()
+        .map_err(|_| "Herdr binary could not be invoked")?;
+    if !output.status.success() {
+        return Err("Herdr command was rejected");
+    }
+    serde_json::from_slice(&output.stdout).map_err(|_| "Herdr response is invalid")
+}
+
+fn exit_code_from_status(status: &ExitStatus) -> ExitCode {
+    ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .filter(|code| *code != 0)
+            .unwrap_or(70),
+    )
 }
 
 fn current_pane_context(executable: &OsStr) -> Option<Value> {
@@ -450,6 +743,10 @@ mod tests {
             parse_command(strings(&["open-pane"])),
             Ok(Command::OpenPane)
         );
+        assert_eq!(
+            parse_command(strings(&["restore-panes"])),
+            Ok(Command::RestorePanes)
+        );
         assert!(parse_command(strings(&["submit", "42"])).is_err());
     }
 
@@ -514,12 +811,64 @@ mod tests {
         assert!(args.contains(&pane_entrypoint().to_owned()));
         let cwd_index = args.iter().position(|arg| arg == "--cwd").expect("--cwd");
         assert_eq!(args[cwd_index + 1], current_dir.to_string_lossy());
+        assert!(!args.iter().any(|arg| arg == "--workspace"));
+        let target_index = args
+            .iter()
+            .position(|arg| arg == "--target-pane")
+            .expect("--target-pane");
+        assert_eq!(args[target_index + 1], "pane-1");
+        assert_eq!(args.last().map(String::as_str), Some("--focus"));
+    }
+
+    #[test]
+    fn open_pane_uses_workspace_only_when_no_target_pane_is_available() {
+        let current_dir = env::current_dir().expect("current dir");
+        let context = serde_json::json!({
+            "workspace_id": "ws-1",
+            "workspace_cwd": current_dir,
+        });
+        let args = herdr_open_pane_args(Some(&context), None)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         let workspace_index = args
             .iter()
             .position(|arg| arg == "--workspace")
             .expect("--workspace");
         assert_eq!(args[workspace_index + 1], "ws-1");
-        assert_eq!(args.last().map(String::as_str), Some("--focus"));
+        assert!(!args.iter().any(|arg| arg == "--target-pane"));
+    }
+
+    #[test]
+    fn startup_restore_targets_a_pane_without_repeating_workspace() {
+        let cwd = Path::new(r"C:\ExampleWorkspace");
+        let args = herdr_restore_pane_args("w1:p1", cwd)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--workspace"));
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--target-pane")
+                .map(|pair| pair[1].as_str()),
+            Some("w1:p1")
+        );
+        assert_eq!(args.last().map(String::as_str), Some("--no-focus"));
+    }
+
+    #[test]
+    fn stale_session_pane_cleanup_uses_plain_pane_commands() {
+        let process_args = herdr_pane_process_info_args("w1:p7")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let close_args = herdr_pane_close_args("w1:p7")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(process_args, ["pane", "process-info", "--pane", "w1:p7"]);
+        assert_eq!(close_args, ["pane", "close", "w1:p7"]);
+        assert!(!close_args.iter().any(|arg| arg == "plugin"));
     }
 
     #[test]
