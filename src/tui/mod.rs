@@ -48,7 +48,9 @@ use self::actions::{
     first_action_index, is_same_path, menu_window, relative_path_text, review_menu_entries,
     step_action_index, validate_name,
 };
-use self::content::{ContentPaneClient, persist_navigator_share_from_host};
+use self::content::{
+    ContentPaneClient, apply_own_navigation_share, persist_navigator_share_from_host,
+};
 use self::display::{display_width, pad_display, slice_display, splice_display};
 use self::explorer::{
     ExplorerAction, ExplorerLoadState, ExplorerModel, connection_message, open_with_default_app,
@@ -81,7 +83,16 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
         .draw(&rendered.lines)
         .map_err(|error| error.to_string())?;
     let mut dirty = false;
+    let persist_armed_at = Instant::now() + Duration::from_secs(2);
     let mut persist_layout_after: Option<Instant> = None;
+    thread::spawn(|| {
+        for attempt in 0..10 {
+            thread::sleep(Duration::from_millis(50 + attempt * 40));
+            if apply_own_navigation_share() {
+                break;
+            }
+        }
+    });
     loop {
         while let Ok(message) = receiver.try_recv() {
             let effect = pane.handle_message(message);
@@ -99,7 +110,9 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
             dirty = false;
         }
 
-        if persist_layout_after.is_some_and(|deadline| Instant::now() >= deadline) {
+        if persist_layout_after.is_some_and(|deadline| Instant::now() >= deadline)
+            && Instant::now() >= persist_armed_at
+        {
             persist_layout_after = None;
             persist_navigator_share_from_host();
         }
@@ -122,7 +135,9 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
             Event::FocusGained | Event::FocusLost | Event::Paste(_) => (false, false),
         };
         if should_close {
-            persist_navigator_share_from_host();
+            if Instant::now() >= persist_armed_at {
+                persist_navigator_share_from_host();
+            }
             break;
         }
         dirty |= event_changed;

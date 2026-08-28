@@ -42,6 +42,9 @@ pub enum OverlayKind {
     Context,
     Insert,
     Delete,
+    /// A skipped unchanged run between unified hunks when the workspace file
+    /// is not available to fill those lines. Rendered as an ellipsis separator.
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +123,7 @@ pub fn build_file_diff(
     } else {
         overlay_onto_file(new_lines, &hunks, truncated.is_none())
     };
+    lines = fill_line_number_gaps(lines, new_lines);
     apply_intra_line(&mut lines);
     let added = count_kind(&lines, OverlayKind::Insert);
     let removed = count_kind(&lines, OverlayKind::Delete);
@@ -177,35 +181,33 @@ fn overlay_onto_file(
                 &new_lines[new_i - 1],
             ));
         }
+        // The workspace preview is byte/line bounded. If this hunk starts
+        // beyond the captured prefix, advance to the line number declared by
+        // the unified header instead of numbering the hunk from the preview
+        // boundary.
+        new_i = new_i.max(new_target);
         old_i = hunk.old_start.saturating_sub(1);
         for line in &hunk.lines {
             match line {
-                HunkLine::Context(_) => {
+                HunkLine::Context(text) => {
                     old_i += 1;
-                    if new_i < new_lines.len() {
-                        new_i += 1;
-                        output.push(overlay(
-                            OverlayKind::Context,
-                            Some(old_i),
-                            Some(new_i),
-                            &new_lines[new_i - 1],
-                        ));
-                    } else if let HunkLine::Context(text) = line {
-                        output.push(overlay(OverlayKind::Context, Some(old_i), None, text));
-                    }
+                    new_i += 1;
+                    let text = new_lines
+                        .get(new_i - 1)
+                        .map_or(text.as_str(), String::as_str);
+                    output.push(overlay(
+                        OverlayKind::Context,
+                        Some(old_i),
+                        Some(new_i),
+                        text,
+                    ));
                 }
-                HunkLine::Insert(_) => {
-                    if new_i < new_lines.len() {
-                        new_i += 1;
-                        output.push(overlay(
-                            OverlayKind::Insert,
-                            None,
-                            Some(new_i),
-                            &new_lines[new_i - 1],
-                        ));
-                    } else if let HunkLine::Insert(text) = line {
-                        output.push(overlay(OverlayKind::Insert, None, Some(new_i + 1), text));
-                    }
+                HunkLine::Insert(text) => {
+                    new_i += 1;
+                    let text = new_lines
+                        .get(new_i - 1)
+                        .map_or(text.as_str(), String::as_str);
+                    output.push(overlay(OverlayKind::Insert, None, Some(new_i), text));
                 }
                 HunkLine::Delete(text) => {
                     old_i += 1;
@@ -285,13 +287,70 @@ fn change_hunk_starts(lines: &[OverlayLine]) -> Vec<usize> {
     let mut starts = Vec::new();
     let mut previous_change = false;
     for (index, line) in lines.iter().enumerate() {
-        let is_change = !matches!(line.kind, OverlayKind::Context);
+        let is_change = matches!(line.kind, OverlayKind::Insert | OverlayKind::Delete);
         if is_change && !previous_change {
             starts.push(index);
         }
         previous_change = is_change;
     }
     starts
+}
+
+fn fill_line_number_gaps(lines: Vec<OverlayLine>, new_lines: &[String]) -> Vec<OverlayLine> {
+    if lines.len() < 2 {
+        return lines;
+    }
+    let mut output = Vec::with_capacity(lines.len().saturating_add(new_lines.len()));
+    for line in lines {
+        if let Some(previous) = output.last().cloned() {
+            let gap = numbered_gap(&previous, &line);
+            if gap >= MIN_FOLD_HIDDEN {
+                if new_lines.is_empty() {
+                    output.push(skipped_overlay(&previous, gap));
+                } else if let Some(after) = previous.new_no {
+                    for number in (after + 1)..after.saturating_add(gap + 1) {
+                        if number == 0 || number > new_lines.len() {
+                            break;
+                        }
+                        if line.new_no == Some(number) {
+                            break;
+                        }
+                        let old_no = previous.old_no.map(|old| old + (number - after));
+                        output.push(overlay(
+                            OverlayKind::Context,
+                            old_no,
+                            Some(number),
+                            &new_lines[number - 1],
+                        ));
+                    }
+                } else {
+                    output.push(skipped_overlay(&previous, gap));
+                }
+            }
+        }
+        output.push(line);
+    }
+    output
+}
+
+fn numbered_gap(previous: &OverlayLine, next: &OverlayLine) -> usize {
+    match (previous.new_no, next.new_no) {
+        (Some(from), Some(to)) if to > from + 1 => to - from - 1,
+        _ => match (previous.old_no, next.old_no) {
+            (Some(from), Some(to)) if to > from + 1 => to - from - 1,
+            _ => 0,
+        },
+    }
+}
+
+fn skipped_overlay(previous: &OverlayLine, hidden: usize) -> OverlayLine {
+    OverlayLine {
+        kind: OverlayKind::Skipped,
+        old_no: previous.old_no.map(|old| old + 1),
+        new_no: previous.new_no.map(|new| new + 1),
+        text: hidden.to_string(),
+        intra: Vec::new(),
+    }
 }
 
 fn fold_ranges(lines: &[OverlayLine], fold_context: usize) -> Vec<FoldRange> {
@@ -616,6 +675,41 @@ mod tests {
         assert_eq!(model.added, 2);
         assert_eq!(model.removed, 1);
         assert_eq!(model.hunks, vec![2]);
+    }
+
+    #[test]
+    fn hunk_after_bounded_workspace_prefix_keeps_declared_new_line_numbers() {
+        let file = lines(&["preview-1", "preview-2"]);
+        let diff = unified("@@ -10,2 +10,4 @@\n old-10\n+insert-a\n+insert-b\n old-11\n");
+        let model = build_file_diff(&file, &diff, Some(FileDiffKind::Edit), 5);
+        let inserts = model
+            .lines
+            .iter()
+            .filter(|line| line.kind == OverlayKind::Insert)
+            .map(|line| (line.new_no, line.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inserts,
+            vec![(Some(11), "insert-a"), (Some(12), "insert-b")]
+        );
+    }
+
+    #[test]
+    fn distant_hunks_without_file_bytes_still_insert_a_skip_separator() {
+        let diff = unified("@@ -2,3 +2,3 @@\n a\n-b\n+B\n c\n@@ -30,3 +30,3 @@\n x\n-y\n+Y\n z\n");
+        let model = build_file_diff(&[], &diff, Some(FileDiffKind::Edit), 5);
+        assert!(
+            model
+                .lines
+                .iter()
+                .any(|line| line.kind == OverlayKind::Skipped),
+            "hunks concatenated without a skip marker: {:?}",
+            model
+                .lines
+                .iter()
+                .map(|line| (line.kind, line.new_no, line.text.as_str()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

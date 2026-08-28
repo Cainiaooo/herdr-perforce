@@ -10,6 +10,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::domain::{
     EXPAND_CHUNK, FileDiff, FoldRange, IntraSpan, MIN_FOLD_HIDDEN, OverlayKind, OverlayLine,
@@ -23,6 +24,10 @@ const ADD_WORD_BG: Color = Color::Rgb(46, 104, 64);
 const DEL_WORD_BG: Color = Color::Rgb(182, 48, 52);
 const DEL_FG: Color = Color::Rgb(255, 168, 168);
 const FOLD_FG: Color = Color::Rgb(125, 174, 199);
+const FOLD_ROW_BG: Color = Color::Rgb(28, 36, 48);
+const ELLIPSIS: &str = "⋯";
+const BTN_DOWN: &str = "[▼20]";
+const BTN_UP: &str = "[▲20]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffToolbarAction {
@@ -40,19 +45,38 @@ pub(crate) struct ToolbarHit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpandDirection {
-    /// Reveal more lines at the bottom of a hidden range (the splitter above a hunk).
+    /// Reveal more hidden lines above the following hunk.
     Up,
-    /// Reveal more lines at the top of a hidden range (the splitter below a hunk).
+    /// Reveal more hidden lines below the preceding hunk.
     Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FoldEdge {
     pub id: usize,
-    pub direction: ExpandDirection,
     pub remaining: usize,
     pub start: usize,
     pub end: usize,
+    pub expand_down: bool,
+    pub expand_up: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldClick {
+    Direction {
+        id: usize,
+        direction: ExpandDirection,
+    },
+    Both {
+        id: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FoldButton {
+    x: u16,
+    width: u16,
+    direction: ExpandDirection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +92,7 @@ pub(crate) struct DiffViewState {
     pub current_hunk: usize,
     pub gutter_width: usize,
     pub truncated: Option<String>,
+    number_width: usize,
     revealed_start: BTreeMap<usize, usize>,
     revealed_end: BTreeMap<usize, usize>,
     highlighted: Option<Vec<Line<'static>>>,
@@ -82,14 +107,15 @@ impl DiffViewState {
             .flatten()
             .max()
             .unwrap_or(1);
-        let number_width = max_number.max(1).ilog10() as usize + 1;
+        let number_width = (max_number.max(1).ilog10() as usize + 1).max(2);
         let highlighted = highlight_new_file(&filename, &model.lines);
         Self {
             model,
             expanded: BTreeSet::new(),
             current_hunk: 0,
-            gutter_width: number_width + 2,
+            gutter_width: number_width * 2 + 3,
             truncated,
+            number_width,
             revealed_start: BTreeMap::new(),
             revealed_end: BTreeMap::new(),
             highlighted,
@@ -125,6 +151,28 @@ impl DiffViewState {
         let mut index = 0;
         let line_count = self.model.lines.len();
         while index < line_count {
+            if self.model.lines[index].kind == OverlayKind::Skipped {
+                let remaining = self.model.lines[index]
+                    .text
+                    .parse::<usize>()
+                    .unwrap_or(1)
+                    .max(1);
+                items.push(VisibleItem::FoldEdge(FoldEdge {
+                    id: self
+                        .model
+                        .folds
+                        .len()
+                        .saturating_add(index)
+                        .saturating_add(1),
+                    remaining,
+                    start: index,
+                    end: index,
+                    expand_down: false,
+                    expand_up: false,
+                }));
+                index += 1;
+                continue;
+            }
             if let Some(fold) = self.model.folds.iter().find(|fold| fold.start == index) {
                 let (from_start, from_end, remaining) = self.fold_reveal(fold);
                 let remaining_start = fold.start + from_start;
@@ -133,35 +181,16 @@ impl DiffViewState {
                     items.push(VisibleItem::Line(line_index));
                 }
                 if remaining > 0 {
-                    let show_down = remaining_start > 0;
-                    let show_up = remaining_end < line_count;
-                    if show_down {
-                        items.push(VisibleItem::FoldEdge(FoldEdge {
-                            id: fold.id,
-                            direction: ExpandDirection::Down,
-                            remaining,
-                            start: remaining_start,
-                            end: remaining_end,
-                        }));
-                    }
-                    if show_up {
-                        items.push(VisibleItem::FoldEdge(FoldEdge {
-                            id: fold.id,
-                            direction: ExpandDirection::Up,
-                            remaining,
-                            start: remaining_start,
-                            end: remaining_end,
-                        }));
-                    }
-                    if !show_down && !show_up {
-                        items.push(VisibleItem::FoldEdge(FoldEdge {
-                            id: fold.id,
-                            direction: ExpandDirection::Down,
-                            remaining,
-                            start: remaining_start,
-                            end: remaining_end,
-                        }));
-                    }
+                    let expand_down = remaining_start > 0;
+                    let expand_up = remaining_end < line_count;
+                    items.push(VisibleItem::FoldEdge(FoldEdge {
+                        id: fold.id,
+                        remaining,
+                        start: remaining_start,
+                        end: remaining_end,
+                        expand_down: expand_down || !expand_up,
+                        expand_up,
+                    }));
                 }
                 for line_index in remaining_end..fold.end {
                     items.push(VisibleItem::Line(line_index));
@@ -182,7 +211,7 @@ impl DiffViewState {
             .map(|item| match item {
                 VisibleItem::Line(index) => paint_overlay_line(
                     &self.model.lines[index],
-                    self.gutter_width,
+                    self.number_width,
                     self.highlighted
                         .as_ref()
                         .and_then(|lines| {
@@ -192,9 +221,7 @@ impl DiffViewState {
                         })
                         .cloned(),
                 ),
-                VisibleItem::FoldEdge(edge) => {
-                    paint_expand_line(&self.model.lines, edge, self.gutter_width)
-                }
+                VisibleItem::FoldEdge(edge) => expand_row(edge, self.number_width).0,
             })
             .collect();
         if let Some(reason) = &self.truncated {
@@ -269,6 +296,47 @@ impl DiffViewState {
         true
     }
 
+    pub(crate) fn expand_both(&mut self, id: usize) -> bool {
+        let down = self.expand_edge(id, ExpandDirection::Down);
+        let up = self.expand_edge(id, ExpandDirection::Up);
+        down || up
+    }
+
+    pub(crate) fn expand_visible(
+        &mut self,
+        scroll_y: usize,
+        body_height: usize,
+        width: usize,
+    ) -> bool {
+        let view_end = scroll_y.saturating_add(body_height.max(1));
+        let mut visual = 0usize;
+        let mut target = None;
+        for item in self.visible_items() {
+            let line = match &item {
+                VisibleItem::Line(index) => {
+                    paint_overlay_line(&self.model.lines[*index], self.number_width, None)
+                }
+                VisibleItem::FoldEdge(edge) => expand_row(*edge, self.number_width).0,
+            };
+            let height = wrap::wrap_line_with_gutter(&line, width.max(1), self.gutter_width)
+                .len()
+                .max(1);
+            if let VisibleItem::FoldEdge(edge) = item
+                && (edge.expand_down || edge.expand_up)
+                && visual < view_end
+                && visual + height > scroll_y
+            {
+                target = fold_click(edge);
+                break;
+            }
+            visual += height;
+        }
+        let Some(click) = target else {
+            return false;
+        };
+        self.apply_fold_click(click)
+    }
+
     pub(crate) fn step_hunk(&mut self, delta: isize) -> bool {
         if self.model.hunks.is_empty() {
             return false;
@@ -298,13 +366,13 @@ impl DiffViewState {
                     return visual;
                 }
                 VisibleItem::Line(index) => {
-                    paint_overlay_line(&self.model.lines[index], self.gutter_width, None)
+                    paint_overlay_line(&self.model.lines[index], self.number_width, None)
                 }
                 VisibleItem::FoldEdge(edge) => {
                     if overlay_index >= edge.start && overlay_index < edge.end {
                         return visual;
                     }
-                    paint_expand_line(&self.model.lines, edge, self.gutter_width)
+                    expand_row(edge, self.number_width).0
                 }
             };
             visual += wrap::wrap_line_with_gutter(&line, width.max(1), self.gutter_width).len();
@@ -312,27 +380,65 @@ impl DiffViewState {
         visual
     }
 
-    pub(crate) fn fold_at_visual_row(&self, visual_row: usize, width: usize) -> Option<FoldEdge> {
+    pub(crate) fn fold_hit_at(
+        &self,
+        visual_row: usize,
+        column: u16,
+        width: usize,
+    ) -> Option<FoldClick> {
         let mut visual = 0;
         for item in self.visible_items() {
-            let line = match item {
-                VisibleItem::Line(index) => {
-                    paint_overlay_line(&self.model.lines[index], self.gutter_width, None)
-                }
-                VisibleItem::FoldEdge(edge) => {
-                    paint_expand_line(&self.model.lines, edge, self.gutter_width)
-                }
+            let (line, buttons) = match item {
+                VisibleItem::Line(index) => (
+                    paint_overlay_line(&self.model.lines[index], self.number_width, None),
+                    Vec::new(),
+                ),
+                VisibleItem::FoldEdge(edge) => expand_row(edge, self.number_width),
             };
-            let height = wrap::wrap_line_with_gutter(&line, width.max(1), self.gutter_width).len();
+            let height = wrap::wrap_line_with_gutter(&line, width.max(1), self.gutter_width)
+                .len()
+                .max(1);
             if visual_row >= visual && visual_row < visual + height {
-                return match item {
-                    VisibleItem::FoldEdge(edge) => Some(edge),
-                    VisibleItem::Line(_) => None,
+                let VisibleItem::FoldEdge(edge) = item else {
+                    return None;
                 };
+                if visual_row == visual {
+                    if let Some(button) = buttons.iter().find(|button| {
+                        column >= button.x && column < button.x.saturating_add(button.width)
+                    }) {
+                        return Some(FoldClick::Direction {
+                            id: edge.id,
+                            direction: button.direction,
+                        });
+                    }
+                }
+                return fold_click(edge);
             }
             visual += height;
         }
         None
+    }
+
+    pub(crate) fn apply_fold_click(&mut self, click: FoldClick) -> bool {
+        match click {
+            FoldClick::Direction { id, direction } => self.expand_edge(id, direction),
+            FoldClick::Both { id } => self.expand_both(id),
+        }
+    }
+}
+
+fn fold_click(edge: FoldEdge) -> Option<FoldClick> {
+    match (edge.expand_down, edge.expand_up) {
+        (true, true) => Some(FoldClick::Both { id: edge.id }),
+        (true, false) => Some(FoldClick::Direction {
+            id: edge.id,
+            direction: ExpandDirection::Down,
+        }),
+        (false, true) => Some(FoldClick::Direction {
+            id: edge.id,
+            direction: ExpandDirection::Up,
+        }),
+        (false, false) => None,
     }
 }
 
@@ -443,6 +549,9 @@ fn highlight_new_file(filename: &str, lines: &[OverlayLine]) -> Option<Vec<Line<
     let mut numbered = Vec::new();
     let mut expected = 1usize;
     for line in lines {
+        if matches!(line.kind, OverlayKind::Skipped) {
+            continue;
+        }
         let Some(number) = line.new_no else {
             continue;
         };
@@ -462,27 +571,34 @@ fn highlight_new_file(filename: &str, lines: &[OverlayLine]) -> Option<Vec<Line<
     syntax::highlight(filename, &text, numbered.len())
 }
 
+fn number_cell(number: Option<usize>, width: usize) -> String {
+    match number {
+        Some(number) => format!("{number:>width$}"),
+        None => " ".repeat(width),
+    }
+}
+
 fn paint_overlay_line(
     line: &OverlayLine,
-    gutter_width: usize,
+    number_width: usize,
     syntax_line: Option<Line<'static>>,
 ) -> Line<'static> {
-    let number = match line.kind {
-        OverlayKind::Delete => line.old_no,
-        OverlayKind::Insert | OverlayKind::Context => line.new_no.or(line.old_no),
-    }
-    .unwrap_or(0);
-    let number_width = gutter_width.saturating_sub(2);
-    let (sign, line_bg, sign_fg) = match line.kind {
-        OverlayKind::Insert => ('+', Some(ADD_LINE_BG), Color::Green),
-        OverlayKind::Delete => ('-', Some(DEL_LINE_BG), DEL_FG),
-        OverlayKind::Context => (' ', None, Color::DarkGray),
+    let (old_no, new_no, mark, line_bg, mark_fg) = match line.kind {
+        OverlayKind::Insert => (None, line.new_no, '+', Some(ADD_LINE_BG), Color::Green),
+        OverlayKind::Delete => (line.old_no, None, '-', Some(DEL_LINE_BG), DEL_FG),
+        OverlayKind::Context | OverlayKind::Skipped => {
+            (line.old_no, line.new_no, ' ', None, Color::DarkGray)
+        }
     };
-    let gutter = format!("{number:>number_width$} {sign}");
+    let gutter = format!(
+        "{} {} {mark}",
+        number_cell(old_no, number_width),
+        number_cell(new_no, number_width)
+    );
     let gutter_style = match line.kind {
-        OverlayKind::Insert => Style::default().fg(sign_fg).bg(ADD_LINE_BG),
-        OverlayKind::Delete => Style::default().fg(sign_fg).bg(DEL_LINE_BG),
-        OverlayKind::Context => Style::default().fg(Color::DarkGray),
+        OverlayKind::Insert => Style::default().fg(mark_fg).bg(ADD_LINE_BG),
+        OverlayKind::Delete => Style::default().fg(mark_fg).bg(DEL_LINE_BG),
+        OverlayKind::Context | OverlayKind::Skipped => Style::default().fg(Color::DarkGray),
     };
     let mut spans = vec![Span::styled(gutter, gutter_style)];
     spans.extend(paint_body(line, syntax_line));
@@ -497,7 +613,7 @@ fn paint_body(line: &OverlayLine, syntax_line: Option<Line<'static>>) -> Vec<Spa
     let word_bg = match line.kind {
         OverlayKind::Insert => Some(ADD_WORD_BG),
         OverlayKind::Delete => Some(DEL_WORD_BG),
-        OverlayKind::Context => None,
+        OverlayKind::Context | OverlayKind::Skipped => None,
     };
     let syntax_spans = syntax_line
         .filter(|_| line.kind != OverlayKind::Delete)
@@ -516,7 +632,7 @@ fn paint_body(line: &OverlayLine, syntax_line: Option<Line<'static>>) -> Vec<Spa
             match line.kind {
                 OverlayKind::Insert => Style::default().fg(Color::Green),
                 OverlayKind::Delete => Style::default().fg(DEL_FG),
-                OverlayKind::Context => Style::default(),
+                OverlayKind::Context | OverlayKind::Skipped => Style::default(),
             },
         )],
     };
@@ -570,32 +686,54 @@ fn apply_intra_spans(
     output
 }
 
-fn paint_expand_line(lines: &[OverlayLine], edge: FoldEdge, gutter_width: usize) -> Line<'static> {
-    let first = lines
-        .get(edge.start)
-        .and_then(|line| line.new_no.or(line.old_no));
-    let last = lines
-        .get(edge.end.saturating_sub(1))
-        .and_then(|line| line.new_no.or(line.old_no));
-    let range = match (first, last) {
-        (Some(start), Some(end)) => format!(" {start}–{end}"),
-        _ => String::new(),
+fn expand_row(edge: FoldEdge, number_width: usize) -> (Line<'static>, Vec<FoldButton>) {
+    let blank = " ".repeat(number_width);
+    let gutter = format!("{blank} {blank} {ELLIPSIS}");
+    let mut x = gutter.width() as u16;
+    let mut spans = vec![Span::styled(
+        gutter,
+        Style::default().fg(FOLD_FG).add_modifier(Modifier::DIM),
+    )];
+    let mut buttons = Vec::new();
+
+    let count = if edge.expand_down || edge.expand_up {
+        format!(" {} hidden  click or Enter ", edge.remaining)
+    } else {
+        format!(" {} unchanged lines omitted ", edge.remaining)
     };
-    let show = EXPAND_CHUNK.min(edge.remaining);
-    let (arrow, side) = match edge.direction {
-        ExpandDirection::Up => ('▲', "above"),
-        ExpandDirection::Down => ('▼', "below"),
+    x += count.width() as u16;
+    spans.push(Span::styled(count, Style::default().fg(FOLD_FG)));
+
+    let mut push_button = |label: &str, direction: ExpandDirection, x: &mut u16| {
+        let text = format!(" {label} ");
+        let width = text.width() as u16;
+        buttons.push(FoldButton {
+            x: *x,
+            width,
+            direction,
+        });
+        spans.push(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(FOLD_FG)
+                .add_modifier(Modifier::BOLD),
+        ));
+        *x += width;
+        spans.push(Span::raw(" "));
+        *x += 1;
     };
-    Line::from(vec![
-        Span::styled(" ".repeat(gutter_width), Color::DarkGray),
-        Span::styled(
-            format!(
-                "── {arrow} {show} more {side} · {remaining} hidden{range} ──",
-                remaining = edge.remaining
-            ),
-            Style::default().fg(FOLD_FG),
-        ),
-    ])
+
+    if edge.expand_down {
+        push_button(BTN_DOWN, ExpandDirection::Down, &mut x);
+    }
+    if edge.expand_up {
+        push_button(BTN_UP, ExpandDirection::Up, &mut x);
+    }
+
+    let mut line = Line::from(spans);
+    line.style = Style::default().bg(FOLD_ROW_BG).fg(FOLD_FG);
+    (line, buttons)
 }
 
 pub(crate) fn pad_background(line: Line<'static>, width: usize) -> Line<'static> {
@@ -666,7 +804,7 @@ mod tests {
         let body = view.body_lines();
         assert!(body.iter().any(|line| {
             let text = texts(line);
-            text.contains("hidden") && (text.contains("▲") || text.contains("▼"))
+            text.contains(ELLIPSIS) && (text.contains("▲") || text.contains("▼"))
         }));
         let fold_id = view.model.folds[0].id;
         view.expand_fold(fold_id);
@@ -806,8 +944,138 @@ mod tests {
             .filter(|item| matches!(item, VisibleItem::Line(_)))
             .count();
         assert_eq!(after_down, after_up + EXPAND_CHUNK);
-        let body = view.body_lines();
+        let mut click_view = DiffViewState::new("a.cpp".into(), view.model.clone(), None);
+        let body = click_view.body_lines();
+        assert!(body.iter().any(|line| texts(line).contains(ELLIPSIS)));
         assert!(body.iter().any(|line| texts(line).contains("▲")));
         assert!(body.iter().any(|line| texts(line).contains("▼")));
+        let leading_row = body
+            .iter()
+            .position(|line| texts(line).contains("[▲20]"))
+            .expect("leading fold row");
+        let click = click_view
+            .fold_hit_at(leading_row, 0, 80)
+            .expect("clickable fold");
+        assert!(matches!(
+            click,
+            FoldClick::Direction {
+                id,
+                direction: ExpandDirection::Up
+            } if id == leading.id
+        ));
+
+        let before_click = click_view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, VisibleItem::Line(_)))
+            .count();
+        assert!(click_view.apply_fold_click(click));
+        let after_click = click_view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, VisibleItem::Line(_)))
+            .count();
+        assert_eq!(after_click, before_click + EXPAND_CHUNK);
+    }
+
+    #[test]
+    fn dual_gutters_keep_old_and_new_numbers_across_edits() {
+        let model = build_file_diff(
+            &["new".into(), "kept".into()],
+            &[
+                "@@ -1,2 +1,2 @@".into(),
+                "-old".into(),
+                "+new".into(),
+                " kept".into(),
+            ],
+            Some(FileDiffKind::Edit),
+            5,
+        );
+        let view = DiffViewState::new("a.rs".into(), model, None);
+        let lines = view.body_lines();
+        assert!(
+            texts(&lines[0]).starts_with(" 1    -"),
+            "delete keeps old number only: {}",
+            texts(&lines[0])
+        );
+        assert!(
+            texts(&lines[1]).starts_with("    1 +"),
+            "insert keeps new number only: {}",
+            texts(&lines[1])
+        );
+        assert!(
+            texts(&lines[2]).starts_with(" 2  2  "),
+            "context shows both numbers: {}",
+            texts(&lines[2])
+        );
+    }
+
+    #[test]
+    fn folded_gap_between_hunks_renders_an_ellipsis_separator() {
+        let mut file: Vec<String> = (1..=40).map(|index| format!("line-{index}")).collect();
+        file[4] = "first".into();
+        file[34] = "second".into();
+        let diff = vec![
+            "@@ -4,3 +4,3 @@".into(),
+            " line-4".into(),
+            "-line-5".into(),
+            "+first".into(),
+            " line-6".into(),
+            "@@ -34,3 +34,3 @@".into(),
+            " line-34".into(),
+            "-line-35".into(),
+            "+second".into(),
+            " line-36".into(),
+        ];
+        let model = build_file_diff(&file, &diff, Some(FileDiffKind::Edit), 5);
+        let mut view = DiffViewState::new("a.cpp".into(), model, None);
+        let body: Vec<String> = view.body_lines().iter().map(texts).collect();
+        assert!(
+            body.iter().any(|line| line.contains(ELLIPSIS)),
+            "expected ⋯ between hunks, got {body:?}"
+        );
+        let fold_row = body
+            .iter()
+            .find(|line| line.contains(ELLIPSIS))
+            .expect("fold");
+        assert!(fold_row.contains("[▼20]") && fold_row.contains("[▲20]"));
+        assert!(view.expand_visible(0, 80, 80));
+        let expanded: Vec<String> = view.body_lines().iter().map(texts).collect();
+        assert!(
+            expanded.iter().any(|line| line.contains("line-20")),
+            "Enter/click should reveal more context, got {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn concatenated_unified_hunks_without_file_still_show_ellipsis() {
+        let diff = vec![
+            "@@ -2,3 +2,3 @@".into(),
+            " a".into(),
+            "-b".into(),
+            "+B".into(),
+            " c".into(),
+            "@@ -30,3 +30,3 @@".into(),
+            " x".into(),
+            "-y".into(),
+            "+Y".into(),
+            " z".into(),
+        ];
+        let model = build_file_diff(&[], &diff, Some(FileDiffKind::Edit), 5);
+        let mut view = DiffViewState::new("a.rs".into(), model, None);
+        let body: Vec<String> = view.body_lines().iter().map(texts).collect();
+        assert!(
+            body.iter().any(|line| line.contains(ELLIPSIS)),
+            "expected ⋯ between concatenated hunks, got {body:?}"
+        );
+        let separator = body
+            .iter()
+            .find(|line| line.contains(ELLIPSIS))
+            .expect("separator");
+        assert!(separator.contains("unchanged lines omitted"));
+        assert!(!separator.contains("click or Enter"));
+        assert!(!separator.contains(BTN_DOWN));
+        assert!(!separator.contains(BTN_UP));
+        assert!(!view.expand_visible(0, 80, 80));
     }
 }

@@ -21,7 +21,8 @@
 - Diff 的画布是工作区当前文件（add 为整份新增，delete 为整份删除）。
 - 删除行插在改动位置上方（红底、gutter `-`），新增行就地（绿底、gutter `+`），未改行保持 File 预览的语法高亮。
 - 配对的删/增行做词级高亮（与 Claude / GitHub 的 word-diff 同类），无关替换不强行铺词底。
-- 远距未改默认折叠，保留每侧 `diff_fold_context` 行（默认 5，`0` 关闭折叠）；折叠行可点击展开，工具栏和 `e` 可全部展开/收起。
+- 远距未改默认折叠，保留每侧 `diff_fold_context` 行（默认 5，`0` 关闭折叠）；折叠处显示 `⋯` 分隔和 `[▼20]`/`[▲20]`，点击再展开 20 行上下文。工作区文本不可用时，分离 hunks 之间显示不可交互的 omitted separator。工具栏和 `e` 可全部展开/收起。
+- Gutter 同时显示旧行号和新行号，与 `herdr-sidebar` 的 Git diff 一致。
 - 工具栏提供 Prev / Next hunk；`[` / `]` 等价。不提供 side-by-side。
 - 配置只放在 `HERDR_PLUGIN_CONFIG_DIR/panel.json` 的 `diff_fold_context`。
 

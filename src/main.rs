@@ -11,7 +11,7 @@ use herdr_perforce::panel_restore::{
     HerdrPane, PanelOpenMode, RememberedWorkspace, load_navigator_share, load_panel_open_mode,
     load_remembered_workspaces, matching_workspace, opened_pane_id, pane_process_is_active,
     parse_pane_list, perforce_pane_candidates, preferred_perforce_pane, remember_workspace,
-    target_pane_id,
+    restore_decision,
 };
 use herdr_perforce::tui::{navigation_resize_args_for_share, rightmost_pane_id};
 use serde_json::Value;
@@ -374,36 +374,38 @@ fn restore_herdr_panes() -> ExitCode {
             unavailable += 1;
             continue;
         };
-        let mut active_panes = Vec::new();
-        let mut stale_pane_ids = Vec::new();
-        let mut inspection_failed = false;
         let candidates = perforce_pane_candidates(entry, &workspace, &panes);
-        for pane in candidates {
-            let process_args = herdr_pane_process_info_args(&pane.id);
-            match run_herdr_json(&executable, &process_args)
-                .and_then(|response| pane_process_is_active(&response))
-            {
-                Ok(true) => active_panes.push(pane),
-                Ok(false) if pane.label.as_deref() == Some("Perforce") => {
-                    stale_pane_ids.push(pane.id.clone());
+        let mut healthy_ids = Vec::new();
+        let mut unknown_ids = Vec::new();
+        let mut healthy_panes = Vec::new();
+        for pane in &candidates {
+            match inspect_perforce_pane(&executable, pane) {
+                Ok(true) => {
+                    healthy_ids.push(pane.id.clone());
+                    healthy_panes.push(*pane);
                 }
-                Ok(false) => inspection_failed = true,
-                Err(_) => inspection_failed = true,
+                Ok(false) => {}
+                Err(_) => unknown_ids.push(pane.id.clone()),
             }
         }
-        if !active_panes.is_empty() {
-            let keep = keep_existing_navigation_pane(&executable, entry, &active_panes);
-            let duplicate_ids = active_panes
+        let decision = restore_decision(entry, &workspace, &panes, &healthy_ids, &unknown_ids);
+        if !decision.healthy_nav_ids.is_empty() {
+            let keep = keep_existing_navigation_pane(&executable, entry, &healthy_panes);
+            let extra_healthy = healthy_panes
                 .iter()
                 .map(|pane| pane.id.clone())
                 .filter(|id| id != &keep)
                 .collect::<Vec<_>>();
-            let duplicate_cleanup = close_panes(&executable, &duplicate_ids);
+            let leftover_cleanup =
+                close_restored_panes(&executable, &decision.leftover_content_ids);
+            stale_closed += leftover_cleanup.closed;
+            failed += leftover_cleanup.failed;
+            let corpse_cleanup = close_restored_panes(&executable, &decision.stale_nav_ids);
+            stale_closed += corpse_cleanup.closed;
+            failed += corpse_cleanup.failed;
+            let duplicate_cleanup = close_restored_panes(&executable, &extra_healthy);
             duplicates_closed += duplicate_cleanup.closed;
             failed += duplicate_cleanup.failed;
-            let cleanup = close_stale_panes(&executable, &stale_pane_ids);
-            stale_closed += cleanup.closed;
-            failed += cleanup.failed;
             if let Some(state_dir) = state_dir.as_deref() {
                 remember_workspace(
                     state_dir,
@@ -414,21 +416,31 @@ fn restore_herdr_panes() -> ExitCode {
                 )
                 .ok();
             }
+            resize_navigation_pane_id(&executable, &keep);
             already_open += 1;
             continue;
         }
-        if inspection_failed {
+        if !decision.unknown_nav_ids.is_empty() {
             failed += 1;
             continue;
         }
-        let target_pane = target_pane_id(entry, &workspace, &panes)
-            .map(ToOwned::to_owned)
-            .or_else(|| stale_pane_ids.first().cloned());
-        let Some(target_pane) = target_pane else {
-            unavailable += 1;
+        // Session restore leaves a labeled shell. Close that corpse first,
+        // then open a real plugin pane from the remaining workspace pane.
+        // Opening first and hoping pane close works is what stacked duplicates.
+        let leftover_cleanup = close_restored_panes(&executable, &decision.leftover_content_ids);
+        stale_closed += leftover_cleanup.closed;
+        failed += leftover_cleanup.failed;
+        if leftover_cleanup.failed > 0 {
             continue;
-        };
-        let args = herdr_restore_pane_args(&target_pane, &entry.cwd);
+        }
+        let corpse_cleanup = close_restored_panes(&executable, &decision.stale_nav_ids);
+        stale_closed += corpse_cleanup.closed;
+        if corpse_cleanup.failed > 0 {
+            failed += corpse_cleanup.failed;
+            continue;
+        }
+        let args =
+            herdr_restore_pane_args(decision.open_target.as_deref(), &workspace.id, &entry.cwd);
         let output = match ProcessCommand::new(&executable).args(&args).output() {
             Ok(output) if output.status.success() => output,
             _ => {
@@ -438,9 +450,6 @@ fn restore_herdr_panes() -> ExitCode {
         };
         resize_opened_navigation_pane(&executable, &output.stdout);
         restored += 1;
-        let cleanup = close_stale_panes(&executable, &stale_pane_ids);
-        stale_closed += cleanup.closed;
-        failed += cleanup.failed;
         if let (Some(state_dir), Ok(response)) = (
             state_dir.as_deref(),
             serde_json::from_slice::<Value>(&output.stdout),
@@ -492,6 +501,30 @@ fn keep_existing_navigation_pane(
         .unwrap_or_else(|| active_panes[0].id.clone())
 }
 
+fn inspect_perforce_pane(executable: &OsStr, pane: &HerdrPane) -> Result<bool, &'static str> {
+    let process_args = herdr_pane_process_info_args(&pane.id);
+    let attempts = if pane.label.as_deref() == Some("Perforce") {
+        5
+    } else {
+        1
+    };
+    let mut last = None;
+    for attempt in 0..attempts {
+        match run_herdr_json(executable, &process_args)
+            .and_then(|response| pane_process_is_active(&response))
+        {
+            Ok(true) => return Ok(true),
+            other => {
+                last = Some(other);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+            }
+        }
+    }
+    last.unwrap_or(Ok(false))
+}
+
 fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
     let Some(pane_id) = serde_json::from_slice::<Value>(stdout)
         .ok()
@@ -501,6 +534,10 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
     else {
         return;
     };
+    resize_navigation_pane_id(executable, &pane_id);
+}
+
+fn resize_navigation_pane_id(executable: &OsStr, pane_id: &str) {
     let share = load_navigator_share(
         env::var_os("HERDR_PLUGIN_STATE_DIR")
             .map(PathBuf::from)
@@ -508,10 +545,10 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
     );
     // Query actual geometry instead of assuming the opening ratio. This also
     // absorbs terminal chrome and any future Herdr default-ratio change.
-    for attempt in 0..4 {
-        let layout_args = herdr_navigation_layout_args(&pane_id);
+    for attempt in 0..6 {
+        let layout_args = herdr_navigation_layout_args(pane_id);
         if let Ok(layout) = run_herdr_json(executable, &layout_args) {
-            let Some(resize_args) = navigation_resize_args_for_share(&layout, &pane_id, share)
+            let Some(resize_args) = navigation_resize_args_for_share(&layout, pane_id, share)
             else {
                 return;
             };
@@ -523,15 +560,15 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
                 return;
             }
         }
-        if attempt < 3 {
-            std::thread::sleep(std::time::Duration::from_millis(25));
+        if attempt < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
     }
     // A just-created plugin pane is a 50/50 split in Herdr 0.8.2. If layout
     // metadata never becomes available, retain the bounded legacy fallback
     // instead of leaving navigation at half the tab.
     let _ = ProcessCommand::new(executable)
-        .args(herdr_navigation_resize_fallback_args(&pane_id, share))
+        .args(herdr_navigation_resize_fallback_args(pane_id, share))
         .output();
 }
 
@@ -565,43 +602,32 @@ struct StalePaneCleanup {
     failed: usize,
 }
 
-fn close_stale_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCleanup {
+fn close_restored_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCleanup {
     let mut result = StalePaneCleanup::default();
     for pane_id in pane_ids {
-        let process_args = herdr_pane_process_info_args(pane_id);
-        match run_herdr_json(executable, &process_args)
-            .and_then(|response| pane_process_is_active(&response))
-        {
-            Ok(true) => continue,
-            Err(_) => {
-                result.failed += 1;
-                continue;
-            }
-            Ok(false) => {}
+        if close_restored_pane(executable, pane_id) {
+            result.closed += 1;
+        } else {
+            result.failed += 1;
         }
-        accumulate_close(executable, pane_id, &mut result);
     }
     result
 }
 
-fn close_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCleanup {
-    let mut result = StalePaneCleanup::default();
-    for pane_id in pane_ids {
-        accumulate_close(executable, pane_id, &mut result);
+fn close_restored_pane(executable: &OsStr, pane_id: &str) -> bool {
+    // Session-restored plugin slots often keep plugin ownership after the
+    // process dies. Prefer plugin pane close, then fall back to a plain close.
+    let plugin_closed = ProcessCommand::new(executable)
+        .args(herdr_plugin_pane_close_args(pane_id))
+        .output()
+        .is_ok_and(|output| herdr_output_succeeded(&output));
+    if plugin_closed {
+        return true;
     }
-    result
-}
-
-fn accumulate_close(executable: &OsStr, pane_id: &str, result: &mut StalePaneCleanup) {
-    let closed = ProcessCommand::new(executable)
+    ProcessCommand::new(executable)
         .args(herdr_pane_close_args(pane_id))
         .output()
-        .is_ok_and(|output| output.status.success());
-    if closed {
-        result.closed += 1;
-    } else {
-        result.failed += 1;
-    }
+        .is_ok_and(|output| herdr_output_succeeded(&output))
 }
 
 fn herdr_pane_process_info_args(pane_id: &str) -> [OsString; 4] {
@@ -621,8 +647,21 @@ fn herdr_pane_close_args(pane_id: &str) -> [OsString; 3] {
     ]
 }
 
-fn herdr_restore_pane_args(target_pane: &str, cwd: &Path) -> Vec<OsString> {
-    vec![
+fn herdr_plugin_pane_close_args(pane_id: &str) -> [OsString; 4] {
+    [
+        OsString::from("plugin"),
+        OsString::from("pane"),
+        OsString::from("close"),
+        OsString::from(pane_id),
+    ]
+}
+
+fn herdr_restore_pane_args(
+    target_pane: Option<&str>,
+    workspace_id: &str,
+    cwd: &Path,
+) -> Vec<OsString> {
+    let mut args = vec![
         OsString::from("plugin"),
         OsString::from("pane"),
         OsString::from("open"),
@@ -634,12 +673,18 @@ fn herdr_restore_pane_args(target_pane: &str, cwd: &Path) -> Vec<OsString> {
         OsString::from("split"),
         OsString::from("--direction"),
         OsString::from("right"),
-        OsString::from("--target-pane"),
-        OsString::from(target_pane),
-        OsString::from("--cwd"),
-        cwd.as_os_str().to_os_string(),
-        OsString::from("--no-focus"),
-    ]
+    ];
+    if let Some(target_pane) = target_pane {
+        args.push(OsString::from("--target-pane"));
+        args.push(OsString::from(target_pane));
+    } else {
+        args.push(OsString::from("--workspace"));
+        args.push(OsString::from(workspace_id));
+    }
+    args.push(OsString::from("--cwd"));
+    args.push(cwd.as_os_str().to_os_string());
+    args.push(OsString::from("--no-focus"));
+    args
 }
 
 fn run_herdr_json(executable: &OsStr, args: &[OsString]) -> Result<Value, &'static str> {
@@ -1018,7 +1063,7 @@ mod tests {
     #[test]
     fn startup_restore_targets_a_pane_without_repeating_workspace() {
         let cwd = Path::new(r"C:\ExampleWorkspace");
-        let args = herdr_restore_pane_args("w1:p1", cwd)
+        let args = herdr_restore_pane_args(Some("w1:p1"), "w1", cwd)
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -1033,8 +1078,28 @@ mod tests {
     }
 
     #[test]
-    fn stale_session_pane_cleanup_uses_plain_pane_commands() {
+    fn startup_restore_uses_workspace_when_no_target_pane_remains() {
+        let cwd = Path::new(r"C:\ExampleWorkspace");
+        let args = herdr_restore_pane_args(None, "w1", cwd)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--target-pane"));
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--workspace")
+                .map(|pair| pair[1].as_str()),
+            Some("w1")
+        );
+    }
+
+    #[test]
+    fn stale_session_pane_cleanup_uses_plugin_close_then_plain_close() {
         let process_args = herdr_pane_process_info_args("w1:p7")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let plugin_close = herdr_plugin_pane_close_args("w1:p7")
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -1043,8 +1108,8 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(process_args, ["pane", "process-info", "--pane", "w1:p7"]);
+        assert_eq!(plugin_close, ["plugin", "pane", "close", "w1:p7"]);
         assert_eq!(close_args, ["pane", "close", "w1:p7"]);
-        assert!(!close_args.iter().any(|arg| arg == "plugin"));
     }
 
     #[test]

@@ -229,7 +229,7 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 - 只恢复被记住且本次 session 仍存在的 workspace；不扫描其他目录、不运行 `p4`。
 - 已有匹配且 process-info 确认运行 `herdr-p4 ... pane`（含 Windows PowerShell 包装）的健康 pane 时不重复打开；同一 workspace 只保留一个导航 pane。
-- 只有真正 shell prompt、且没有插件进程的同 workspace 同名 pane 视为 stale；新 pane 成功后必须二次确认仍无插件进程，再用 pane close 清理，失败不得静默忽略。
+- 标题是 `Perforce` 但前台只剩默认 shell 的 pane 视为 corpse：必须先关掉空壳和同时带有 Content source/control metadata token 的残留 Content pane，再打开真正的插件 pane。不得仅凭 `Diff ·` / `File ·` 标题关闭 pane，不得把空壳当成已恢复。任一清理关闭失败不得再 split，也不得静默忽略。
 - 用户拖动过的导航宽度写入插件 state；重启后已有健康 pane 保持该宽度，不得被默认 50/50 覆盖。
 - 缺失 workspace 计为 unavailable 并安全跳过。
 - 新恢复 pane 不抢焦点，且不会替换或关闭 Agent pane。
@@ -424,13 +424,14 @@ fixture 和 Level B 只读环境至少覆盖普通 binary 与 `+l` binary。期�
 
 ### ACC-DIFF-008（P1）Diff 导航
 
-期望：`[`/`]` 与工具栏 Prev/Next 在首尾边界行为稳定；刷新后尽量保留当前 hunk。点击折叠行只展开该段；`e` 与 Expand all / Fold unchanged 切换全部折叠。
+期望：`[`/`]` 与工具栏 Prev/Next 在首尾边界行为稳定；刷新后尽量保留当前 hunk。折叠块之间显示 `⋯` 分隔和 `[▼20]`/`[▲20]`；点击按钮再展开 20 行上下文。`e` 与 Expand all / Fold unchanged 切换全部折叠。
 
 ### ACC-DIFF-009（P1）折叠与行内修改
 
 期望：
 
-- 未改连续行超过 `2 * diff_fold_context + 3` 时中间折叠，折叠行标明隐藏行数且可展开。
+- 未改连续行超过 `2 * diff_fold_context + 3` 时中间折叠；有工作区文本可供展开时，折叠行用 `⋯` 标明跳过的行，并带可点的 `[▼20]`/`[▲20]`。工作区文本不可用、只能依据分离 hunks 表示间隔时，显示不可点击的 omitted separator，不伪装成可展开控件。
+- Diff 行号为旧/新双列；折叠两侧的可见行号连续属于各自文件，不把跳过的区间画成相连行号。
 - `diff_fold_context = 0` 时不折叠。
 - 无效或超出 0–200 的配置被拒绝，与其它 `panel.json` 字段相同。
 - 配对的删/增行把变化 token 标得比整行底色更亮；完全无关的替换不强行做词级高亮。

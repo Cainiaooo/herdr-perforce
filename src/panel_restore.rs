@@ -20,9 +20,11 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 const MAX_LAYOUT_BYTES: u64 = 4 * 1024;
 const MAX_REMEMBERED_WORKSPACES: usize = 128;
+const CONTENT_SOURCE_TOKEN: &str = "herdr-perforce-content";
+const CONTENT_CONTROL_TOKEN: &str = "herdr-p4-content-control";
 pub const DEFAULT_NAVIGATION_SHARE: f64 = 0.2;
 const MIN_NAVIGATION_SHARE: f64 = 0.08;
-const MAX_NAVIGATION_SHARE: f64 = 0.45;
+const MAX_NAVIGATION_SHARE: f64 = 0.32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelOpenMode {
@@ -65,6 +67,7 @@ pub struct HerdrPane {
     pub cwd: PathBuf,
     pub label: Option<String>,
     pub focused: bool,
+    pub content_owned: bool,
 }
 
 pub fn load_panel_open_mode(config_dir: Option<&Path>) -> Result<PanelOpenMode, &'static str> {
@@ -243,6 +246,11 @@ pub fn save_navigator_share(state_dir: &Path, share: f64) -> Result<(), &'static
     if !share.is_finite() {
         return Err("navigator share is invalid");
     }
+    // A just-opened Herdr plugin split is 50/50. Persist only after the user
+    // has actually narrowed (or widened slightly past) the default sidebar.
+    if (0.45..=0.55).contains(&share) {
+        return Err("navigator share looks like the host default split");
+    }
     let share = share.clamp(MIN_NAVIGATION_SHARE, MAX_NAVIGATION_SHARE);
     fs::create_dir_all(state_dir).map_err(|_| "panel state directory could not be created")?;
     let value = json!({
@@ -300,6 +308,12 @@ pub fn parse_pane_list(response: &Value) -> Result<Vec<HerdrPane>, &'static str>
                     .get("focused")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                content_owned: value.get("tokens").and_then(Value::as_object).is_some_and(
+                    |tokens| {
+                        tokens.contains_key(CONTENT_SOURCE_TOKEN)
+                            && tokens.contains_key(CONTENT_CONTROL_TOKEN)
+                    },
+                ),
             })
         })
         .collect()
@@ -372,6 +386,7 @@ pub fn target_pane_id<'a>(
         .iter()
         .filter(|pane| pane.workspace_id == workspace.id)
         .filter(|pane| !is_perforce_pane(remembered, workspace, pane))
+        .filter(|pane| !is_perforce_content_label(pane.label.as_deref()))
         .min_by_key(|pane| !pane.focused)
         .map(|pane| pane.id.as_str())
 }
@@ -433,13 +448,102 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 }
 
 fn is_perforce_pane(
-    remembered: &RememberedWorkspace,
+    _remembered: &RememberedWorkspace,
     workspace: &HerdrWorkspace,
     pane: &HerdrPane,
 ) -> bool {
-    pane.workspace_id == workspace.id
-        && (remembered.pane_id.as_deref() == Some(pane.id.as_str())
-            || pane.label.as_deref() == Some("Perforce"))
+    pane.workspace_id == workspace.id && is_perforce_navigation_label(pane.label.as_deref())
+}
+
+/// Startup restore plan for one remembered workspace.
+///
+/// Herdr session restore keeps pane slots and labels, but the process inside
+/// is a fresh shell. A `Perforce` title without a live `herdr-p4 pane` process
+/// is a corpse: close it, then open a real plugin pane. Never treat the empty
+/// shell as already restored — that leaves a Terminal where the TUI should be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreDecision {
+    pub healthy_nav_ids: Vec<String>,
+    pub unknown_nav_ids: Vec<String>,
+    pub stale_nav_ids: Vec<String>,
+    pub leftover_content_ids: Vec<String>,
+    pub open_target: Option<String>,
+}
+
+impl RestoreDecision {
+    pub fn should_open_new(&self) -> bool {
+        self.healthy_nav_ids.is_empty() && self.unknown_nav_ids.is_empty()
+    }
+}
+
+pub fn restore_decision(
+    remembered: &RememberedWorkspace,
+    workspace: &HerdrWorkspace,
+    panes: &[HerdrPane],
+    healthy_nav_ids: &[String],
+    unknown_nav_ids: &[String],
+) -> RestoreDecision {
+    let nav = perforce_pane_candidates(remembered, workspace, panes);
+    let mut leftover_content_ids = Vec::new();
+    for pane in perforce_content_panes(workspace, panes) {
+        push_unique(&mut leftover_content_ids, pane.id.clone());
+    }
+    let mut healthy = Vec::new();
+    let mut unknown = Vec::new();
+    let mut stale = Vec::new();
+    for pane in nav {
+        if healthy_nav_ids.iter().any(|id| id == &pane.id) {
+            push_unique(&mut healthy, pane.id.clone());
+            continue;
+        }
+        if unknown_nav_ids.iter().any(|id| id == &pane.id) {
+            push_unique(&mut unknown, pane.id.clone());
+            continue;
+        }
+        push_unique(&mut stale, pane.id.clone());
+    }
+    RestoreDecision {
+        open_target: if healthy.is_empty() && unknown.is_empty() {
+            target_pane_id(remembered, workspace, panes).map(ToOwned::to_owned)
+        } else {
+            None
+        },
+        healthy_nav_ids: healthy,
+        unknown_nav_ids: unknown,
+        stale_nav_ids: stale,
+        leftover_content_ids,
+    }
+}
+
+fn push_unique(ids: &mut Vec<String>, id: String) {
+    if !ids.iter().any(|existing| existing == &id) {
+        ids.push(id);
+    }
+}
+
+pub fn is_perforce_navigation_label(label: Option<&str>) -> bool {
+    label == Some("Perforce")
+}
+
+pub fn is_perforce_content_label(label: Option<&str>) -> bool {
+    let Some(label) = label else {
+        return false;
+    };
+    label == "Perforce Content" || (label.ends_with(" · Perforce") && label != "Perforce")
+}
+
+pub fn perforce_content_panes<'a>(
+    workspace: &HerdrWorkspace,
+    panes: &'a [HerdrPane],
+) -> Vec<&'a HerdrPane> {
+    panes
+        .iter()
+        .filter(|pane| {
+            pane.workspace_id == workspace.id
+                && pane.content_owned
+                && is_perforce_content_label(pane.label.as_deref())
+        })
+        .collect()
 }
 
 fn is_herdr_p4_pane_process(process: &Value) -> bool {
@@ -732,6 +836,7 @@ mod tests {
             cwd: PathBuf::from(r"C:\ExampleWorkspace"),
             label: Some("Perforce".to_owned()),
             focused: false,
+            content_owned: false,
         }];
         let workspace = matching_workspace(&remembered, &panes).expect("cwd match");
         assert_eq!(
@@ -759,6 +864,7 @@ mod tests {
                 cwd: remembered.cwd.clone(),
                 label: Some("1".to_owned()),
                 focused: false,
+                content_owned: false,
             },
             HerdrPane {
                 id: "w1:p2".to_owned(),
@@ -766,6 +872,7 @@ mod tests {
                 cwd: remembered.cwd.clone(),
                 label: Some("Agent".to_owned()),
                 focused: true,
+                content_owned: false,
             },
         ];
         assert_eq!(
@@ -793,6 +900,7 @@ mod tests {
             cwd: workspace_root.join("Build"),
             label: Some("Agent".to_owned()),
             focused: true,
+            content_owned: false,
         }];
         let workspace = matching_workspace(&remembered, &panes).expect("workspace root match");
         assert_eq!(workspace.id, "w1");
@@ -832,6 +940,7 @@ mod tests {
             }]}
         });
         let panes = parse_pane_list(&pane_response).unwrap();
+        assert!(!panes[0].content_owned);
         let remembered = RememberedWorkspace {
             cwd: PathBuf::from(r"C:\ExampleWorkspace"),
             workspace_cwd: PathBuf::from(r"C:\ExampleWorkspace"),
@@ -844,6 +953,33 @@ mod tests {
                 id: "w1".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn content_ownership_requires_both_plugin_metadata_tokens() {
+        let response = json!({
+            "result": { "panes": [
+                {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "cwd": r"C:\ExampleWorkspace",
+                    "label": "Diff · file.rs · Perforce",
+                    "tokens": {
+                        CONTENT_SOURCE_TOKEN: "alive",
+                        CONTENT_CONTROL_TOKEN: "control.json"
+                    }
+                },
+                {
+                    "pane_id": "w1:p2",
+                    "workspace_id": "w1",
+                    "cwd": r"C:\ExampleWorkspace",
+                    "label": "Diff · unrelated Agent work · Perforce"
+                }
+            ]}
+        });
+        let panes = parse_pane_list(&response).expect("panes");
+        assert!(panes[0].content_owned);
+        assert!(!panes[1].content_owned);
     }
 
     #[test]
@@ -979,6 +1115,69 @@ mod tests {
     }
 
     #[test]
+    fn content_panes_are_not_navigation_candidates() {
+        assert!(is_perforce_navigation_label(Some("Perforce")));
+        assert!(!is_perforce_content_label(Some("Perforce")));
+        assert!(is_perforce_content_label(Some("Perforce Content")));
+        assert!(is_perforce_content_label(Some(
+            "Diff · NeonPhysicsQueryWorldSubsystem.cpp · Perforce"
+        )));
+        assert!(!is_perforce_content_label(Some(
+            "Diff · unrelated Agent work"
+        )));
+        let remembered = RememberedWorkspace {
+            cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_id: Some("w1".to_owned()),
+            pane_id: Some("w1:p1V".to_owned()),
+        };
+        let workspace = HerdrWorkspace {
+            id: "w1".to_owned(),
+        };
+        let panes = vec![
+            HerdrPane {
+                id: "w1:p1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Agent".to_owned()),
+                focused: true,
+                content_owned: false,
+            },
+            HerdrPane {
+                id: "w1:p1W".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Diff · NeonPhysicsQueryWorldSubsystem.cpp · Perforce".to_owned()),
+                focused: false,
+                content_owned: true,
+            },
+            HerdrPane {
+                id: "w1:p1V".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame\"),
+                label: Some("Perforce".to_owned()),
+                focused: false,
+                content_owned: false,
+            },
+        ];
+        let nav = perforce_pane_candidates(&remembered, &workspace, &panes);
+        assert_eq!(nav.len(), 1);
+        assert_eq!(nav[0].id, "w1:p1V");
+        let content = perforce_content_panes(&workspace, &panes);
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].id, "w1:p1W");
+
+        let mut spoofed = panes[0].clone();
+        spoofed.label = Some("Diff · unrelated Agent work · Perforce".to_owned());
+        spoofed.content_owned = false;
+        assert!(perforce_content_panes(&workspace, &[spoofed]).is_empty());
+        assert_eq!(
+            target_pane_id(&remembered, &workspace, &panes),
+            Some("w1:p1")
+        );
+    }
+
+    #[test]
     fn perforce_candidates_match_by_workspace_and_label_not_exact_cwd() {
         let remembered = RememberedWorkspace {
             cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame"),
@@ -996,6 +1195,7 @@ mod tests {
                 cwd: PathBuf::from(r"G:\Projects\Neon\"),
                 label: Some("Perforce".to_owned()),
                 focused: false,
+                content_owned: false,
             },
             HerdrPane {
                 id: "w6:p9".to_owned(),
@@ -1003,6 +1203,7 @@ mod tests {
                 cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame\"),
                 label: Some("Perforce".to_owned()),
                 focused: false,
+                content_owned: false,
             },
             HerdrPane {
                 id: "w6:p1".to_owned(),
@@ -1010,6 +1211,7 @@ mod tests {
                 cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame"),
                 label: Some("Agent".to_owned()),
                 focused: true,
+                content_owned: false,
             },
         ];
         let candidates = perforce_pane_candidates(&remembered, &workspace, &panes);
@@ -1030,6 +1232,7 @@ mod tests {
         assert_eq!(load_navigator_share(Some(&root)), DEFAULT_NAVIGATION_SHARE);
         save_navigator_share(&root, 0.12).expect("save");
         assert!((load_navigator_share(Some(&root)) - 0.12).abs() < f64::EPSILON);
+        assert!(save_navigator_share(&root, 0.5).is_err());
         assert!(save_navigator_share(&root, 0.01).is_ok());
         assert!((load_navigator_share(Some(&root)) - 0.08).abs() < f64::EPSILON);
         fs::write(
@@ -1039,5 +1242,152 @@ mod tests {
         .expect("layout");
         assert_eq!(load_navigator_share(Some(&root)), DEFAULT_NAVIGATION_SHARE);
         fs::remove_dir_all(root).ok();
+    }
+
+    fn neon_game_panes() -> (RememberedWorkspace, HerdrWorkspace, Vec<HerdrPane>) {
+        let remembered = RememberedWorkspace {
+            cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_id: Some("w1".to_owned()),
+            pane_id: Some("w1:p1X".to_owned()),
+        };
+        let workspace = HerdrWorkspace {
+            id: "w1".to_owned(),
+        };
+        let panes = vec![
+            HerdrPane {
+                id: "w1:p1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Agent".to_owned()),
+                focused: true,
+                content_owned: false,
+            },
+            HerdrPane {
+                id: "w1:p1X".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Perforce".to_owned()),
+                focused: false,
+                content_owned: false,
+            },
+            HerdrPane {
+                id: "w1:p1W".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Diff · NeonPhysicsQueryWorldSubsystem.cpp · Perforce".to_owned()),
+                focused: false,
+                content_owned: true,
+            },
+        ];
+        (remembered, workspace, panes)
+    }
+
+    #[test]
+    fn label_only_shell_is_a_corpse_and_must_be_replaced() {
+        let (remembered, workspace, panes) = neon_game_panes();
+        let decision = restore_decision(&remembered, &workspace, &panes, &[], &[]);
+        assert!(decision.should_open_new());
+        assert_eq!(decision.open_target.as_deref(), Some("w1:p1"));
+        assert_eq!(decision.stale_nav_ids, ["w1:p1X"]);
+        assert_eq!(decision.leftover_content_ids, ["w1:p1W"]);
+        assert!(!decision.stale_nav_ids.iter().any(|id| id == "w1:p1"));
+        assert!(decision.healthy_nav_ids.is_empty());
+    }
+
+    #[test]
+    fn live_plugin_process_is_kept_and_corpses_are_closed() {
+        let (remembered, workspace, panes) = neon_game_panes();
+        let decision =
+            restore_decision(&remembered, &workspace, &panes, &["w1:p1X".to_owned()], &[]);
+        assert!(!decision.should_open_new());
+        assert_eq!(decision.healthy_nav_ids, ["w1:p1X"]);
+        assert_eq!(decision.leftover_content_ids, ["w1:p1W"]);
+        assert!(decision.stale_nav_ids.is_empty());
+        assert_eq!(decision.open_target, None);
+    }
+
+    #[test]
+    fn remembered_pane_id_does_not_mark_an_agent_pane_as_perforce() {
+        let remembered = RememberedWorkspace {
+            cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_id: Some("w1".to_owned()),
+            pane_id: Some("w1:p1".to_owned()),
+        };
+        let workspace = HerdrWorkspace {
+            id: "w1".to_owned(),
+        };
+        let panes = vec![HerdrPane {
+            id: "w1:p1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            label: Some("Agent".to_owned()),
+            focused: true,
+            content_owned: false,
+        }];
+        assert!(perforce_pane_candidates(&remembered, &workspace, &panes).is_empty());
+        let decision = restore_decision(&remembered, &workspace, &panes, &[], &[]);
+        assert!(decision.should_open_new());
+        assert_eq!(decision.open_target.as_deref(), Some("w1:p1"));
+        assert!(decision.stale_nav_ids.is_empty());
+        assert!(decision.leftover_content_ids.is_empty());
+    }
+
+    #[test]
+    fn two_shell_corpses_are_both_closed_before_opening() {
+        let remembered = RememberedWorkspace {
+            cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_cwd: PathBuf::from(r"E:\Project\NeonGame"),
+            workspace_id: Some("w1".to_owned()),
+            pane_id: Some("w1:p1X".to_owned()),
+        };
+        let workspace = HerdrWorkspace {
+            id: "w1".to_owned(),
+        };
+        let panes = vec![
+            HerdrPane {
+                id: "w1:p1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Agent".to_owned()),
+                focused: true,
+                content_owned: false,
+            },
+            HerdrPane {
+                id: "w1:p1X".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Perforce".to_owned()),
+                focused: false,
+                content_owned: false,
+            },
+            HerdrPane {
+                id: "w1:p1Y".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: PathBuf::from(r"E:\Project\NeonGame"),
+                label: Some("Perforce".to_owned()),
+                focused: false,
+                content_owned: false,
+            },
+        ];
+        let decision = restore_decision(&remembered, &workspace, &panes, &[], &[]);
+        assert!(decision.should_open_new());
+        assert_eq!(decision.open_target.as_deref(), Some("w1:p1"));
+        assert_eq!(decision.stale_nav_ids.len(), 2);
+        assert!(decision.stale_nav_ids.contains(&"w1:p1X".to_owned()));
+        assert!(decision.stale_nav_ids.contains(&"w1:p1Y".to_owned()));
+    }
+
+    #[test]
+    fn unknown_health_does_not_close_or_replace_the_pane() {
+        let (remembered, workspace, panes) = neon_game_panes();
+        let decision =
+            restore_decision(&remembered, &workspace, &panes, &[], &["w1:p1X".to_owned()]);
+        assert!(!decision.should_open_new());
+        assert_eq!(decision.unknown_nav_ids, ["w1:p1X"]);
+        assert!(decision.stale_nav_ids.is_empty());
+        assert_eq!(decision.leftover_content_ids, ["w1:p1W"]);
+        assert_eq!(decision.open_target, None);
     }
 }

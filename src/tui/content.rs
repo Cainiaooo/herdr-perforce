@@ -15,8 +15,8 @@ use std::{
 
 use crate::{
     domain::{
-        ChangedFile, Changelist, ChangelistId, FileAction, FileDiffKind, PreviewContent,
-        PreviewTruncation, build_file_diff,
+        ChangedFile, Changelist, ChangelistId, FileAction, FileDiffKind, MAX_PREVIEW_LINES,
+        PreviewContent, PreviewTruncation, build_file_diff,
     },
     p4::{
         P4Client, P4Query, StdProcessTransport, changed_files_from_opened,
@@ -746,12 +746,9 @@ pub fn rightmost_pane_id<'a>(
 }
 
 pub fn persist_navigator_share_from_host() {
-    let Ok(pane_id) = env::var("HERDR_PANE_ID") else {
+    let Some(pane_id) = own_pane_id() else {
         return;
     };
-    if pane_id.trim().is_empty() {
-        return;
-    }
     let Ok(layout) = pane_layout(&pane_id) else {
         return;
     };
@@ -762,6 +759,28 @@ pub fn persist_navigator_share_from_host() {
         return;
     };
     let _ = panel_restore::save_navigator_share(&state_dir, share);
+}
+
+pub fn apply_own_navigation_share() -> bool {
+    let Some(pane_id) = own_pane_id() else {
+        return false;
+    };
+    apply_navigation_share_to_pane(&pane_id)
+}
+
+pub fn apply_navigation_share_to_pane(pane_id: &str) -> bool {
+    let share = load_navigator_share(
+        env::var_os("HERDR_PLUGIN_STATE_DIR")
+            .map(PathBuf::from)
+            .as_deref(),
+    );
+    let Ok(layout) = pane_layout(pane_id) else {
+        return false;
+    };
+    let Some(args) = navigation_resize_args_for_share(&layout, pane_id, share) else {
+        return true;
+    };
+    run_herdr_status(&args)
 }
 
 fn env_assignment(name: &str, value: &OsStr) -> OsString {
@@ -901,7 +920,9 @@ struct ViewerState {
     scroll_y: usize,
     body_width: usize,
     body_height: usize,
+    body_y: u16,
     toolbar_hits: Vec<diff::ToolbarHit>,
+    last_fold_click: Option<Instant>,
 }
 
 impl ViewerState {
@@ -914,7 +935,9 @@ impl ViewerState {
             scroll_y: 0,
             body_width: 1,
             body_height: 1,
+            body_y: 0,
             toolbar_hits: Vec::new(),
+            last_fold_click: None,
         }
     }
 
@@ -1109,22 +1132,33 @@ impl ViewerState {
     }
 
     fn handle_diff_key(&mut self, code: KeyCode) -> bool {
+        let scroll_y = self.scroll_y;
+        let body_height = self.body_height;
+        let body_width = self.body_width.max(1);
         {
             let Document::Diff { view, .. } = &mut self.document else {
                 return false;
             };
             match code {
-                KeyCode::Char('[') => {
+                KeyCode::Char('[') | KeyCode::Char('p') => {
                     view.step_hunk(-1);
                 }
-                KeyCode::Char(']') => {
+                KeyCode::Char(']') | KeyCode::Char('n') => {
                     view.step_hunk(1);
                 }
                 KeyCode::Char('e') => view.toggle_folds(),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if !view.expand_visible(scroll_y, body_height, body_width) {
+                        return false;
+                    }
+                }
                 _ => return false,
             }
         }
-        if matches!(code, KeyCode::Char('[') | KeyCode::Char(']')) {
+        if matches!(
+            code,
+            KeyCode::Char('[') | KeyCode::Char(']') | KeyCode::Char('p') | KeyCode::Char('n')
+        ) {
             self.scroll_to_current_hunk();
         } else {
             self.clamp_scroll();
@@ -1133,9 +1167,9 @@ impl ViewerState {
     }
 
     fn handle_diff_click(&mut self, column: u16, row: u16) -> bool {
-        let header = self.document.header_height();
-        if row < header {
-            if row + 1 != header {
+        if row < self.body_y {
+            let header = self.document.header_height();
+            if header == 0 || row + 1 != header {
                 return false;
             }
             let Some(action) = diff::hit_action(&self.toolbar_hits, column) else {
@@ -1148,11 +1182,22 @@ impl ViewerState {
         };
         let visual = self
             .scroll_y
-            .saturating_add(row.saturating_sub(header) as usize);
-        let Some(edge) = view.fold_at_visual_row(visual, self.body_width.max(1)) else {
+            .saturating_add(row.saturating_sub(self.body_y) as usize);
+        let Some(click) = view.fold_hit_at(visual, column, self.body_width.max(1)) else {
             return false;
         };
-        view.expand_edge(edge.id, edge.direction);
+        let now = Instant::now();
+        if self
+            .last_fold_click
+            .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(200))
+        {
+            return false;
+        }
+        let changed = view.apply_fold_click(click);
+        if !changed {
+            return false;
+        }
+        self.last_fold_click = Some(now);
         self.clamp_scroll();
         true
     }
@@ -1318,6 +1363,17 @@ fn metadata_lines(preview: PreviewContent) -> Vec<Line<'static>> {
     }
 }
 
+fn read_canvas_lines(path: &Path) -> Vec<String> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .take(MAX_PREVIEW_LINES)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn revision_label(revision: Option<u64>) -> String {
     revision
         .map(|value| value.to_string())
@@ -1357,7 +1413,9 @@ fn diff_document(
         preview => {
             let (new_lines, truncated) = match preview {
                 PreviewContent::Text { lines, truncated } => (lines, truncated),
-                PreviewContent::Failed { .. } | PreviewContent::None => (Vec::new(), None),
+                PreviewContent::Failed { .. } | PreviewContent::None => {
+                    (read_canvas_lines(path), None)
+                }
                 PreviewContent::Binary { .. } | PreviewContent::Directory { .. } => unreachable!(),
             };
             let kind = action.map(FileDiffKind::from_action);
@@ -1533,7 +1591,11 @@ fn viewer_loop(
                     KeyCode::Char('q') => return Ok(true),
                     KeyCode::Esc if !state.go_back() => return Ok(true),
                     KeyCode::Esc => {}
-                    KeyCode::Enter => state.activate(),
+                    KeyCode::Enter => {
+                        if !state.handle_diff_key(KeyCode::Enter) {
+                            state.activate();
+                        }
+                    }
                     KeyCode::Up | KeyCode::Char('k') => state.move_vertical(-1),
                     KeyCode::Down | KeyCode::Char('j') => state.move_vertical(1),
                     KeyCode::PageUp => state.move_vertical(-(state.body_height as isize)),
@@ -1550,7 +1612,8 @@ fn viewer_loop(
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => state.move_vertical(-3),
                     MouseEventKind::ScrollDown => state.move_vertical(3),
-                    MouseEventKind::Down(MouseButton::Left) => {
+                    MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => {
                         let _ = state.handle_diff_click(mouse.column, mouse.row);
                     }
                     _ => {}
@@ -1613,6 +1676,7 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
 
     state.body_width = chunks[1].width as usize;
     state.body_height = chunks[1].height as usize;
+    state.body_y = chunks[1].y;
     state.clamp_scroll();
     let paragraph = Paragraph::new(state.render_rows())
         .scroll((state.scroll_y.min(u16::MAX as usize) as u16, 0));
@@ -1621,9 +1685,11 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     let footer = match &state.document {
         Document::Changelist { .. } => "↑↓/wheel: select   Enter: diff   q/Esc: close",
         Document::Diff { back: Some(_), .. } => {
-            "[/]: hunk   e: folds   click ▲/▼: +20   Esc: back   q: close"
+            "[: prev change  ]: next change  e: unfold all  Enter/click ⋯: +20 lines  Esc: back  q: close"
         }
-        Document::Diff { .. } => "[/]: hunk   e: folds   click ▲/▼: +20   q/Esc: close",
+        Document::Diff { .. } => {
+            "[: prev change  ]: next change  e: unfold all  Enter/click ⋯: +20 lines  q: close"
+        }
         Document::Text { back: Some(_), .. } => {
             "↑↓/wheel: scroll   PgUp/PgDn: page   Esc: back   q: close"
         }
@@ -1943,5 +2009,75 @@ mod tests {
                 "truncated: 512 byte preview budget exceeded; truncated: 4000 line diff budget exceeded"
             )
         );
+    }
+
+    #[test]
+    fn clicking_leading_diff_ellipsis_reveals_twenty_lines_toward_hunk() {
+        let mut file: Vec<String> = (1..=100).map(|index| format!("line-{index}")).collect();
+        file[69] = "changed".into();
+        let unified = vec![
+            "@@ -68,5 +68,5 @@".into(),
+            " line-68".into(),
+            " line-69".into(),
+            "-line-70".into(),
+            "+changed".into(),
+            " line-71".into(),
+            " line-72".into(),
+        ];
+        let model = build_file_diff(&file, &unified, Some(FileDiffKind::Edit), 5);
+        let request = ContentRequest::Diff {
+            change: ChangelistId::Numbered(42),
+            path: PathBuf::from("a.cpp"),
+            action: Some(FileAction::Edit),
+            fold_context: 5,
+        };
+        let mut state = ViewerState {
+            cwd: PathBuf::from("."),
+            request,
+            document: Document::Diff {
+                title: "Diff · a.cpp".into(),
+                context: "CL 42".into(),
+                view: Box::new(DiffViewState::new("a.cpp".into(), model, None)),
+                back: None,
+            },
+            scroll_y: 0,
+            body_width: 120,
+            body_height: 40,
+            body_y: 3,
+            toolbar_hits: Vec::new(),
+            last_fold_click: None,
+        };
+        let Document::Diff { view, .. } = &state.document else {
+            unreachable!();
+        };
+        let fold_row = view
+            .body_lines()
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("[▲20]")))
+            .expect("leading fold row") as u16;
+        let before = view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, diff::VisibleItem::Line(_)))
+            .count();
+
+        assert!(state.handle_diff_click(0, state.body_y + fold_row));
+
+        let Document::Diff { view, .. } = &state.document else {
+            unreachable!();
+        };
+        let after = view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, diff::VisibleItem::Line(_)))
+            .count();
+        assert_eq!(after, before + crate::domain::EXPAND_CHUNK);
+        assert!(view.body_lines().iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("line-47")
+        }));
     }
 }

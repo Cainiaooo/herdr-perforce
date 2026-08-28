@@ -281,8 +281,8 @@ impl ExplorerModel {
     }
 
     fn selected_row<'a>(&self, rows: &'a [VisibleExplorerRow]) -> Option<&'a VisibleExplorerRow> {
-        let index = self.selected_index(rows);
-        rows.get(index)
+        let selected = self.selected.as_ref()?;
+        rows.iter().find(|row| &row.path == selected)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -443,10 +443,11 @@ impl ExplorerModel {
         self.listings
             .retain(|listed, _| listed != &path && !listed.starts_with(&path));
         self.expanded
-            .retain(|listed| listed != &path && !listed.starts_with(&path));
-        if path == self.cwd {
-            self.expanded.insert(self.cwd.clone());
-        }
+            .retain(|listed| listed == &path || !listed.starts_with(&path));
+        // A mutation inside this directory should reveal its result once the
+        // asynchronous reload completes. Keeping the parent expanded also
+        // prevents an invisible child selection from aliasing to row zero.
+        self.expanded.insert(path.clone());
         self.pending_load = Some(path);
     }
 
@@ -749,6 +750,45 @@ mod tests {
                 .map(|name| name.to_string_lossy().into_owned())),
             Some("file-02.txt".into())
         );
+    }
+
+    #[test]
+    fn nested_mutation_reload_never_aliases_an_invisible_selection_to_root() {
+        let root = PathBuf::from("C:/ws");
+        let child = root.join("src");
+        let created = child.join("new.txt");
+        let mut explorer = ExplorerModel::new(root.clone());
+        explorer.install_ready_listing_for_test(LoadedDirectory {
+            path: root.clone(),
+            entries: vec![ExplorerEntry {
+                name: "src".into(),
+                path: child.clone(),
+                kind: ExplorerEntryKind::Directory,
+                decoration: None,
+                file_type: None,
+                have_rev: None,
+                head_rev: None,
+            }],
+            truncated: false,
+        });
+        explorer.select_index(1);
+        explorer.select_path(created.clone());
+        explorer.invalidate_directory(child.clone());
+
+        assert_eq!(explorer.selected_path(), Some(created.as_path()));
+        assert_eq!(explorer.selected_row_info(), None);
+        assert!(explorer.expanded.contains(&child));
+
+        explorer.install_directory(
+            explorer.generation(),
+            child.clone(),
+            Ok(LoadedDirectory {
+                path: child.clone(),
+                entries: vec![file_entry(&child, "new.txt", None)],
+                truncated: false,
+            }),
+        );
+        assert_eq!(explorer.selected_row_info().map(|row| row.0), Some(created));
     }
 
     fn identity_for_test(root: &Path) -> WorkspaceIdentity {
