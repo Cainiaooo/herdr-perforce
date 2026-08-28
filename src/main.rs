@@ -8,11 +8,12 @@ use std::{
 
 use herdr_perforce::p4::{P4Client, StdProcessTransport, run_level_b_read_only};
 use herdr_perforce::panel_restore::{
-    PanelOpenMode, load_panel_open_mode, load_remembered_workspaces, matching_workspace,
-    opened_pane_id, pane_process_is_active, parse_pane_list, perforce_pane_candidates,
-    remember_workspace, target_pane_id,
+    HerdrPane, PanelOpenMode, RememberedWorkspace, load_navigator_share, load_panel_open_mode,
+    load_remembered_workspaces, matching_workspace, opened_pane_id, pane_process_is_active,
+    parse_pane_list, perforce_pane_candidates, preferred_perforce_pane, remember_workspace,
+    target_pane_id,
 };
-use herdr_perforce::tui::navigation_resize_args_for_layout;
+use herdr_perforce::tui::{navigation_resize_args_for_share, rightmost_pane_id};
 use serde_json::Value;
 
 const HELP: &str = concat!(
@@ -367,20 +368,22 @@ fn restore_herdr_panes() -> ExitCode {
     let mut unavailable = 0usize;
     let mut failed = 0usize;
     let mut stale_closed = 0usize;
+    let mut duplicates_closed = 0usize;
     for entry in &remembered {
         let Some(workspace) = matching_workspace(entry, &panes) else {
             unavailable += 1;
             continue;
         };
-        let mut active_pane_id = None;
+        let mut active_panes = Vec::new();
         let mut stale_pane_ids = Vec::new();
         let mut inspection_failed = false;
-        for pane in perforce_pane_candidates(entry, &workspace, &panes) {
+        let candidates = perforce_pane_candidates(entry, &workspace, &panes);
+        for pane in candidates {
             let process_args = herdr_pane_process_info_args(&pane.id);
             match run_herdr_json(&executable, &process_args)
                 .and_then(|response| pane_process_is_active(&response))
             {
-                Ok(true) => active_pane_id = Some(pane.id.clone()),
+                Ok(true) => active_panes.push(pane),
                 Ok(false) if pane.label.as_deref() == Some("Perforce") => {
                     stale_pane_ids.push(pane.id.clone());
                 }
@@ -388,7 +391,16 @@ fn restore_herdr_panes() -> ExitCode {
                 Err(_) => inspection_failed = true,
             }
         }
-        if let Some(active_pane_id) = active_pane_id {
+        if !active_panes.is_empty() {
+            let keep = keep_existing_navigation_pane(&executable, entry, &active_panes);
+            let duplicate_ids = active_panes
+                .iter()
+                .map(|pane| pane.id.clone())
+                .filter(|id| id != &keep)
+                .collect::<Vec<_>>();
+            let duplicate_cleanup = close_panes(&executable, &duplicate_ids);
+            duplicates_closed += duplicate_cleanup.closed;
+            failed += duplicate_cleanup.failed;
             let cleanup = close_stale_panes(&executable, &stale_pane_ids);
             stale_closed += cleanup.closed;
             failed += cleanup.failed;
@@ -398,7 +410,7 @@ fn restore_herdr_panes() -> ExitCode {
                     &entry.cwd,
                     &entry.workspace_cwd,
                     Some(&workspace.id),
-                    Some(&active_pane_id),
+                    Some(&keep),
                 )
                 .ok();
             }
@@ -449,13 +461,35 @@ fn restore_herdr_panes() -> ExitCode {
     }
 
     println!(
-        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, unavailable={unavailable}, failed={failed}"
+        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, duplicates-closed={duplicates_closed}, unavailable={unavailable}, failed={failed}"
     );
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(70)
     }
+}
+
+fn keep_existing_navigation_pane(
+    executable: &OsStr,
+    entry: &RememberedWorkspace,
+    active_panes: &[&HerdrPane],
+) -> String {
+    if active_panes.len() == 1 {
+        return active_panes[0].id.clone();
+    }
+    if let Some(layout) = active_panes
+        .first()
+        .and_then(|pane| run_herdr_json(executable, &herdr_navigation_layout_args(&pane.id)).ok())
+    {
+        let ids = active_panes.iter().map(|pane| pane.id.as_str());
+        if let Some(pane_id) = rightmost_pane_id(&layout, ids) {
+            return pane_id.to_owned();
+        }
+    }
+    preferred_perforce_pane(entry, active_panes)
+        .map(|pane| pane.id.clone())
+        .unwrap_or_else(|| active_panes[0].id.clone())
 }
 
 fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
@@ -467,12 +501,18 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
     else {
         return;
     };
+    let share = load_navigator_share(
+        env::var_os("HERDR_PLUGIN_STATE_DIR")
+            .map(PathBuf::from)
+            .as_deref(),
+    );
     // Query actual geometry instead of assuming the opening ratio. This also
     // absorbs terminal chrome and any future Herdr default-ratio change.
     for attempt in 0..4 {
         let layout_args = herdr_navigation_layout_args(&pane_id);
         if let Ok(layout) = run_herdr_json(executable, &layout_args) {
-            let Some(resize_args) = navigation_resize_args_for_layout(&layout, &pane_id) else {
+            let Some(resize_args) = navigation_resize_args_for_share(&layout, &pane_id, share)
+            else {
                 return;
             };
             if ProcessCommand::new(executable)
@@ -491,7 +531,7 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
     // metadata never becomes available, retain the bounded legacy fallback
     // instead of leaving navigation at half the tab.
     let _ = ProcessCommand::new(executable)
-        .args(herdr_navigation_resize_fallback_args(&pane_id))
+        .args(herdr_navigation_resize_fallback_args(&pane_id, share))
         .output();
 }
 
@@ -504,14 +544,16 @@ fn herdr_navigation_layout_args(pane_id: &str) -> Vec<OsString> {
     ]
 }
 
-fn herdr_navigation_resize_fallback_args(pane_id: &str) -> Vec<OsString> {
+fn herdr_navigation_resize_fallback_args(pane_id: &str, share: f64) -> Vec<OsString> {
+    let amount = (0.5 - share).abs().max(0.01);
+    let direction = if share <= 0.5 { "right" } else { "left" };
     vec![
         OsString::from("pane"),
         OsString::from("resize"),
         OsString::from("--direction"),
-        OsString::from("right"),
+        OsString::from(direction),
         OsString::from("--amount"),
-        OsString::from("0.3"),
+        OsString::from(format!("{amount:.6}")),
         OsString::from("--pane"),
         OsString::from(pane_id),
     ]
@@ -537,17 +579,29 @@ fn close_stale_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCleanu
             }
             Ok(false) => {}
         }
-        let closed = ProcessCommand::new(executable)
-            .args(herdr_pane_close_args(pane_id))
-            .output()
-            .is_ok_and(|output| output.status.success());
-        if closed {
-            result.closed += 1;
-        } else {
-            result.failed += 1;
-        }
+        accumulate_close(executable, pane_id, &mut result);
     }
     result
+}
+
+fn close_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCleanup {
+    let mut result = StalePaneCleanup::default();
+    for pane_id in pane_ids {
+        accumulate_close(executable, pane_id, &mut result);
+    }
+    result
+}
+
+fn accumulate_close(executable: &OsStr, pane_id: &str, result: &mut StalePaneCleanup) {
+    let closed = ProcessCommand::new(executable)
+        .args(herdr_pane_close_args(pane_id))
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if closed {
+        result.closed += 1;
+    } else {
+        result.failed += 1;
+    }
 }
 
 fn herdr_pane_process_info_args(pane_id: &str) -> [OsString; 4] {
@@ -858,14 +912,14 @@ mod tests {
             strings(&["pane", "layout", "--pane", "workspace:p2",])
         );
         assert_eq!(
-            herdr_navigation_resize_fallback_args("workspace:p2"),
+            herdr_navigation_resize_fallback_args("workspace:p2", 0.2),
             strings(&[
                 "pane",
                 "resize",
                 "--direction",
                 "right",
                 "--amount",
-                "0.3",
+                "0.300000",
                 "--pane",
                 "workspace:p2",
             ])

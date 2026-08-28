@@ -259,7 +259,7 @@ Submit 测试还应覆盖：
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。
-- 首次成功手动打开后检查状态只写入 `HERDR_PLUGIN_STATE_DIR`；重启 Herdr server 后恢复 remembered workspace，重复 startup 不创建第二个 Perforce pane。
+- 首次成功手动打开后检查状态只写入 `HERDR_PLUGIN_STATE_DIR`；重启 Herdr server 后恢复 remembered workspace，重复 startup 不创建第二个 Perforce pane。同一 workspace 因不同 cwd 产生的重复记忆记录必须合并；Windows 上 PowerShell 包装的 `herdr-p4 pane` 视为健康进程。用户调整过的导航宽度写入 `layout.json`，已有健康 pane 不得被新建 50/50 split 覆盖。
 - 同一 server 上仅重新连接客户端不应重复执行 startup；缺失 workspace 安全 skip，恢复 pane 使用 `--no-focus`。
 - startup 期间用 fake `herdr` 捕获 argv，确认只执行 workspace/pane/process-info 查询、plugin pane open 和对二次确认仍 stale pane 的 pane close；不运行 `p4`，也不同时传 `--workspace` 与 `--target-pane`。
 

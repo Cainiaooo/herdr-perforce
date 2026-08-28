@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -48,13 +48,16 @@ use self::actions::{
     first_action_index, is_same_path, menu_window, relative_path_text, review_menu_entries,
     step_action_index, validate_name,
 };
-use self::content::ContentPaneClient;
+use self::content::{ContentPaneClient, persist_navigator_share_from_host};
 use self::display::{display_width, pad_display, slice_display, splice_display};
 use self::explorer::{
     ExplorerAction, ExplorerLoadState, ExplorerModel, connection_message, open_with_default_app,
 };
 
-pub use self::content::{navigation_resize_args_for_layout, run_content_pane};
+pub use self::content::{
+    navigation_resize_args_for_layout, navigation_resize_args_for_share, rightmost_pane_id,
+    run_content_pane,
+};
 
 const MAX_VISIBLE_CHANGELISTS: u16 = 4_096;
 const EVENT_POLL: Duration = Duration::from_millis(50);
@@ -78,6 +81,7 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
         .draw(&rendered.lines)
         .map_err(|error| error.to_string())?;
     let mut dirty = false;
+    let mut persist_layout_after: Option<Instant> = None;
     loop {
         while let Ok(message) = receiver.try_recv() {
             let effect = pane.handle_message(message);
@@ -95,6 +99,11 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
             dirty = false;
         }
 
+        if persist_layout_after.is_some_and(|deadline| Instant::now() >= deadline) {
+            persist_layout_after = None;
+            persist_navigator_share_from_host();
+        }
+
         if !event::poll(EVENT_POLL).map_err(|error| error.to_string())? {
             continue;
         }
@@ -106,10 +115,14 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
                 false,
                 pane.handle_mouse(mouse, &rendered.hits, &service, &sender),
             ),
-            Event::Resize(_, _) => (false, true),
+            Event::Resize(_, _) => {
+                persist_layout_after = Some(Instant::now() + Duration::from_millis(400));
+                (false, true)
+            }
             Event::FocusGained | Event::FocusLost | Event::Paste(_) => (false, false),
         };
         if should_close {
+            persist_navigator_share_from_host();
             break;
         }
         dirty |= event_changed;

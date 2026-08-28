@@ -543,9 +543,9 @@ Description Apply 前重新查询并比较 `spec_token`；Submit confirmation �
 
 首版不依赖 Herdr 的 Git worktree provenance；P4 workspace identity 完全由当前 cwd 和 P4 查询决定。
 
-Link/install 持久注册 manifest；terminal pane 是 Herdr session 的运行时对象，不因插件已注册就自动出现在每个 workspace。默认 `open_mode = remembered`：一次成功的 `open-pane` action 把 workspace cwd、Herdr workspace id hint 和 pane id hint 写入插件 state 目录。
+Link/install 持久注册 manifest；terminal pane 是 Herdr session 的运行时对象，不因插件已注册就自动出现在每个 workspace。默认 `open_mode = remembered`：一次成功的 `open-pane` action 把 workspace cwd、Herdr workspace id hint 和 pane id hint 写入插件 state 目录。同一 Herdr workspace id 只保留一条记忆记录。
 
-Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-panes`。恢复流程先读取 Herdr workspace/pane snapshot，再按 cwd 匹配记忆记录；id hint 只用于优先匹配，不能覆盖 cwd 边界。相同 cwd、label 为 `Perforce` 只构成候选，插件还必须通过 `pane process-info` 确认前台存在 `herdr-p4 ... pane` 才视为健康。只剩 shell prompt 的候选是 stale：先在 focused 非插件 pane（无 focused 时选择第一个；只有 stale pane 时以它为 target）右侧打开新 pane，成功后再次读取 process-info，仍失活才用普通 `pane close` 清理。候选范围同时受 workspace、cwd 和 label 约束，二次检查避免关闭正在启动的进程；清理失败计入 startup failure。新 pane 始终以 `--no-focus` 打开。split 已通过 target pane 确定 workspace 时不得同时传 `--workspace`，以兼容 Herdr 0.8.2 的参数约束。
+Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-panes`。恢复流程先读取 Herdr workspace/pane snapshot，再按 workspace id（其次 cwd）匹配记忆记录；id hint 只用于优先匹配，不能覆盖 cwd 边界。同一 workspace 中 label 为 `Perforce` 的 pane 都是候选，插件还必须通过 `pane process-info` 确认前台存在 `herdr-p4 ... pane`（Windows 上包括 PowerShell 包装启动）才视为健康。同一 workspace 若已有健康导航 pane，不再打开第二个；多余的健康重复 pane 关掉并保留最右侧那个。只剩 shell prompt 的候选是 stale：先在 focused 非插件 pane（无 focused 时选择第一个；只有 stale pane 时以它为 target）右侧打开新 pane，成功后再次读取 process-info，仍失活才用普通 `pane close` 清理。二次检查避免关闭正在启动的进程；清理失败计入 startup failure。新 pane 始终以 `--no-focus` 打开。split 已通过 target pane 确定 workspace 时不得同时传 `--workspace`，以兼容 Herdr 0.8.2 的参数约束。用户拖动后的导航比例写入 `layout.json`，仅在新打开导航 pane 时应用；已有健康 pane 沿用 Herdr session 布局。
 
 关闭当前 pane 只改变当前 session，不表示忘记 workspace。首版不实现 `detected` 模式，不在 startup 中对所有 workspace 执行 `p4 info`。
 
@@ -574,6 +574,7 @@ Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-pan
 本地运行状态放在 `HERDR_PLUGIN_STATE_DIR`：
 
 - remembered workspace cwd 和短期 Herdr id hint。
+- `layout.json` 中的导航宽度比例。
 - 展开的 CL。
 - 最近打开的 CL 编号。
 - 当前布局比例。

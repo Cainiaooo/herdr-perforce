@@ -67,8 +67,8 @@ herdr plugin action invoke open --plugin herdr.perforce
 
 1. 读取已记住的 workspace，不扫描其他目录，也不在启动阶段运行 `p4`。
 2. 只处理本次 session 中仍存在且 cwd 匹配的 Herdr workspace。
-3. 对已有 `Perforce` pane 调用 `pane process-info`；只有前台确实运行 `herdr-p4 ... pane` 才视为健康并保持现状。
-4. 只有 PowerShell/shell prompt 的失活 pane 不算恢复成功；插件会打开新的 split，成功后再次确认旧 pane 仍无插件进程，再用普通 pane close 清理它，并使用 `--no-focus` 保持当前焦点。
+3. 对已有 `Perforce` pane 调用 `pane process-info`；前台是 `herdr-p4 ... pane`，或 Windows 上由 PowerShell 包装启动的同一命令，都视为健康并保持现状。同一 Herdr workspace 只保留一个导航 pane，多出来的重复 pane 会关掉。
+4. 只有真正的 shell prompt、且没有插件进程的同名 pane 才算 stale；插件会打开新的 split，成功后再次确认旧 pane 仍无插件进程，再用普通 pane close 清理它，并使用 `--no-focus` 保持当前焦点。
 
 关闭并重新打开一个连接到同一 Herdr server 的客户端，不会重复运行 startup hook；要验证恢复行为，需要真正重启 Herdr server。仅关闭当前 Perforce pane 不会删除 workspace 记录，因此下次 server 启动仍会恢复它。
 
@@ -201,7 +201,7 @@ herdr plugin log list --plugin herdr.perforce
 
 `no remembered workspaces` 表示还没有成功记录；`manual mode` 表示 `panel.json` 禁用了恢复；`unavailable` 表示记录的 cwd 在本次 Herdr session 中没有匹配 workspace。Startup log 只输出数量和分类，不输出 workspace 绝对路径。
 
-如果 pane 边框显示 `Perforce`，内容却只是 `PS ...>` 或其他 shell prompt，表示 Herdr 恢复了 pane 布局但插件进程没有存活。当前版本会用 process-info 将它识别为 stale，并在下一次 startup 恢复真正的插件 pane；日志中的 `stale-closed` 是成功清理的旧 pane 数量。清理只作用于同 workspace、同 cwd、标题匹配且二次 process-info 仍确认失活的候选；失败会计入 `failed`，不会静默宣称恢复完成。
+如果 pane 边框显示 `Perforce`，内容却只是 `PS ...>` 或其他 shell prompt，表示 Herdr 恢复了 pane 布局但插件进程没有存活。当前版本会用 process-info 将它识别为 stale，并在下一次 startup 恢复真正的插件 pane。Windows 上 pane 入口通过 PowerShell 启动 `herdr-p4.exe pane`，这不算 stale。日志中的 `stale-closed` 是成功清理的旧 pane 数量，`duplicates-closed` 是同一 workspace 里关掉的重复健康 pane 数量。清理只作用于同 workspace、标题匹配的候选；失败会计入 `failed`，不会静默宣称恢复完成。导航宽度会记在插件 state 的 `layout.json` 里；拖动分隔条后，下次**新打开**的导航 pane 使用记住的比例。已经存在的健康 pane 保持 Herdr session 里的布局，不再被 50/50 新建 pane 覆盖。
 
 ### `p4` 找不到或 workspace 不可用
 

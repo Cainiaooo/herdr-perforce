@@ -22,7 +22,7 @@ use crate::{
         P4Client, P4Query, StdProcessTransport, changed_files_from_opened,
         changelist_from_describe, load_workspace_diff, read_workspace_preview,
     },
-    panel_restore::{self, strip_verbatim_prefix},
+    panel_restore::{self, DEFAULT_NAVIGATION_SHARE, load_navigator_share, strip_verbatim_prefix},
 };
 use crossterm::{
     event::{
@@ -52,7 +52,6 @@ const CONTENT_SOURCE: &str = "herdr-perforce-content";
 const CONTROL_TOKEN: &str = "herdr-p4-content-control";
 const POLL: Duration = Duration::from_millis(250);
 const HEARTBEAT: Duration = Duration::from_secs(5);
-const NAVIGATION_SHARE: f64 = 0.2;
 const LAYOUT_EPSILON: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,7 +588,12 @@ fn ensure_content_layout(navigation_pane: &str, content_pane: &str) -> Result<()
         );
     }
 
-    if let Some(args) = navigation_resize_args_for_layout(&layout, navigation_pane) {
+    let share = load_navigator_share(
+        env::var_os("HERDR_PLUGIN_STATE_DIR")
+            .map(PathBuf::from)
+            .as_deref(),
+    );
+    if let Some(args) = navigation_resize_args_for_share(&layout, navigation_pane, share) {
         if !run_herdr_status(&args) {
             return Err("navigation pane could not be resized to its narrow share".to_owned());
         }
@@ -673,27 +677,23 @@ fn rect_from(value: &Value) -> Option<PaneRect> {
 }
 
 /// Calculate the exact resize needed to keep a right-docked navigation pane
-/// at 20% of its owning horizontal split. `None` means it is already at the
+/// at `share` of its owning horizontal split. `None` means it is already at the
 /// target or the layout does not expose a matching divider.
 pub fn navigation_resize_args_for_layout(
     layout: &Value,
     navigation_pane: &str,
 ) -> Option<Vec<OsString>> {
+    navigation_resize_args_for_share(layout, navigation_pane, DEFAULT_NAVIGATION_SHARE)
+}
+
+pub fn navigation_resize_args_for_share(
+    layout: &Value,
+    navigation_pane: &str,
+    share: f64,
+) -> Option<Vec<OsString>> {
     let navigation = pane_rect(layout, navigation_pane)?;
-    let (_, split_width) = layout
-        .pointer("/result/layout/splits")?
-        .as_array()?
-        .iter()
-        .filter(|split| split.get("direction").and_then(Value::as_str) == Some("right"))
-        .filter_map(|split| {
-            let rect = rect_from(split.get("rect")?)?;
-            let ratio = split.get("ratio")?.as_f64()?;
-            let divider = rect.x + (rect.width as f64 * ratio).round() as i64;
-            ((divider - navigation.x).abs() <= LAYOUT_EPSILON && rect.width > 0)
-                .then_some((rect.width, rect.width))
-        })
-        .min_by_key(|(width, _)| *width)?;
-    let target_width = (split_width as f64 * NAVIGATION_SHARE).round() as i64;
+    let split_width = owning_horizontal_split_width(layout, navigation)?;
+    let target_width = (split_width as f64 * share).round() as i64;
     let width_delta = target_width.saturating_sub(navigation.width);
     let amount = width_delta.unsigned_abs() as f64 / split_width as f64;
     if amount < 0.005 {
@@ -710,6 +710,58 @@ pub fn navigation_resize_args_for_layout(
         OsString::from("--pane"),
         OsString::from(navigation_pane),
     ])
+}
+
+pub fn navigation_share_from_layout(layout: &Value, navigation_pane: &str) -> Option<f64> {
+    let navigation = pane_rect(layout, navigation_pane)?;
+    let split_width = owning_horizontal_split_width(layout, navigation)?;
+    (split_width > 0).then_some(navigation.width as f64 / split_width as f64)
+}
+
+fn owning_horizontal_split_width(layout: &Value, navigation: PaneRect) -> Option<i64> {
+    layout
+        .pointer("/result/layout/splits")?
+        .as_array()?
+        .iter()
+        .filter(|split| split.get("direction").and_then(Value::as_str) == Some("right"))
+        .filter_map(|split| {
+            let rect = rect_from(split.get("rect")?)?;
+            let ratio = split.get("ratio")?.as_f64()?;
+            let divider = rect.x + (rect.width as f64 * ratio).round() as i64;
+            ((divider - navigation.x).abs() <= LAYOUT_EPSILON && rect.width > 0)
+                .then_some(rect.width)
+        })
+        .min()
+}
+
+pub fn rightmost_pane_id<'a>(
+    layout: &Value,
+    pane_ids: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    pane_ids.into_iter().max_by_key(|pane_id| {
+        pane_rect(layout, pane_id)
+            .map(|rect| rect.x)
+            .unwrap_or(i64::MIN)
+    })
+}
+
+pub fn persist_navigator_share_from_host() {
+    let Ok(pane_id) = env::var("HERDR_PANE_ID") else {
+        return;
+    };
+    if pane_id.trim().is_empty() {
+        return;
+    }
+    let Ok(layout) = pane_layout(&pane_id) else {
+        return;
+    };
+    let Some(share) = navigation_share_from_layout(&layout, &pane_id) else {
+        return;
+    };
+    let Some(state_dir) = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let _ = panel_restore::save_navigator_share(&state_dir, share);
 }
 
 fn env_assignment(name: &str, value: &OsStr) -> OsString {
@@ -1745,6 +1797,39 @@ mod tests {
             .into_iter()
             .map(OsString::from)
             .collect::<Vec<_>>()
+        );
+        assert_eq!(navigation_share_from_layout(&layout, "w:nav"), Some(0.5));
+        let narrower = navigation_resize_args_for_share(&layout, "w:nav", 0.12).expect("narrow");
+        assert_eq!(
+            narrower
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "pane",
+                "resize",
+                "--direction",
+                "right",
+                "--amount",
+                "0.380000",
+                "--pane",
+                "w:nav"
+            ]
+        );
+    }
+
+    #[test]
+    fn rightmost_duplicate_navigation_pane_is_preferred() {
+        let layout = json!({"result":{"layout":{
+            "panes":[
+                {"pane_id":"w:agent","rect":{"x":0,"y":0,"width":40,"height":50}},
+                {"pane_id":"w:left","rect":{"x":40,"y":0,"width":40,"height":50}},
+                {"pane_id":"w:right","rect":{"x":80,"y":0,"width":20,"height":50}}
+            ]
+        }}});
+        assert_eq!(
+            rightmost_pane_id(&layout, ["w:left", "w:right"]),
+            Some("w:right")
         );
     }
 

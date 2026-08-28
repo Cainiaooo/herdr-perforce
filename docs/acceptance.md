@@ -228,8 +228,9 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 期望：
 
 - 只恢复被记住且本次 session 仍存在的 workspace；不扫描其他目录、不运行 `p4`。
-- 已有匹配且 process-info 确认运行 `herdr-p4 ... pane` 的健康 pane 时不重复打开。
-- 只有 PowerShell/shell prompt 的同 workspace/cwd 同名 pane 视为 stale；新 pane 成功后必须二次确认仍无插件进程，再用 pane close 清理，失败不得静默忽略。
+- 已有匹配且 process-info 确认运行 `herdr-p4 ... pane`（含 Windows PowerShell 包装）的健康 pane 时不重复打开；同一 workspace 只保留一个导航 pane。
+- 只有真正 shell prompt、且没有插件进程的同 workspace 同名 pane 视为 stale；新 pane 成功后必须二次确认仍无插件进程，再用 pane close 清理，失败不得静默忽略。
+- 用户拖动过的导航宽度写入插件 state；重启后已有健康 pane 保持该宽度，不得被默认 50/50 覆盖。
 - 缺失 workspace 计为 unavailable 并安全跳过。
 - 新恢复 pane 不抢焦点，且不会替换或关闭 Agent pane。
 - 连接到同一 server 的新客户端、配置 reload、link/enable 不被误记为 server startup。

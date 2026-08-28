@@ -15,9 +15,14 @@ use crate::domain::{DEFAULT_FOLD_CONTEXT, MAX_FOLD_CONTEXT};
 
 const CONFIG_FILE: &str = "panel.json";
 const STATE_FILE: &str = "remembered-workspaces.json";
+const LAYOUT_FILE: &str = "layout.json";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
+const MAX_LAYOUT_BYTES: u64 = 4 * 1024;
 const MAX_REMEMBERED_WORKSPACES: usize = 128;
+pub const DEFAULT_NAVIGATION_SHARE: f64 = 0.2;
+const MIN_NAVIGATION_SHARE: f64 = 0.08;
+const MAX_NAVIGATION_SHARE: f64 = 0.45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelOpenMode {
@@ -130,7 +135,50 @@ pub fn load_remembered_workspaces(
         return Err("panel state contains too many workspaces");
     }
 
-    workspaces.iter().map(parse_remembered_workspace).collect()
+    let entries = workspaces
+        .iter()
+        .map(parse_remembered_workspace)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(coalesce_remembered_workspaces(entries))
+}
+
+pub fn coalesce_remembered_workspaces(
+    entries: Vec<RememberedWorkspace>,
+) -> Vec<RememberedWorkspace> {
+    let mut kept = Vec::<RememberedWorkspace>::new();
+    for entry in entries {
+        if let Some(index) = kept
+            .iter()
+            .position(|existing| same_remembered_workspace(existing, &entry))
+        {
+            kept[index] = entry;
+        } else {
+            kept.push(entry);
+        }
+    }
+    kept
+}
+
+fn same_remembered_workspace(left: &RememberedWorkspace, right: &RememberedWorkspace) -> bool {
+    remembered_workspace_matches(
+        left,
+        &right.cwd,
+        &right.workspace_cwd,
+        right.workspace_id.as_deref(),
+    )
+}
+
+fn remembered_workspace_matches(
+    entry: &RememberedWorkspace,
+    cwd: &Path,
+    workspace_cwd: &Path,
+    workspace_id: Option<&str>,
+) -> bool {
+    match (entry.workspace_id.as_deref(), workspace_id) {
+        (Some(left), Some(right)) if left == right => return true,
+        _ => {}
+    }
+    paths_equal(&entry.workspace_cwd, workspace_cwd) || paths_equal(&entry.cwd, cwd)
 }
 
 pub fn remember_workspace(
@@ -150,7 +198,8 @@ pub fn remember_workspace(
     }
     fs::create_dir_all(state_dir).map_err(|_| "panel state directory could not be created")?;
     let mut entries = load_remembered_workspaces(Some(state_dir))?;
-    entries.retain(|entry| !paths_equal(&entry.cwd, &cwd));
+    entries
+        .retain(|entry| !remembered_workspace_matches(entry, &cwd, &workspace_cwd, workspace_id));
     entries.push(RememberedWorkspace {
         cwd,
         workspace_cwd,
@@ -177,6 +226,55 @@ pub fn remember_workspace(
         return Err("panel state is too large");
     }
     fs::write(state_dir.join(STATE_FILE), bytes).map_err(|_| "panel state could not be written")
+}
+
+pub fn load_navigator_share(state_dir: Option<&Path>) -> f64 {
+    let Some(state_dir) = state_dir else {
+        return DEFAULT_NAVIGATION_SHARE;
+    };
+    let path = state_dir.join(LAYOUT_FILE);
+    if !path.exists() {
+        return DEFAULT_NAVIGATION_SHARE;
+    }
+    parse_navigator_share(&path).unwrap_or(DEFAULT_NAVIGATION_SHARE)
+}
+
+pub fn save_navigator_share(state_dir: &Path, share: f64) -> Result<(), &'static str> {
+    if !share.is_finite() {
+        return Err("navigator share is invalid");
+    }
+    let share = share.clamp(MIN_NAVIGATION_SHARE, MAX_NAVIGATION_SHARE);
+    fs::create_dir_all(state_dir).map_err(|_| "panel state directory could not be created")?;
+    let value = json!({
+        "version": 1,
+        "navigator_share": share,
+    });
+    let bytes =
+        serde_json::to_vec_pretty(&value).map_err(|_| "panel layout could not be encoded")?;
+    if bytes.len() as u64 > MAX_LAYOUT_BYTES {
+        return Err("panel layout is too large");
+    }
+    fs::write(state_dir.join(LAYOUT_FILE), bytes).map_err(|_| "panel layout could not be written")
+}
+
+fn parse_navigator_share(path: &Path) -> Result<f64, &'static str> {
+    let value = read_bounded_json(path, MAX_LAYOUT_BYTES, "panel layout could not be read")?;
+    let object = strict_object(
+        &value,
+        &["version", "navigator_share"],
+        "panel layout is invalid",
+    )?;
+    if object.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err("panel layout version is unsupported");
+    }
+    let share = object
+        .get("navigator_share")
+        .and_then(Value::as_f64)
+        .ok_or("panel layout navigator_share is invalid")?;
+    if !share.is_finite() || !(MIN_NAVIGATION_SHARE..=MAX_NAVIGATION_SHARE).contains(&share) {
+        return Err("panel layout navigator_share is out of range");
+    }
+    Ok(share)
 }
 
 pub fn parse_pane_list(response: &Value) -> Result<Vec<HerdrPane>, &'static str> {
@@ -278,6 +376,23 @@ pub fn target_pane_id<'a>(
         .map(|pane| pane.id.as_str())
 }
 
+pub fn preferred_perforce_pane<'a>(
+    remembered: &RememberedWorkspace,
+    panes: &[&'a HerdrPane],
+) -> Option<&'a HerdrPane> {
+    remembered
+        .pane_id
+        .as_deref()
+        .and_then(|id| panes.iter().copied().find(|pane| pane.id == id))
+        .or_else(|| {
+            panes
+                .iter()
+                .copied()
+                .find(|pane| paths_equal(&pane.cwd, &remembered.cwd))
+        })
+        .or_else(|| panes.first().copied())
+}
+
 pub fn paths_equal(left: &Path, right: &Path) -> bool {
     let left = strip_verbatim_prefix(left);
     let right = strip_verbatim_prefix(right);
@@ -323,34 +438,91 @@ fn is_perforce_pane(
     pane: &HerdrPane,
 ) -> bool {
     pane.workspace_id == workspace.id
-        && paths_equal(&pane.cwd, &remembered.cwd)
         && (remembered.pane_id.as_deref() == Some(pane.id.as_str())
             || pane.label.as_deref() == Some("Perforce"))
 }
 
 fn is_herdr_p4_pane_process(process: &Value) -> bool {
-    let Some(name) = process.get("name").and_then(Value::as_str) else {
-        return false;
-    };
-    let is_binary = matches_ignore_ascii_case(name, &["herdr-p4", "herdr-p4.exe"])
+    if is_herdr_p4_binary(process) {
+        return process
+            .get("argv")
+            .and_then(Value::as_array)
+            .map(|argv| argv_contains_pane_command(argv))
+            .unwrap_or(true);
+    }
+    powershell_launches_herdr_p4_pane(process)
+}
+
+fn is_herdr_p4_binary(process: &Value) -> bool {
+    let name = process.get("name").and_then(Value::as_str).unwrap_or("");
+    matches_ignore_ascii_case(name, &["herdr-p4", "herdr-p4.exe"])
         || process
             .get("argv0")
             .and_then(Value::as_str)
             .and_then(|argv0| Path::new(argv0).file_name())
             .and_then(|name| name.to_str())
-            .is_some_and(|name| matches_ignore_ascii_case(name, &["herdr-p4", "herdr-p4.exe"]));
-    if !is_binary {
+            .is_some_and(|name| matches_ignore_ascii_case(name, &["herdr-p4", "herdr-p4.exe"]))
+}
+
+fn argv_contains_pane_command(argv: &[Value]) -> bool {
+    argv.iter()
+        .filter_map(Value::as_str)
+        .any(|argument| argument == "pane")
+}
+
+fn powershell_launches_herdr_p4_pane(process: &Value) -> bool {
+    if !process_is_powershell(process) {
         return false;
     }
-    process
-        .get("argv")
-        .and_then(Value::as_array)
-        .map(|argv| {
-            argv.iter()
-                .filter_map(Value::as_str)
-                .any(|arg| arg == "pane")
-        })
-        .unwrap_or(true)
+    let mut blobs = Vec::new();
+    if let Some(cmdline) = process.get("cmdline").and_then(Value::as_str) {
+        blobs.push(cmdline);
+    }
+    if let Some(argv) = process.get("argv").and_then(Value::as_array) {
+        for argument in argv {
+            if let Some(value) = argument.as_str() {
+                blobs.push(value);
+            }
+        }
+    }
+    blobs.iter().any(|blob| command_invokes_herdr_p4_pane(blob))
+}
+
+fn process_is_powershell(process: &Value) -> bool {
+    let name = process.get("name").and_then(Value::as_str).unwrap_or("");
+    let argv0_name = process
+        .get("argv0")
+        .and_then(Value::as_str)
+        .and_then(|argv0| Path::new(argv0).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches_ignore_ascii_case(name, &["powershell", "powershell.exe", "pwsh", "pwsh.exe"])
+        || matches_ignore_ascii_case(
+            argv0_name,
+            &["powershell", "powershell.exe", "pwsh", "pwsh.exe"],
+        )
+}
+
+fn command_invokes_herdr_p4_pane(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let Some(offset) = lower.find("herdr-p4") else {
+        return false;
+    };
+    let mut rest = &lower[offset + "herdr-p4".len()..];
+    if let Some(stripped) = rest.strip_prefix(".exe") {
+        rest = stripped;
+    }
+    rest = rest.trim_start_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\'' | ')' | '(' | '\\' | ' ' | '\t' | '\r' | '\n'
+        )
+    });
+    rest == "pane"
+        || rest.starts_with("pane ")
+        || rest.starts_with("pane\"")
+        || rest.starts_with("pane'")
+        || rest.starts_with("pane\t")
 }
 
 fn matches_ignore_ascii_case(value: &str, expected: &[&str]) -> bool {
@@ -720,5 +892,152 @@ mod tests {
             }]}}
         });
         assert_eq!(pane_process_is_active(&response), Ok(false));
+    }
+
+    #[test]
+    fn windows_powershell_wrapper_running_pane_is_healthy() {
+        let command = r#"$root = $env:HERDR_PLUGIN_ROOT; if (-not $root) { Write-Error "HERDR_PLUGIN_ROOT is missing"; exit 69 }; if ($root.StartsWith('\\?\')) { $root = $root.Substring(4) }; & (Join-Path $root "target\release\herdr-p4.exe") pane"#;
+        let response = json!({
+            "result": { "process_info": { "foreground_processes": [{
+                "pid": 620,
+                "name": "powershell.exe",
+                "argv0": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE",
+                "argv": [
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command
+                ],
+                "cmdline": format!("powershell.EXE -NoProfile -ExecutionPolicy Bypass -Command \"{command}\"")
+            }]}}
+        });
+        assert_eq!(pane_process_is_active(&response), Ok(true));
+    }
+
+    #[test]
+    fn windows_powershell_restore_hook_is_not_a_healthy_pane() {
+        let command = r#"$root = $env:HERDR_PLUGIN_ROOT; & (Join-Path $root "target\release\herdr-p4.exe") restore-panes"#;
+        let response = json!({
+            "result": { "process_info": { "foreground_processes": [{
+                "pid": 8,
+                "name": "powershell.exe",
+                "argv": ["powershell.exe", "-Command", command]
+            }]}}
+        });
+        assert_eq!(pane_process_is_active(&response), Ok(false));
+    }
+
+    #[test]
+    fn load_coalesces_duplicate_workspace_ids_from_disk() {
+        let root = temp_dir("coalesce-disk");
+        let parent = root.join("Neon");
+        let child = parent.join("NeonGame");
+        fs::create_dir_all(&child).expect("workspace");
+        let value = json!({
+            "version": 1,
+            "workspaces": [
+                {
+                    "cwd": parent,
+                    "workspace_cwd": parent,
+                    "workspace_id": "w6",
+                    "pane_id": "w6:p8"
+                },
+                {
+                    "cwd": child,
+                    "workspace_cwd": child,
+                    "workspace_id": "w6",
+                    "pane_id": "w6:p9"
+                }
+            ]
+        });
+        fs::write(
+            root.join(STATE_FILE),
+            serde_json::to_vec_pretty(&value).expect("encode"),
+        )
+        .expect("state");
+        let entries = load_remembered_workspaces(Some(&root)).expect("state");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pane_id.as_deref(), Some("w6:p9"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn same_workspace_id_with_nested_cwds_is_one_remembered_entry() {
+        let root = temp_dir("same-workspace");
+        let parent = root.join("Neon");
+        let child = parent.join("NeonGame");
+        fs::create_dir_all(&child).expect("workspace");
+        remember_workspace(&root, &parent, &parent, Some("w6"), Some("w6:p8")).expect("parent");
+        remember_workspace(&root, &child, &child, Some("w6"), Some("w6:p9")).expect("child");
+        let entries = load_remembered_workspaces(Some(&root)).expect("state");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cwd, child);
+        assert_eq!(entries[0].pane_id.as_deref(), Some("w6:p9"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn perforce_candidates_match_by_workspace_and_label_not_exact_cwd() {
+        let remembered = RememberedWorkspace {
+            cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame"),
+            workspace_cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame"),
+            workspace_id: Some("w6".to_owned()),
+            pane_id: Some("w6:p9".to_owned()),
+        };
+        let workspace = HerdrWorkspace {
+            id: "w6".to_owned(),
+        };
+        let panes = vec![
+            HerdrPane {
+                id: "w6:p8".to_owned(),
+                workspace_id: "w6".to_owned(),
+                cwd: PathBuf::from(r"G:\Projects\Neon\"),
+                label: Some("Perforce".to_owned()),
+                focused: false,
+            },
+            HerdrPane {
+                id: "w6:p9".to_owned(),
+                workspace_id: "w6".to_owned(),
+                cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame\"),
+                label: Some("Perforce".to_owned()),
+                focused: false,
+            },
+            HerdrPane {
+                id: "w6:p1".to_owned(),
+                workspace_id: "w6".to_owned(),
+                cwd: PathBuf::from(r"G:\Projects\Neon\NeonGame"),
+                label: Some("Agent".to_owned()),
+                focused: true,
+            },
+        ];
+        let candidates = perforce_pane_candidates(&remembered, &workspace, &panes);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            preferred_perforce_pane(&remembered, &candidates).map(|pane| pane.id.as_str()),
+            Some("w6:p9")
+        );
+        assert_eq!(
+            target_pane_id(&remembered, &workspace, &panes),
+            Some("w6:p1")
+        );
+    }
+
+    #[test]
+    fn navigator_share_round_trips_and_rejects_out_of_range() {
+        let root = temp_dir("layout-share");
+        assert_eq!(load_navigator_share(Some(&root)), DEFAULT_NAVIGATION_SHARE);
+        save_navigator_share(&root, 0.12).expect("save");
+        assert!((load_navigator_share(Some(&root)) - 0.12).abs() < f64::EPSILON);
+        assert!(save_navigator_share(&root, 0.01).is_ok());
+        assert!((load_navigator_share(Some(&root)) - 0.08).abs() < f64::EPSILON);
+        fs::write(
+            root.join(LAYOUT_FILE),
+            br#"{"version":1,"navigator_share":0.9}"#,
+        )
+        .expect("layout");
+        assert_eq!(load_navigator_share(Some(&root)), DEFAULT_NAVIGATION_SHARE);
+        fs::remove_dir_all(root).ok();
     }
 }
