@@ -17,6 +17,7 @@
 - File、Diff 和 CL 文件列表复用同一个 Content pane，通过插件私有 control file 原地切换，路径不经过 shell quoting。
 - Content pane 按当前宽度把长行稳定拆成多行并按显示行滚动，同时处理文本行号、文件语法高亮和 diff 语义颜色。
 - 在 CL 文件列表中选择具有本地 client path 的文件，可在同一 Content pane 下钻到 Diff；`Esc` 返回 CL 文件列表。
+- 最后一次 File/Diff/CL 请求由插件按 workspace 持久化；Herdr server 重启后先清理 session 恢复出的 Content shell，再以 `--no-focus` 重建中间 Content pane。
 
 ## Consequences
 

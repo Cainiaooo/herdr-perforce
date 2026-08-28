@@ -229,8 +229,8 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 - 只恢复被记住且本次 session 仍存在的 workspace；不扫描其他目录、不运行 `p4`。
 - 已有匹配且 process-info 确认运行 `herdr-p4 ... pane`（含 Windows PowerShell 包装）的健康 pane 时不重复打开；同一 workspace 只保留一个导航 pane。
-- 标题是 `Perforce` 但前台只剩默认 shell 的 pane 视为 corpse：必须先关掉空壳和同时带有 Content source/control metadata token 的残留 Content pane，再打开真正的插件 pane。不得仅凭 `Diff ·` / `File ·` 标题关闭 pane，不得把空壳当成已恢复。任一清理关闭失败不得再 split，也不得静默忽略。
-- 用户拖动过的导航宽度写入插件 state；重启后已有健康 pane 保持该宽度，不得被默认 50/50 覆盖。
+- 标题是 `Perforce` 但前台只剩默认 shell 的 pane 视为 corpse：必须先关掉空壳和残留 Content pane，再打开真正的插件 pane。带完整 Content token 的 pane 可正常清理；重启后 token 丢失但标题匹配的候选还必须确认前台是 viewer/默认 shell 且与导航候选水平相邻，之后按 plugin-first、plain-fallback 清理。不得把同名 Agent 当成插件 pane。任一检查或清理关闭失败不得再 split，也不得静默忽略。
+- 用户拖动过的导航宽度按 workspace 写入插件 state；不同 workspace 的比例不得互相覆盖。重启后恢复 Explorer/Review 视图和最后 File/Diff/CL 内容，并保持 `Agent | Content | Navigation`；没有 Content 时保持 `Agent | Navigation`。不得被默认 50/50 覆盖。
 - 缺失 workspace 计为 unavailable 并安全跳过。
 - 新恢复 pane 不抢焦点，且不会替换或关闭 Agent pane。
 - 连接到同一 server 的新客户端、配置 reload、link/enable 不被误记为 server startup。

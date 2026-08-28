@@ -8,12 +8,16 @@ use std::{
 
 use herdr_perforce::p4::{P4Client, StdProcessTransport, run_level_b_read_only};
 use herdr_perforce::panel_restore::{
-    HerdrPane, PanelOpenMode, RememberedWorkspace, load_navigator_share, load_panel_open_mode,
-    load_remembered_workspaces, matching_workspace, opened_pane_id, pane_process_is_active,
-    parse_pane_list, perforce_pane_candidates, preferred_perforce_pane, remember_workspace,
-    restore_decision,
+    HerdrPane, PanelOpenMode, RememberedWorkspace, load_content_request, load_navigator_share,
+    load_panel_open_mode, load_remembered_workspaces, matching_workspace, opened_pane_id,
+    pane_process_is_active, parse_pane_list, perforce_content_label_panes,
+    perforce_pane_candidates, preferred_perforce_pane, remember_workspace, restore_decision,
+    save_navigator_share, workspace_layout_exists,
 };
-use herdr_perforce::tui::{navigation_resize_args_for_share, rightmost_pane_id};
+use herdr_perforce::tui::{
+    navigation_resize_args_for_share, navigation_share_from_layout, restore_content_pane,
+    rightmost_pane_id, viewer_process_is_active,
+};
 use serde_json::Value;
 
 const HELP: &str = concat!(
@@ -25,7 +29,7 @@ const HELP: &str = concat!(
     "  herdr-p4 pane [--cwd <workspace-path>]\n",
     "  herdr-p4 viewer [--cwd <workspace-path>]\n",
     "  herdr-p4 open-pane\n",
-    "  herdr-p4 restore-panes\n\n",
+    "  herdr-p4 restore-panes [--workspace-cwd <workspace-path>]\n\n",
     "Level B is explicitly opt-in and only runs bounded info, changes, describe, opened,\n",
     "and where queries. It never runs a write command or retries through another config.\n\n",
     "The pane command is the Herdr terminal entrypoint. Submit remains available only\n",
@@ -46,7 +50,7 @@ fn main() -> ExitCode {
         Ok(Command::Pane { cwd }) => run_pane(cwd),
         Ok(Command::Viewer { cwd }) => run_viewer(cwd),
         Ok(Command::OpenPane) => open_herdr_pane(),
-        Ok(Command::RestorePanes) => restore_herdr_panes(),
+        Ok(Command::RestorePanes { workspace_cwd }) => restore_herdr_panes(workspace_cwd),
         Err(message) => {
             eprintln!("{message}; run herdr-p4 --help");
             ExitCode::from(64)
@@ -62,7 +66,7 @@ enum Command {
     Pane { cwd: Option<PathBuf> },
     Viewer { cwd: Option<PathBuf> },
     OpenPane,
-    RestorePanes,
+    RestorePanes { workspace_cwd: Option<PathBuf> },
 }
 
 fn parse_command(args: Vec<OsString>) -> Result<Command, &'static str> {
@@ -100,8 +104,19 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, &'static str> {
         [viewer, ..] if viewer == "viewer" => Err("viewer accepts only [--cwd <workspace-path>]"),
         [open] if open == "open-pane" => Ok(Command::OpenPane),
         [open, ..] if open == "open-pane" => Err("open-pane accepts no arguments"),
-        [restore] if restore == "restore-panes" => Ok(Command::RestorePanes),
-        [restore, ..] if restore == "restore-panes" => Err("restore-panes accepts no arguments"),
+        [restore] if restore == "restore-panes" => Ok(Command::RestorePanes {
+            workspace_cwd: None,
+        }),
+        [restore, workspace_flag, workspace_cwd]
+            if restore == "restore-panes" && workspace_flag == "--workspace-cwd" =>
+        {
+            Ok(Command::RestorePanes {
+                workspace_cwd: Some(PathBuf::from(workspace_cwd)),
+            })
+        }
+        [restore, ..] if restore == "restore-panes" => {
+            Err("restore-panes accepts only [--workspace-cwd <workspace-path>]")
+        }
         _ => Err("unsupported arguments"),
     }
 }
@@ -261,12 +276,17 @@ fn open_herdr_pane() -> ExitCode {
         current_pane_context(&executable),
     );
     let plugin_root = env::var_os("HERDR_PLUGIN_ROOT").map(PathBuf::from);
+    let workspace_cwd = context
+        .as_ref()
+        .and_then(|context| workspace_cwd_from_context(context, plugin_root.as_deref()));
     let mut command = ProcessCommand::new(&executable);
     let args = herdr_open_pane_args(context.as_ref(), plugin_root.as_deref());
     command.args(args);
     match command.output() {
         Ok(output) if output.status.success() => {
-            resize_opened_navigation_pane(&executable, &output.stdout);
+            if let Some(workspace_cwd) = workspace_cwd.as_deref() {
+                resize_opened_navigation_pane(&executable, &output.stdout, workspace_cwd);
+            }
             remember_opened_pane(context.as_ref(), &output.stdout, plugin_root.as_deref());
             println!("Herdr Perforce pane opened");
             ExitCode::SUCCESS
@@ -319,7 +339,14 @@ fn remember_opened_pane(context: Option<&Value>, stdout: &[u8], plugin_root: Opt
     }
 }
 
-fn restore_herdr_panes() -> ExitCode {
+fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
+    if requested_workspace
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        eprintln!("Herdr Perforce pane restore requires an absolute workspace cwd");
+        return ExitCode::from(64);
+    }
     let config_dir = env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from);
     match load_panel_open_mode(config_dir.as_deref()) {
         Ok(PanelOpenMode::Manual) => {
@@ -369,12 +396,43 @@ fn restore_herdr_panes() -> ExitCode {
     let mut failed = 0usize;
     let mut stale_closed = 0usize;
     let mut duplicates_closed = 0usize;
-    for entry in &remembered {
+    for entry in remembered.iter().filter(|entry| {
+        requested_workspace
+            .as_deref()
+            .is_none_or(|requested| paths_equal(requested, &entry.workspace_cwd))
+    }) {
         let Some(workspace) = matching_workspace(entry, &panes) else {
             unavailable += 1;
             continue;
         };
+        let session_content_panes = perforce_content_label_panes(&workspace, &panes)
+            .into_iter()
+            .filter(|pane| !pane.content_owned)
+            .collect::<Vec<_>>();
         let candidates = perforce_pane_candidates(entry, &workspace, &panes);
+        if migrate_session_navigator_share(
+            &executable,
+            state_dir.as_deref(),
+            entry,
+            &session_content_panes,
+            &candidates,
+        )
+        .is_err()
+        {
+            failed += 1;
+            continue;
+        }
+        let session_content_ids = match authenticated_session_content_ids(
+            &executable,
+            &session_content_panes,
+            &candidates,
+        ) {
+            Ok(ids) => ids,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
         let mut healthy_ids = Vec::new();
         let mut unknown_ids = Vec::new();
         let mut healthy_panes = Vec::new();
@@ -400,6 +458,9 @@ fn restore_herdr_panes() -> ExitCode {
                 close_restored_panes(&executable, &decision.leftover_content_ids);
             stale_closed += leftover_cleanup.closed;
             failed += leftover_cleanup.failed;
+            let session_content_cleanup = close_restored_panes(&executable, &session_content_ids);
+            stale_closed += session_content_cleanup.closed;
+            failed += session_content_cleanup.failed;
             let corpse_cleanup = close_restored_panes(&executable, &decision.stale_nav_ids);
             stale_closed += corpse_cleanup.closed;
             failed += corpse_cleanup.failed;
@@ -416,7 +477,13 @@ fn restore_herdr_panes() -> ExitCode {
                 )
                 .ok();
             }
-            resize_navigation_pane_id(&executable, &keep);
+            resize_navigation_pane_id(&executable, &keep, &entry.workspace_cwd);
+            if leftover_cleanup.failed == 0
+                && session_content_cleanup.failed == 0
+                && restore_workspace_content(state_dir.as_deref(), entry, &keep).is_err()
+            {
+                failed += 1;
+            }
             already_open += 1;
             continue;
         }
@@ -431,6 +498,12 @@ fn restore_herdr_panes() -> ExitCode {
         stale_closed += leftover_cleanup.closed;
         failed += leftover_cleanup.failed;
         if leftover_cleanup.failed > 0 {
+            continue;
+        }
+        let session_content_cleanup = close_restored_panes(&executable, &session_content_ids);
+        stale_closed += session_content_cleanup.closed;
+        failed += session_content_cleanup.failed;
+        if session_content_cleanup.failed > 0 {
             continue;
         }
         let corpse_cleanup = close_restored_panes(&executable, &decision.stale_nav_ids);
@@ -448,7 +521,7 @@ fn restore_herdr_panes() -> ExitCode {
                 continue;
             }
         };
-        resize_opened_navigation_pane(&executable, &output.stdout);
+        resize_opened_navigation_pane(&executable, &output.stdout, &entry.workspace_cwd);
         restored += 1;
         if let (Some(state_dir), Ok(response)) = (
             state_dir.as_deref(),
@@ -466,6 +539,14 @@ fn restore_herdr_panes() -> ExitCode {
             {
                 failed += 1;
             }
+        }
+        if let Some(pane_id) = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .as_ref()
+            .and_then(opened_pane_id)
+            && restore_workspace_content(state_dir.as_deref(), entry, pane_id).is_err()
+        {
+            failed += 1;
         }
     }
 
@@ -525,7 +606,7 @@ fn inspect_perforce_pane(executable: &OsStr, pane: &HerdrPane) -> Result<bool, &
     last.unwrap_or(Ok(false))
 }
 
-fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
+fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8], workspace_cwd: &Path) {
     let Some(pane_id) = serde_json::from_slice::<Value>(stdout)
         .ok()
         .as_ref()
@@ -534,14 +615,15 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8]) {
     else {
         return;
     };
-    resize_navigation_pane_id(executable, &pane_id);
+    resize_navigation_pane_id(executable, &pane_id, workspace_cwd);
 }
 
-fn resize_navigation_pane_id(executable: &OsStr, pane_id: &str) {
+fn resize_navigation_pane_id(executable: &OsStr, pane_id: &str, workspace_cwd: &Path) {
     let share = load_navigator_share(
         env::var_os("HERDR_PLUGIN_STATE_DIR")
             .map(PathBuf::from)
             .as_deref(),
+        workspace_cwd,
     );
     // Query actual geometry instead of assuming the opening ratio. This also
     // absorbs terminal chrome and any future Herdr default-ratio change.
@@ -612,6 +694,138 @@ fn close_restored_panes(executable: &OsStr, pane_ids: &[String]) -> StalePaneCle
         }
     }
     result
+}
+
+fn authenticated_session_content_ids(
+    executable: &OsStr,
+    content_panes: &[&HerdrPane],
+    navigation_panes: &[&HerdrPane],
+) -> Result<Vec<String>, &'static str> {
+    let mut ids = Vec::new();
+    for content in content_panes {
+        let process = run_herdr_json(executable, &herdr_pane_process_info_args(&content.id))?;
+        if !viewer_process_is_active(&process) && !pane_process_is_default_shell(&process)? {
+            // A title by itself is not enough to authorize closing a pane.
+            continue;
+        }
+        let layout = run_herdr_json(executable, &herdr_navigation_layout_args(&content.id))?;
+        if navigation_panes
+            .iter()
+            .any(|navigation| panes_are_horizontal_neighbors(&layout, &content.id, &navigation.id))
+        {
+            ids.push(content.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+fn migrate_session_navigator_share(
+    executable: &OsStr,
+    state_dir: Option<&Path>,
+    entry: &RememberedWorkspace,
+    content_panes: &[&HerdrPane],
+    navigation_panes: &[&HerdrPane],
+) -> Result<(), &'static str> {
+    let Some(state_dir) = state_dir else {
+        return Ok(());
+    };
+    if workspace_layout_exists(state_dir, &entry.workspace_cwd)? {
+        return Ok(());
+    }
+    let pane_ids = navigation_panes
+        .iter()
+        .chain(content_panes.iter())
+        .map(|pane| pane.id.as_str())
+        .collect::<Vec<_>>();
+    // A single 50/50 restored leaf does not carry enough information to
+    // distinguish the user's sidebar width from Herdr's opening default.
+    let Some(first) = (pane_ids.len() >= 2).then(|| pane_ids[0]) else {
+        return Ok(());
+    };
+    let Ok(layout) = run_herdr_json(executable, &herdr_navigation_layout_args(first)) else {
+        return Ok(());
+    };
+    let Some(rightmost) = rightmost_pane_id(&layout, pane_ids) else {
+        return Ok(());
+    };
+    let Some(share) = navigation_share_from_layout(&layout, rightmost) else {
+        return Ok(());
+    };
+    if (0.45..=0.55).contains(&share) {
+        return Ok(());
+    }
+    save_navigator_share(state_dir, &entry.workspace_cwd, share)
+}
+
+fn pane_process_is_default_shell(response: &Value) -> Result<bool, &'static str> {
+    let processes = response
+        .pointer("/result/process_info/foreground_processes")
+        .and_then(Value::as_array)
+        .ok_or("Herdr pane process response is invalid")?;
+    Ok(processes.len() == 1 && processes.first().is_some_and(process_is_default_shell))
+}
+
+fn process_is_default_shell(process: &Value) -> bool {
+    let name = process
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            process
+                .get("argv0")
+                .and_then(Value::as_str)
+                .and_then(|argv0| Path::new(argv0).file_name())
+                .and_then(OsStr::to_str)
+        })
+        .unwrap_or("")
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "pwsh" | "powershell" | "cmd" | "bash" | "zsh" | "sh" | "fish" | "nu"
+    ) && ![process.get("cmdline"), process.get("argv")]
+        .into_iter()
+        .flatten()
+        .any(|value| value.to_string().to_ascii_lowercase().contains("herdr-p4"))
+}
+
+fn panes_are_horizontal_neighbors(layout: &Value, first: &str, second: &str) -> bool {
+    let Some(first) = pane_rect(layout, first) else {
+        return false;
+    };
+    let Some(second) = pane_rect(layout, second) else {
+        return false;
+    };
+    let vertically_overlaps =
+        first.1 < second.1.saturating_add(second.3) && second.1 < first.1.saturating_add(first.3);
+    let adjacent = (first.0.saturating_add(first.2) - second.0).abs() <= 2
+        || (second.0.saturating_add(second.2) - first.0).abs() <= 2;
+    vertically_overlaps && adjacent
+}
+
+fn pane_rect(layout: &Value, pane_id: &str) -> Option<(i64, i64, i64, i64)> {
+    let rect = layout
+        .pointer("/result/layout/panes")?
+        .as_array()?
+        .iter()
+        .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(pane_id))?
+        .get("rect")?;
+    Some((
+        rect.get("x")?.as_i64()?,
+        rect.get("y")?.as_i64()?,
+        rect.get("width")?.as_i64()?,
+        rect.get("height")?.as_i64()?,
+    ))
+}
+
+fn restore_workspace_content(
+    state_dir: Option<&Path>,
+    entry: &RememberedWorkspace,
+    navigation_pane: &str,
+) -> Result<(), ()> {
+    let Some(request) = load_content_request(state_dir, &entry.workspace_cwd) else {
+        return Ok(());
+    };
+    restore_content_pane(navigation_pane, &entry.cwd, &request).map_err(|_| ())
 }
 
 fn close_restored_pane(executable: &OsStr, pane_id: &str) -> bool {
@@ -945,7 +1159,19 @@ mod tests {
         );
         assert_eq!(
             parse_command(strings(&["restore-panes"])),
-            Ok(Command::RestorePanes)
+            Ok(Command::RestorePanes {
+                workspace_cwd: None
+            })
+        );
+        assert_eq!(
+            parse_command(strings(&[
+                "restore-panes",
+                "--workspace-cwd",
+                "E:/Project/NeonGame"
+            ])),
+            Ok(Command::RestorePanes {
+                workspace_cwd: Some(PathBuf::from("E:/Project/NeonGame"))
+            })
         );
         assert!(parse_command(strings(&["submit", "42"])).is_err());
     }
@@ -1110,6 +1336,57 @@ mod tests {
         assert_eq!(process_args, ["pane", "process-info", "--pane", "w1:p7"]);
         assert_eq!(plugin_close, ["plugin", "pane", "close", "w1:p7"]);
         assert_eq!(close_args, ["pane", "close", "w1:p7"]);
+    }
+
+    #[test]
+    fn default_shell_detection_rejects_plugin_and_agent_processes() {
+        let shell = serde_json::json!({
+            "result": { "process_info": { "foreground_processes": [{
+                "name": "pwsh.exe",
+                "argv0": "C:/Program Files/PowerShell/7/pwsh.exe",
+                "argv": ["pwsh.exe", "-NoExit", "-Command", "function prompt {}"]
+            }]}}
+        });
+        let plugin = serde_json::json!({
+            "result": { "process_info": { "foreground_processes": [{
+                "name": "powershell.exe",
+                "cmdline": "powershell.exe -File pane.ps1 D:/Plugin/herdr-p4.exe pane"
+            }]}}
+        });
+        let agent = serde_json::json!({
+            "result": { "process_info": { "foreground_processes": [{
+                "name": "codex.exe",
+                "argv0": "C:/Tools/codex.exe"
+            }]}}
+        });
+        assert_eq!(pane_process_is_default_shell(&shell), Ok(true));
+        assert_eq!(pane_process_is_default_shell(&plugin), Ok(false));
+        assert_eq!(pane_process_is_default_shell(&agent), Ok(false));
+    }
+
+    #[test]
+    fn content_cleanup_requires_horizontal_adjacency_to_navigation() {
+        let layout = serde_json::json!({"result":{"layout":{"panes":[
+            {"pane_id":"w1:agent","rect":{"x":0,"y":0,"width":100,"height":60}},
+            {"pane_id":"w1:nav","rect":{"x":100,"y":0,"width":80,"height":60}},
+            {"pane_id":"w1:content","rect":{"x":180,"y":0,"width":20,"height":60}},
+            {"pane_id":"w1:other","rect":{"x":0,"y":61,"width":200,"height":20}}
+        ]}}});
+        assert!(panes_are_horizontal_neighbors(
+            &layout,
+            "w1:content",
+            "w1:nav"
+        ));
+        assert!(!panes_are_horizontal_neighbors(
+            &layout,
+            "w1:content",
+            "w1:agent"
+        ));
+        assert!(!panes_are_horizontal_neighbors(
+            &layout,
+            "w1:content",
+            "w1:other"
+        ));
     }
 
     #[test]

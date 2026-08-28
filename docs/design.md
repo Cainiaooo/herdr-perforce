@@ -546,7 +546,7 @@ Description Apply 前重新查询并比较 `spec_token`；Submit confirmation �
 
 Link/install 持久注册 manifest；terminal pane 是 Herdr session 的运行时对象，不因插件已注册就自动出现在每个 workspace。默认 `open_mode = remembered`：一次成功的 `open-pane` action 把 workspace cwd、Herdr workspace id hint 和 pane id hint 写入插件 state 目录。同一 Herdr workspace id 只保留一条记忆记录。
 
-Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-panes`。恢复流程先读取 Herdr workspace/pane snapshot，再按 workspace id（其次 cwd）匹配记忆记录；id hint 只用于优先匹配，不能覆盖 cwd 边界。同一 workspace 中 label 为 `Perforce` 的 pane 都是候选，插件还必须通过 `pane process-info` 确认前台存在 `herdr-p4 ... pane`（Windows 上包括 PowerShell 包装启动）才视为健康。同一 workspace 若已有健康导航 pane，不再打开第二个；多余的健康重复 pane 关掉并保留最右侧那个。标题仍是 `Perforce` 但前台只剩默认 shell 的 pane 是 corpse：Herdr 只恢复了槽位，进程已经死掉。恢复必须先关掉这些空壳以及同时带有 `herdr-perforce-content` source token 和 content-control token 的残留 Content pane，优先 `plugin pane close`，失败再普通 `pane close`；标题相似但没有所有权 token 的 Agent pane 不得关闭。全部清理成功后，才从剩余的非插件 pane（通常是 Agent）右侧打开真正的插件 pane。不得把空壳当成已恢复而跳过打开，否则用户看到的是 Terminal。任一关闭失败则不计为已恢复，也不能再 split 出一个新 pane。新 pane 始终以 `--no-focus` 打开。split 已通过 target pane 确定 workspace 时不得同时传 `--workspace`，以兼容 Herdr 0.8.2 的参数约束。用户拖动后的导航比例写入 `layout.json`，新打开和已有健康 pane 都应用该比例，避免 50/50 默认 split 留下过宽导航。
+Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-panes`。恢复流程先读取 Herdr workspace/pane snapshot，再按 workspace id（其次 cwd）匹配记忆记录；id hint 只用于优先匹配，不能覆盖 cwd 边界。同一 workspace 中 label 为 `Perforce` 的 pane 都是候选，插件还必须通过 `pane process-info` 确认前台存在 `herdr-p4 ... pane`（Windows 上包括 PowerShell 包装启动）才视为健康。同一 workspace 若已有健康导航 pane，不再打开第二个；多余的健康重复 pane 关掉并保留最右侧那个。标题仍是 `Perforce` 但前台只剩默认 shell 的 pane 是 corpse：Herdr 只恢复了槽位，进程已经死掉。恢复必须先清理这些空壳和残留 Content。Content 由普通 `pane split` 创建，重启后可能没有 plugin token；此时只有标题匹配、`process-info` 确认前台仍是 viewer 或默认 shell、并且布局确认它与导航候选水平相邻，才允许采用 plugin-first、plain-fallback 关闭。全部清理成功后，才从剩余的非插件 pane（通常是 Agent）右侧打开真正的导航 pane，并根据按 workspace 保存的最后 Content 请求重建中间 pane。任一关闭失败则不能继续 split。新 pane 和恢复的 Content 都使用 `--no-focus`。每个 workspace 使用独立的 `layout-<hash>.json` 保存导航比例、Explorer/Review 视图和最后 Content 请求，避免多个 pane 进程并发覆盖；旧版全局 `layout.json` 只作为迁移 fallback。
 
 关闭当前 pane 只改变当前 session，不表示忘记 workspace。首版不实现 `detected` 模式，不在 startup 中对所有 workspace 执行 `p4 info`。
 
@@ -575,7 +575,7 @@ Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-pan
 本地运行状态放在 `HERDR_PLUGIN_STATE_DIR`：
 
 - remembered workspace cwd 和短期 Herdr id hint。
-- `layout.json` 中的导航宽度比例。
+- workspace 专属 `layout-<hash>.json` 中保存的导航宽度、Explorer/Review 视图和最后 Content 请求。
 - 展开的 CL。
 - 最近打开的 CL 编号。
 - 当前布局比例。

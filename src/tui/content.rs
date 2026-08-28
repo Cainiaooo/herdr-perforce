@@ -280,6 +280,10 @@ impl ContentPaneClient {
     }
 
     fn open(&mut self, request: ContentRequest) -> Result<(), String> {
+        self.open_with_focus(request, true)
+    }
+
+    fn open_with_focus(&mut self, request: ContentRequest, focus: bool) -> Result<(), String> {
         let navigation = self.navigation_pane.clone().ok_or_else(|| {
             "content pane needs HERDR_PANE_ID; reopen Perforce from a Herdr pane".to_owned()
         })?;
@@ -290,8 +294,11 @@ impl ContentPaneClient {
         if let (Some(pane), Some(control)) = (&self.content_pane, &self.control) {
             if pane_is_in_navigation_tab(pane, &navigation)? {
                 write_control(control, &request)?;
-                ensure_content_layout(&navigation, pane)?;
-                focus_left_of(&navigation);
+                ensure_content_layout(&navigation, pane, &self.cwd)?;
+                if focus {
+                    focus_left_of(&navigation);
+                }
+                persist_content_request(&self.cwd, &request);
                 return Ok(());
             }
             self.content_pane = None;
@@ -309,19 +316,23 @@ impl ContentPaneClient {
             if !content_process_is_active(&pane) {
                 start_viewer_in_pane(&pane)?;
             }
-            ensure_content_layout(&navigation, &pane)?;
-            focus_left_of(&navigation);
+            ensure_content_layout(&navigation, &pane, &self.cwd)?;
+            if focus {
+                focus_left_of(&navigation);
+            }
             self.content_pane = Some(pane);
             self.control = Some(control);
+            persist_content_request(&self.cwd, &request);
             return Ok(());
         }
 
         let control = fresh_control_path();
         write_control(&control, &request)?;
-        match spawn_content_pane(&navigation, &self.cwd, &control) {
+        match spawn_content_pane(&navigation, &self.cwd, &control, focus) {
             Ok(pane) => {
                 self.content_pane = Some(pane);
                 self.control = Some(control);
+                persist_content_request(&self.cwd, &request);
                 Ok(())
             }
             Err(error) => {
@@ -329,6 +340,30 @@ impl ContentPaneClient {
                 Err(error)
             }
         }
+    }
+}
+
+pub fn restore_content_pane(
+    navigation_pane: &str,
+    cwd: &Path,
+    raw_request: &str,
+) -> Result<(), String> {
+    let request = ContentRequest::from_json(raw_request)?;
+    let mut client = ContentPaneClient {
+        cwd: cwd.to_path_buf(),
+        navigation_pane: Some(navigation_pane.to_owned()),
+        content_pane: None,
+        control: None,
+    };
+    client.open_with_focus(request, false)
+}
+
+fn persist_content_request(cwd: &Path, request: &ContentRequest) {
+    let Some(state_dir) = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if let Ok(raw) = request.to_json() {
+        let _ = panel_restore::save_content_request(&state_dir, cwd, Some(&raw));
     }
 }
 
@@ -412,7 +447,7 @@ fn content_process_is_active(pane_id: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn viewer_process_is_active(response: &Value) -> bool {
+pub fn viewer_process_is_active(response: &Value) -> bool {
     response
         .pointer("/result/process_info/foreground_processes")
         .and_then(Value::as_array)
@@ -452,7 +487,12 @@ fn focus_left_of(navigation_pane: &str) {
     ]);
 }
 
-fn spawn_content_pane(navigation_pane: &str, cwd: &Path, control: &Path) -> Result<String, String> {
+fn spawn_content_pane(
+    navigation_pane: &str,
+    cwd: &Path,
+    control: &Path,
+    focus: bool,
+) -> Result<String, String> {
     let layout = run_herdr_json(&[
         OsString::from("pane"),
         OsString::from("layout"),
@@ -480,6 +520,7 @@ fn spawn_content_pane(navigation_pane: &str, cwd: &Path, control: &Path) -> Resu
         control,
         &launch_path,
         env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref(),
+        focus,
     );
     let response = run_herdr_json(&args)?;
     let pane = pane_id_from_response(&response)
@@ -509,7 +550,7 @@ fn spawn_content_pane(navigation_pane: &str, cwd: &Path, control: &Path) -> Resu
         OsString::from(&pane),
         OsString::from("Perforce Content"),
     ]);
-    if let Err(error) = ensure_content_layout(navigation_pane, &pane) {
+    if let Err(error) = ensure_content_layout(navigation_pane, &pane, cwd) {
         let _ = close_pane(&pane);
         return Err(error);
     }
@@ -534,6 +575,7 @@ fn split_args(
     control: &Path,
     launch_path: &OsStr,
     config_dir: Option<&OsStr>,
+    focus: bool,
 ) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("pane"),
@@ -555,11 +597,15 @@ fn split_args(
         args.push(OsString::from("--env"));
         args.push(env_assignment("HERDR_PLUGIN_CONFIG_DIR", config_dir));
     }
-    args.push(OsString::from("--focus"));
+    args.push(OsString::from(if focus { "--focus" } else { "--no-focus" }));
     args
 }
 
-fn ensure_content_layout(navigation_pane: &str, content_pane: &str) -> Result<(), String> {
+fn ensure_content_layout(
+    navigation_pane: &str,
+    content_pane: &str,
+    workspace_cwd: &Path,
+) -> Result<(), String> {
     let mut layout = pane_layout(navigation_pane)?;
     if directly_left_of(&layout, navigation_pane, content_pane) {
         // Already correct.
@@ -592,6 +638,7 @@ fn ensure_content_layout(navigation_pane: &str, content_pane: &str) -> Result<()
         env::var_os("HERDR_PLUGIN_STATE_DIR")
             .map(PathBuf::from)
             .as_deref(),
+        workspace_cwd,
     );
     if let Some(args) = navigation_resize_args_for_share(&layout, navigation_pane, share) {
         if !run_herdr_status(&args) {
@@ -745,7 +792,7 @@ pub fn rightmost_pane_id<'a>(
     })
 }
 
-pub fn persist_navigator_share_from_host() {
+pub fn persist_navigator_share_from_host(workspace_cwd: &Path) {
     let Some(pane_id) = own_pane_id() else {
         return;
     };
@@ -758,21 +805,22 @@ pub fn persist_navigator_share_from_host() {
     let Some(state_dir) = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) else {
         return;
     };
-    let _ = panel_restore::save_navigator_share(&state_dir, share);
+    let _ = panel_restore::save_navigator_share(&state_dir, workspace_cwd, share);
 }
 
-pub fn apply_own_navigation_share() -> bool {
+pub fn apply_own_navigation_share(workspace_cwd: &Path) -> bool {
     let Some(pane_id) = own_pane_id() else {
         return false;
     };
-    apply_navigation_share_to_pane(&pane_id)
+    apply_navigation_share_to_pane(&pane_id, workspace_cwd)
 }
 
-pub fn apply_navigation_share_to_pane(pane_id: &str) -> bool {
+pub fn apply_navigation_share_to_pane(pane_id: &str, workspace_cwd: &Path) -> bool {
     let share = load_navigator_share(
         env::var_os("HERDR_PLUGIN_STATE_DIR")
             .map(PathBuf::from)
             .as_deref(),
+        workspace_cwd,
     );
     let Ok(layout) = pane_layout(pane_id) else {
         return false;
@@ -1571,6 +1619,9 @@ fn run_viewer(cwd: PathBuf, control: PathBuf) -> io::Result<()> {
     let _ = terminal.show_cursor();
     let _ = fs::remove_file(&control);
     if result.as_ref().is_ok_and(|close| *close) {
+        if let Some(state_dir) = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) {
+            let _ = panel_restore::save_content_request(&state_dir, &state.cwd, None);
+        }
         close_own_pane();
     }
     result.map(|_| ())
@@ -1788,6 +1839,7 @@ mod tests {
             Path::new(r"C:\Temp\content.json"),
             OsStr::new(r"C:\Plugin\bin;C:\Windows"),
             Some(OsStr::new(r"C:\Herdr\plugin-config")),
+            true,
         );
         assert_eq!(args[3], "workspace:p1");
         assert_eq!(args[7], "0.5");
@@ -1806,12 +1858,23 @@ mod tests {
             Path::new(r"C:\Temp\content.json"),
             OsStr::new(r"C:\Plugin\bin"),
             None,
+            true,
         );
         assert!(
             without_config
                 .iter()
                 .all(|arg| !arg.to_string_lossy().contains("HERDR_PLUGIN_CONFIG_DIR="))
         );
+        let restored = split_args(
+            "workspace:p1",
+            Path::new(r"C:\Workspace"),
+            Path::new(r"C:\Temp\content.json"),
+            OsStr::new(r"C:\Plugin\bin"),
+            None,
+            false,
+        );
+        assert!(restored.iter().any(|arg| arg == "--no-focus"));
+        assert!(!restored.iter().any(|arg| arg == "--focus"));
     }
 
     #[test]

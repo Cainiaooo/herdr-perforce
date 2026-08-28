@@ -18,7 +18,7 @@ const STATE_FILE: &str = "remembered-workspaces.json";
 const LAYOUT_FILE: &str = "layout.json";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
-const MAX_LAYOUT_BYTES: u64 = 4 * 1024;
+const MAX_LAYOUT_BYTES: u64 = 64 * 1024;
 const MAX_REMEMBERED_WORKSPACES: usize = 128;
 const CONTENT_SOURCE_TOKEN: &str = "herdr-perforce-content";
 const CONTENT_CONTROL_TOKEN: &str = "herdr-p4-content-control";
@@ -231,18 +231,29 @@ pub fn remember_workspace(
     fs::write(state_dir.join(STATE_FILE), bytes).map_err(|_| "panel state could not be written")
 }
 
-pub fn load_navigator_share(state_dir: Option<&Path>) -> f64 {
+#[derive(Debug, Clone, PartialEq)]
+struct WorkspaceLayoutState {
+    workspace_cwd: PathBuf,
+    navigator_share: Option<f64>,
+    content_request: Option<String>,
+    navigation_view: Option<String>,
+}
+
+pub fn load_navigator_share(state_dir: Option<&Path>, workspace_cwd: &Path) -> f64 {
     let Some(state_dir) = state_dir else {
         return DEFAULT_NAVIGATION_SHARE;
     };
-    let path = state_dir.join(LAYOUT_FILE);
-    if !path.exists() {
-        return DEFAULT_NAVIGATION_SHARE;
-    }
-    parse_navigator_share(&path).unwrap_or(DEFAULT_NAVIGATION_SHARE)
+    load_workspace_layout(state_dir, workspace_cwd)
+        .ok()
+        .and_then(|entry| entry.navigator_share)
+        .unwrap_or(DEFAULT_NAVIGATION_SHARE)
 }
 
-pub fn save_navigator_share(state_dir: &Path, share: f64) -> Result<(), &'static str> {
+pub fn save_navigator_share(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+    share: f64,
+) -> Result<(), &'static str> {
     if !share.is_finite() {
         return Err("navigator share is invalid");
     }
@@ -252,20 +263,138 @@ pub fn save_navigator_share(state_dir: &Path, share: f64) -> Result<(), &'static
         return Err("navigator share looks like the host default split");
     }
     let share = share.clamp(MIN_NAVIGATION_SHARE, MAX_NAVIGATION_SHARE);
+    update_workspace_layout(state_dir, workspace_cwd, |entry| {
+        entry.navigator_share = Some(share);
+    })
+}
+
+pub fn workspace_layout_exists(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+) -> Result<bool, &'static str> {
+    if !workspace_cwd.is_absolute() {
+        return Err("workspace layout cwd is invalid");
+    }
+    let path = workspace_layout_path(state_dir, workspace_cwd);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let state = parse_workspace_layout(&path)?;
+    if !paths_equal(&state.workspace_cwd, workspace_cwd) {
+        return Err("workspace layout identity does not match its file");
+    }
+    Ok(true)
+}
+
+pub fn load_content_request(state_dir: Option<&Path>, workspace_cwd: &Path) -> Option<String> {
+    load_workspace_layout(state_dir?, workspace_cwd)
+        .ok()?
+        .content_request
+}
+
+pub fn save_content_request(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+    request: Option<&str>,
+) -> Result<(), &'static str> {
+    if request.is_some_and(|request| request.len() > MAX_CONFIG_BYTES as usize) {
+        return Err("content request is too large");
+    }
+    update_workspace_layout(state_dir, workspace_cwd, |entry| {
+        entry.content_request = request.map(ToOwned::to_owned);
+    })
+}
+
+pub fn load_navigation_view(state_dir: Option<&Path>, workspace_cwd: &Path) -> Option<String> {
+    load_workspace_layout(state_dir?, workspace_cwd)
+        .ok()?
+        .navigation_view
+}
+
+pub fn save_navigation_view(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+    view: &str,
+) -> Result<(), &'static str> {
+    if !matches!(view, "explorer" | "review") {
+        return Err("navigation view is invalid");
+    }
+    update_workspace_layout(state_dir, workspace_cwd, |entry| {
+        entry.navigation_view = Some(view.to_owned());
+    })
+}
+
+fn update_workspace_layout(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+    update: impl FnOnce(&mut WorkspaceLayoutState),
+) -> Result<(), &'static str> {
+    if !workspace_cwd.is_absolute() {
+        return Err("workspace layout cwd is invalid");
+    }
     fs::create_dir_all(state_dir).map_err(|_| "panel state directory could not be created")?;
+    let path = workspace_layout_path(state_dir, workspace_cwd);
+    let mut entry = load_workspace_layout(state_dir, workspace_cwd)?;
+    update(&mut entry);
+    write_layout_state(&path, &entry)
+}
+
+fn workspace_layout_path(state_dir: &Path, workspace_cwd: &Path) -> PathBuf {
+    let path = strip_verbatim_prefix(workspace_cwd);
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    let identity = text.replace('/', "\\").to_ascii_lowercase();
+    #[cfg(not(windows))]
+    let identity = text.into_owned();
+    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    state_dir.join(format!("layout-{digest}.json"))
+}
+
+fn load_workspace_layout(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+) -> Result<WorkspaceLayoutState, &'static str> {
+    if !workspace_cwd.is_absolute() {
+        return Err("workspace layout cwd is invalid");
+    }
+    let path = workspace_layout_path(state_dir, workspace_cwd);
+    if path.exists() {
+        let state = parse_workspace_layout(&path)?;
+        if !paths_equal(&state.workspace_cwd, workspace_cwd) {
+            return Err("workspace layout identity does not match its file");
+        }
+        return Ok(state);
+    }
+    let legacy_path = state_dir.join(LAYOUT_FILE);
+    let navigator_share = legacy_path
+        .exists()
+        .then(|| parse_legacy_navigator_share(&legacy_path))
+        .transpose()?;
+    Ok(WorkspaceLayoutState {
+        workspace_cwd: strip_verbatim_prefix(workspace_cwd),
+        navigator_share,
+        content_request: None,
+        navigation_view: None,
+    })
+}
+
+fn write_layout_state(path: &Path, state: &WorkspaceLayoutState) -> Result<(), &'static str> {
     let value = json!({
-        "version": 1,
-        "navigator_share": share,
+        "version": 2,
+        "workspace_cwd": state.workspace_cwd.to_string_lossy(),
+        "navigator_share": state.navigator_share,
+        "content_request": state.content_request,
+        "navigation_view": state.navigation_view,
     });
     let bytes =
         serde_json::to_vec_pretty(&value).map_err(|_| "panel layout could not be encoded")?;
     if bytes.len() as u64 > MAX_LAYOUT_BYTES {
         return Err("panel layout is too large");
     }
-    fs::write(state_dir.join(LAYOUT_FILE), bytes).map_err(|_| "panel layout could not be written")
+    fs::write(path, bytes).map_err(|_| "panel layout could not be written")
 }
 
-fn parse_navigator_share(path: &Path) -> Result<f64, &'static str> {
+fn parse_legacy_navigator_share(path: &Path) -> Result<f64, &'static str> {
     let value = read_bounded_json(path, MAX_LAYOUT_BYTES, "panel layout could not be read")?;
     let object = strict_object(
         &value,
@@ -275,8 +404,55 @@ fn parse_navigator_share(path: &Path) -> Result<f64, &'static str> {
     if object.get("version").and_then(Value::as_u64) != Some(1) {
         return Err("panel layout version is unsupported");
     }
-    let share = object
-        .get("navigator_share")
+    parse_layout_share(object.get("navigator_share"))
+}
+
+fn parse_workspace_layout(path: &Path) -> Result<WorkspaceLayoutState, &'static str> {
+    let value = read_bounded_json(path, MAX_LAYOUT_BYTES, "workspace layout could not be read")?;
+    let object = strict_object(
+        &value,
+        &[
+            "version",
+            "workspace_cwd",
+            "navigator_share",
+            "content_request",
+            "navigation_view",
+        ],
+        "workspace layout is invalid",
+    )?;
+    if object.get("version").and_then(Value::as_u64) != Some(2) {
+        return Err("workspace layout version is unsupported");
+    }
+    let workspace_cwd =
+        required_absolute_path(&value, "workspace_cwd", "workspace layout cwd is invalid")?;
+    let navigator_share = match object.get("navigator_share") {
+        Some(Value::Null) | None => None,
+        value => Some(parse_layout_share(value)?),
+    };
+    let content_request = match object.get("content_request") {
+        Some(Value::String(request)) if request.len() <= MAX_CONFIG_BYTES as usize => {
+            Some(request.clone())
+        }
+        Some(Value::Null) | None => None,
+        _ => return Err("workspace content request is invalid"),
+    };
+    let navigation_view = match object.get("navigation_view") {
+        Some(Value::String(view)) if matches!(view.as_str(), "explorer" | "review") => {
+            Some(view.clone())
+        }
+        Some(Value::Null) | None => None,
+        _ => return Err("workspace navigation view is invalid"),
+    };
+    Ok(WorkspaceLayoutState {
+        workspace_cwd,
+        navigator_share,
+        content_request,
+        navigation_view,
+    })
+}
+
+fn parse_layout_share(value: Option<&Value>) -> Result<f64, &'static str> {
+    let share = value
         .and_then(Value::as_f64)
         .ok_or("panel layout navigator_share is invalid")?;
     if !share.is_finite() || !(MIN_NAVIGATION_SHARE..=MAX_NAVIGATION_SHARE).contains(&share) {
@@ -536,12 +712,20 @@ pub fn perforce_content_panes<'a>(
     workspace: &HerdrWorkspace,
     panes: &'a [HerdrPane],
 ) -> Vec<&'a HerdrPane> {
+    perforce_content_label_panes(workspace, panes)
+        .into_iter()
+        .filter(|pane| pane.content_owned)
+        .collect()
+}
+
+pub fn perforce_content_label_panes<'a>(
+    workspace: &HerdrWorkspace,
+    panes: &'a [HerdrPane],
+) -> Vec<&'a HerdrPane> {
     panes
         .iter()
         .filter(|pane| {
-            pane.workspace_id == workspace.id
-                && pane.content_owned
-                && is_perforce_content_label(pane.label.as_deref())
+            pane.workspace_id == workspace.id && is_perforce_content_label(pane.label.as_deref())
         })
         .collect()
 }
@@ -1170,7 +1354,11 @@ mod tests {
         let mut spoofed = panes[0].clone();
         spoofed.label = Some("Diff · unrelated Agent work · Perforce".to_owned());
         spoofed.content_owned = false;
-        assert!(perforce_content_panes(&workspace, &[spoofed]).is_empty());
+        assert!(perforce_content_panes(&workspace, &[spoofed.clone()]).is_empty());
+        assert_eq!(
+            perforce_content_label_panes(&workspace, &[spoofed]).len(),
+            1
+        );
         assert_eq!(
             target_pane_id(&remembered, &workspace, &panes),
             Some("w1:p1")
@@ -1229,18 +1417,49 @@ mod tests {
     #[test]
     fn navigator_share_round_trips_and_rejects_out_of_range() {
         let root = temp_dir("layout-share");
-        assert_eq!(load_navigator_share(Some(&root)), DEFAULT_NAVIGATION_SHARE);
-        save_navigator_share(&root, 0.12).expect("save");
-        assert!((load_navigator_share(Some(&root)) - 0.12).abs() < f64::EPSILON);
-        assert!(save_navigator_share(&root, 0.5).is_err());
-        assert!(save_navigator_share(&root, 0.01).is_ok());
-        assert!((load_navigator_share(Some(&root)) - 0.08).abs() < f64::EPSILON);
+        let neon = PathBuf::from(r"E:\Project\NeonGame");
+        let quill = PathBuf::from(r"D:\Projects\Quill");
+        assert_eq!(
+            load_navigator_share(Some(&root), &neon),
+            DEFAULT_NAVIGATION_SHARE
+        );
+        assert_eq!(workspace_layout_exists(&root, &neon), Ok(false));
+        save_navigator_share(&root, &neon, 0.12).expect("save");
+        save_navigator_share(&root, &quill, 0.27).expect("save");
+        assert_eq!(workspace_layout_exists(&root, &neon), Ok(true));
+        assert!((load_navigator_share(Some(&root), &neon) - 0.12).abs() < f64::EPSILON);
+        assert!((load_navigator_share(Some(&root), &quill) - 0.27).abs() < f64::EPSILON);
+        assert!(save_navigator_share(&root, &neon, 0.5).is_err());
+        assert!(save_navigator_share(&root, &neon, 0.01).is_ok());
+        assert!((load_navigator_share(Some(&root), &neon) - 0.08).abs() < f64::EPSILON);
+        save_content_request(
+            &root,
+            &neon,
+            Some(r#"{"version":1,"kind":"file","path":"E:\\Project\\NeonGame\\Neon.uproject"}"#),
+        )
+        .expect("content request");
+        assert!(load_content_request(Some(&root), &neon).is_some());
+        assert_eq!(load_content_request(Some(&root), &quill), None);
+        save_navigation_view(&root, &neon, "review").expect("navigation view");
+        save_navigation_view(&root, &quill, "explorer").expect("navigation view");
+        assert_eq!(
+            load_navigation_view(Some(&root), &neon).as_deref(),
+            Some("review")
+        );
+        assert_eq!(
+            load_navigation_view(Some(&root), &quill).as_deref(),
+            Some("explorer")
+        );
         fs::write(
             root.join(LAYOUT_FILE),
             br#"{"version":1,"navigator_share":0.9}"#,
         )
         .expect("layout");
-        assert_eq!(load_navigator_share(Some(&root)), DEFAULT_NAVIGATION_SHARE);
+        let other = PathBuf::from(r"G:\Projects\Other");
+        assert_eq!(
+            load_navigator_share(Some(&root), &other),
+            DEFAULT_NAVIGATION_SHARE
+        );
         fs::remove_dir_all(root).ok();
     }
 

@@ -40,6 +40,7 @@ use crate::{
         load_explorer_directory, load_opened_records, pending_changelists_from_changes,
         workspace_owning_cwd,
     },
+    panel_restore,
     submit_provider::{ExternalLaunchError, SubmitProvider},
 };
 
@@ -57,8 +58,9 @@ use self::explorer::{
 };
 
 pub use self::content::{
-    navigation_resize_args_for_layout, navigation_resize_args_for_share, rightmost_pane_id,
-    run_content_pane,
+    navigation_resize_args_for_layout, navigation_resize_args_for_share,
+    navigation_share_from_layout, restore_content_pane, rightmost_pane_id, run_content_pane,
+    viewer_process_is_active,
 };
 
 const MAX_VISIBLE_CHANGELISTS: u16 = 4_096;
@@ -85,10 +87,11 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
     let mut dirty = false;
     let persist_armed_at = Instant::now() + Duration::from_secs(2);
     let mut persist_layout_after: Option<Instant> = None;
-    thread::spawn(|| {
+    let share_cwd = pane.cwd.clone();
+    thread::spawn(move || {
         for attempt in 0..10 {
             thread::sleep(Duration::from_millis(50 + attempt * 40));
-            if apply_own_navigation_share() {
+            if apply_own_navigation_share(&share_cwd) {
                 break;
             }
         }
@@ -114,7 +117,7 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
             && Instant::now() >= persist_armed_at
         {
             persist_layout_after = None;
-            persist_navigator_share_from_host();
+            persist_navigator_share_from_host(&pane.cwd);
         }
 
         if !event::poll(EVENT_POLL).map_err(|error| error.to_string())? {
@@ -136,7 +139,7 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
         };
         if should_close {
             if Instant::now() >= persist_armed_at {
-                persist_navigator_share_from_host();
+                persist_navigator_share_from_host(&pane.cwd);
             }
             break;
         }
@@ -252,6 +255,14 @@ enum PaneView {
     Review,
 }
 
+fn env_navigation_view(cwd: &Path) -> PaneView {
+    let state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from);
+    match panel_restore::load_navigation_view(state_dir.as_deref(), cwd).as_deref() {
+        Some("review") => PaneView::Review,
+        Some("explorer") | None | Some(_) => PaneView::Explorer,
+    }
+}
+
 const NAV_CHROME_ROWS: usize = 4;
 const WHEEL_SCROLL_STEP: isize = 3;
 
@@ -365,13 +376,15 @@ impl PaneModel {
     fn new(cwd: PathBuf) -> Self {
         let mut pane = Self::new_with_provider(cwd, Arc::new(SubmitProvider::Native));
         pane.reload_provider_from_environment = false;
+        pane.view = PaneView::Explorer;
         pane
     }
 
     fn new_with_provider(cwd: PathBuf, submit_provider: Arc<SubmitProvider>) -> Self {
+        let view = env_navigation_view(&cwd);
         Self {
             cwd: cwd.clone(),
-            view: PaneView::Explorer,
+            view,
             overview: OverviewState::Loading,
             overview_generation: 1,
             selected: 0,
@@ -389,6 +402,21 @@ impl PaneModel {
             review_scroll_x: 0,
             review_follow: true,
         }
+    }
+
+    fn set_view(&mut self, view: PaneView) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        let Some(state_dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let value = match view {
+            PaneView::Explorer => "explorer",
+            PaneView::Review => "review",
+        };
+        let _ = panel_restore::save_navigation_view(&state_dir, &self.cwd, value);
     }
 
     fn set_nav_size(&mut self, width: u16, height: u16) {
@@ -616,11 +644,11 @@ impl PaneModel {
         match key.code {
             KeyCode::Char('q') => true,
             KeyCode::Char('1') => {
-                self.view = PaneView::Explorer;
+                self.set_view(PaneView::Explorer);
                 false
             }
             KeyCode::Char('2') => {
-                self.view = PaneView::Review;
+                self.set_view(PaneView::Review);
                 false
             }
             KeyCode::Char('m') => {
@@ -820,7 +848,7 @@ impl PaneModel {
             .view_explorer
             .is_some_and(|target| target.contains(mouse.column, mouse.row))
         {
-            self.view = PaneView::Explorer;
+            self.set_view(PaneView::Explorer);
             self.drag = None;
             return true;
         }
@@ -828,7 +856,7 @@ impl PaneModel {
             .view_review
             .is_some_and(|target| target.contains(mouse.column, mouse.row))
         {
-            self.view = PaneView::Review;
+            self.set_view(PaneView::Review);
             self.drag = None;
             return true;
         }

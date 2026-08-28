@@ -68,7 +68,8 @@ herdr plugin action invoke open --plugin herdr.perforce
 1. 读取已记住的 workspace，不扫描其他目录，也不在启动阶段运行 `p4`。
 2. 只处理本次 session 中仍存在且 cwd 匹配的 Herdr workspace。
 3. 对已有 `Perforce` pane 调用 `pane process-info`；前台是 `herdr-p4 ... pane`，或 Windows 上由 PowerShell 包装启动的同一命令，都视为健康并保持现状。同一 Herdr workspace 只保留一个导航 pane，多出来的重复 pane 会关掉。
-4. 标题是 `Perforce` 但里面只是 `PS ...>` 或其他默认 shell 的 pane 是 corpse：先关掉空壳和带有 Herdr Perforce Content metadata token 的残留 Content pane（优先 `plugin pane close`），再从剩余 pane 打开真正的插件进程。仅标题相似的 Agent pane 不属于清理目标。不能把空壳当成已经恢复。新 pane 使用 `--no-focus`。
+4. 标题是 `Perforce` 但里面只是 `PS ...>` 或其他默认 shell 的 pane 是 corpse：先关掉空壳和残留 Content pane，再从剩余 pane 打开真正的插件进程。Content 本来由普通 split 创建，重启后 token 可能丢失；只有标题匹配、前台仍是 viewer 或默认 shell、并且与已确认的导航候选水平相邻时才允许按 plugin-first、plain-fallback 路径清理。不能把同名 Agent 当成 Content，也不能把空壳当成已经恢复。新 pane 使用 `--no-focus`。
+5. 导航比例、Explorer/Review 视图以及最后打开的 File/Diff/CL 请求按 workspace 恢复；有 Content 时重新建立 `Agent | Content | Navigation`，且不抢焦点。
 
 关闭并重新打开一个连接到同一 Herdr server 的客户端，不会重复运行 startup hook；要验证恢复行为，需要真正重启 Herdr server。仅关闭当前 Perforce pane 不会删除 workspace 记录，因此下次 server 启动仍会恢复它。
 
@@ -201,7 +202,7 @@ herdr plugin log list --plugin herdr.perforce
 
 `no remembered workspaces` 表示还没有成功记录；`manual mode` 表示 `panel.json` 禁用了恢复；`unavailable` 表示记录的 cwd 在本次 Herdr session 中没有匹配 workspace。Startup log 只输出数量和分类，不输出 workspace 绝对路径。
 
-如果 pane 边框显示 `Perforce`，内容却只是 `PS ...>` 或其他 shell prompt，表示 Herdr 恢复了 pane 布局但插件进程没有存活。当前版本会把它识别为 corpse：先关掉这个空壳，再打开真正的插件 pane。Windows 上 pane 入口通过 PowerShell 启动 `herdr-p4.exe pane`，这不算 stale。日志中的 `stale-closed` 是成功清理的空壳数量，`duplicates-closed` 是同一 workspace 里关掉的重复健康 pane 数量。Content 清理只作用于同 workspace、标题匹配且同时带 source/control metadata token 的 pane；仅标题相似的 Agent 不会被关闭。任一清理失败会计入 `failed`，并阻止继续 split。导航宽度会记在插件 state 的 `layout.json` 里；拖动分隔条后，下次恢复会应用该比例，而不是停在 50/50。
+如果 pane 边框显示 `Perforce`，内容却只是 `PS ...>` 或其他 shell prompt，表示 Herdr 恢复了 pane 布局但插件进程没有存活。当前版本会把它识别为 corpse：先关掉这个空壳，再打开真正的插件 pane。Windows 上 pane 入口通过 PowerShell 启动 `herdr-p4.exe pane`，这不算 stale。日志中的 `stale-closed` 是成功清理的空壳数量，`duplicates-closed` 是同一 workspace 里关掉的重复健康 pane 数量。有完整 token 的 Content 可直接识别；重启后 token 丢失的 Content 还必须同时满足 viewer/默认-shell 进程身份和与导航候选水平相邻，之后才走 plugin-first、plain-fallback 关闭。仅标题相似的 Agent 不会被关闭。任一清理失败会计入 `failed`，并阻止继续 split。workspace 专属的 `layout-<hash>.json` 保存导航宽度、当前 Explorer/Review 视图和最后 Content 请求；旧 `layout.json` 只用于迁移，项目之间不会互相覆盖。
 
 ### `p4` 找不到或 workspace 不可用
 
