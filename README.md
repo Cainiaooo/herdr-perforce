@@ -57,7 +57,7 @@ herdr plugin action invoke open-windows --plugin herdr.perforce
 herdr plugin action invoke open --plugin herdr.perforce
 ```
 
-也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
+也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
 
 ### Panel 加载与自动恢复
 
@@ -98,9 +98,11 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 
 | 按键 | 行为 |
 |---|---|
-| `j` / `k`、方向键 | 选择 changelist |
-| `1` / `2` | 切换 Explorer / Review 导航 |
+| `j` / `k`、方向键 | 选择目录、文件或 changelist |
+| `1` / `2` | 切换 Explorer / P4 Review 导航 |
 | `Enter` | Explorer 中打开 File；Review 中打开 CL 文件列表 |
+| `m` / 右键 | 打开当前行的上下文菜单（Rename、Copy Path、Reveal 等） |
+| 滚轮 / 拖动 | 树与 CL 列表纵向滚动；横向拖动查看被截断的单行名称 |
 | `d` | Explorer 中为 opened file 打开 Diff |
 | `o` | 使用系统默认应用打开 Explorer 选中路径 |
 | `s` | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
@@ -121,7 +123,7 @@ overlay 打开时，背景列表不会响应 Submit 或导航快捷键。SubmitR
 
 内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；从 CL 文件列表进入 Diff 后，`Esc` 返回列表。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 使用 `📂`、`📁`、`📄` 区分展开目录、折叠目录和文件。
 
-Diff 以当前文件为画布：未改行就是文件本身，删除为红底 `-`，新增为绿底 `+`，行内替换会把变化的词标得更亮。远距未改默认折叠，点击折叠行或 `e` / **Expand all** 展开；**Prev** / **Next** 或 `[` / `]` 跳到上一/下一处改动。
+Diff 以当前文件为画布：未改行就是文件本身，删除为红底 `-`，新增为绿底 `+`，行内替换会把变化的词标得更亮。远距未改默认折叠；修改区域上方和下方各有一条分割行，点击后朝该方向再展开 20 行上下文。`e` / **Expand all** 展开全部；**Prev** / **Next** 或 `[` / `]` 跳到上一/下一处改动。
 
 ## Submit 安全模型
 

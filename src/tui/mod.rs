@@ -1,7 +1,9 @@
 //! Terminal pane: workspace File Explorer and Submit review views.
 
+mod actions;
 mod content;
 mod diff;
+mod display;
 mod explorer;
 mod syntax;
 mod wrap;
@@ -41,7 +43,13 @@ use crate::{
     submit_provider::{ExternalLaunchError, SubmitProvider},
 };
 
+use self::actions::{
+    ExplorerMenuTarget, MenuAction, MenuEntry, copy_to_clipboard, explorer_menu_entries,
+    first_action_index, is_same_path, menu_window, relative_path_text, review_menu_entries,
+    step_action_index, validate_name,
+};
 use self::content::ContentPaneClient;
+use self::display::{display_width, pad_display, slice_display, splice_display};
 use self::explorer::{
     ExplorerAction, ExplorerLoadState, ExplorerModel, connection_message, open_with_default_app,
 };
@@ -64,6 +72,7 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
 
     let mut terminal = TerminalGuard::enter().map_err(|error| error.to_string())?;
     let (width, height) = terminal::size().map_err(|error| error.to_string())?;
+    pane.set_nav_size(width, height);
     let mut rendered = render_frame(&pane, width, height);
     terminal
         .draw(&rendered.lines)
@@ -78,6 +87,7 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
 
         if dirty {
             let (width, height) = terminal::size().map_err(|error| error.to_string())?;
+            pane.set_nav_size(width, height);
             rendered = render_frame(&pane, width, height);
             terminal
                 .draw(&rendered.lines)
@@ -92,13 +102,10 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
         let (should_close, event_changed) = match event {
             Event::Key(key) if key.kind != KeyEventKind::Press => (false, false),
             Event::Key(key) => (pane.handle_key(key, &service, &sender), true),
-            Event::Mouse(mouse) => {
-                let changed = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
-                (
-                    pane.handle_mouse(mouse, &rendered.hits, &service, &sender),
-                    changed,
-                )
-            }
+            Event::Mouse(mouse) => (
+                false,
+                pane.handle_mouse(mouse, &rendered.hits, &service, &sender),
+            ),
             Event::Resize(_, _) => (false, true),
             Event::FocusGained | Event::FocusLost | Event::Paste(_) => (false, false),
         };
@@ -217,6 +224,70 @@ enum PaneView {
     Review,
 }
 
+const NAV_CHROME_ROWS: usize = 4;
+const WHEEL_SCROLL_STEP: isize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragTarget {
+    Explorer,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NavDrag {
+    start_x: u16,
+    start_y: u16,
+    origin_scroll_x: usize,
+    origin_scroll_y: usize,
+    moved: bool,
+    target: DragTarget,
+    pending_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum PromptKind {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename { path: PathBuf },
+}
+
+#[derive(Debug, Clone)]
+enum MenuKind {
+    Explorer {
+        target: Option<(PathBuf, bool, bool)>,
+    },
+    Review {
+        change_index: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum NavOverlay {
+    Closed,
+    Menu {
+        x: u16,
+        y: u16,
+        kind: MenuKind,
+        entries: Vec<MenuEntry>,
+        selected: usize,
+    },
+    Prompt {
+        title: String,
+        input: String,
+        kind: PromptKind,
+    },
+    ConfirmDelete {
+        path: PathBuf,
+        is_dir: bool,
+    },
+}
+
+impl NavOverlay {
+    fn is_open(&self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
 enum MessageEffect {
     None,
     ReloadOverview,
@@ -252,6 +323,13 @@ struct PaneModel {
     submit_provider: Arc<SubmitProvider>,
     reload_provider_from_environment: bool,
     status: String,
+    nav_width: u16,
+    nav_height: u16,
+    nav_overlay: NavOverlay,
+    drag: Option<NavDrag>,
+    review_scroll_y: usize,
+    review_scroll_x: usize,
+    review_follow: bool,
 }
 
 impl PaneModel {
@@ -265,7 +343,7 @@ impl PaneModel {
     fn new_with_provider(cwd: PathBuf, submit_provider: Arc<SubmitProvider>) -> Self {
         Self {
             cwd: cwd.clone(),
-            view: PaneView::Review,
+            view: PaneView::Explorer,
             overview: OverviewState::Loading,
             overview_generation: 1,
             selected: 0,
@@ -274,8 +352,28 @@ impl PaneModel {
             overlay: SubmitOverlay::default(),
             submit_provider,
             reload_provider_from_environment: true,
-            status: "Loading current Perforce workspace...".to_owned(),
+            status: "Loading workspace files...".to_owned(),
+            nav_width: 80,
+            nav_height: 24,
+            nav_overlay: NavOverlay::Closed,
+            drag: None,
+            review_scroll_y: 0,
+            review_scroll_x: 0,
+            review_follow: true,
         }
+    }
+
+    fn set_nav_size(&mut self, width: u16, height: u16) {
+        self.nav_width = width.max(1);
+        self.nav_height = height.max(1);
+    }
+
+    fn body_height(&self) -> usize {
+        (self.nav_height as usize).saturating_sub(NAV_CHROME_ROWS)
+    }
+
+    fn body_width(&self) -> usize {
+        (self.nav_width as usize).saturating_sub(1)
     }
 
     fn reload_submit_provider(&mut self) {
@@ -483,6 +581,10 @@ impl PaneModel {
             return false;
         }
 
+        if self.nav_overlay.is_open() {
+            return self.handle_nav_overlay_key(key, service, sender);
+        }
+
         match key.code {
             KeyCode::Char('q') => true,
             KeyCode::Char('1') => {
@@ -491,6 +593,10 @@ impl PaneModel {
             }
             KeyCode::Char('2') => {
                 self.view = PaneView::Review;
+                false
+            }
+            KeyCode::Char('m') => {
+                self.open_menu_for_selection();
                 false
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -526,6 +632,7 @@ impl PaneModel {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
+                self.review_follow = true;
                 false
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -534,6 +641,24 @@ impl PaneModel {
                     OverviewState::Loading | OverviewState::Failed(_) => 0,
                 };
                 self.selected = self.selected.saturating_add(1).min(count.saturating_sub(1));
+                self.review_follow = true;
+                false
+            }
+            KeyCode::PageUp => {
+                self.selected = self.selected.saturating_sub(self.body_height().max(1));
+                self.review_follow = true;
+                false
+            }
+            KeyCode::PageDown => {
+                let count = match &self.overview {
+                    OverviewState::Ready(overview) => overview.changes.len(),
+                    OverviewState::Loading | OverviewState::Failed(_) => 0,
+                };
+                self.selected = self
+                    .selected
+                    .saturating_add(self.body_height().max(1))
+                    .min(count.saturating_sub(1));
+                self.review_follow = true;
                 false
             }
             _ => false,
@@ -578,6 +703,16 @@ impl PaneModel {
                 self.explorer.move_selection(1);
                 false
             }
+            KeyCode::PageUp => {
+                self.explorer
+                    .move_selection(-(self.body_height().max(1) as isize));
+                false
+            }
+            KeyCode::PageDown => {
+                self.explorer
+                    .move_selection(self.body_height().max(1) as isize);
+                false
+            }
             _ => false,
         }
     }
@@ -605,10 +740,10 @@ impl PaneModel {
         service: &Arc<P4WriteService<T>>,
         sender: &mpsc::Sender<PaneMessage>,
     ) -> bool {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
         if !matches!(self.overlay.state(), SubmitOverlayState::Closed) {
+            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return false;
+            }
             if hits
                 .cancel
                 .is_some_and(|target| target.contains(mouse.column, mouse.row))
@@ -629,45 +764,722 @@ impl PaneModel {
                     self.issue_overlay_request(request, service, sender);
                 }
             }
-            return false;
+            return true;
         }
+
+        if self.nav_overlay.is_open() {
+            return self.handle_nav_overlay_mouse(mouse, hits, service, sender);
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_active_view(-WHEEL_SCROLL_STEP),
+            MouseEventKind::ScrollDown => self.scroll_active_view(WHEEL_SCROLL_STEP),
+            MouseEventKind::ScrollLeft => self.pan_active_view(-4),
+            MouseEventKind::ScrollRight => self.pan_active_view(4),
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.open_context_menu(mouse.column, mouse.row, hits);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.handle_left_down(mouse, hits),
+            MouseEventKind::Drag(MouseButton::Left) => self.handle_left_drag(mouse),
+            MouseEventKind::Up(MouseButton::Left) => self.handle_left_up(sender),
+            _ => false,
+        }
+    }
+
+    fn handle_left_down(&mut self, mouse: MouseEvent, hits: &HitTargets) -> bool {
         if hits
             .view_explorer
             .is_some_and(|target| target.contains(mouse.column, mouse.row))
         {
             self.view = PaneView::Explorer;
-            return false;
+            self.drag = None;
+            return true;
         }
         if hits
             .view_review
             .is_some_and(|target| target.contains(mouse.column, mouse.row))
         {
             self.view = PaneView::Review;
-            return false;
+            self.drag = None;
+            return true;
         }
         if self.view == PaneView::Explorer {
-            if let Some(index) = hits
+            let pending = hits
                 .explorer_rows
                 .iter()
                 .position(|target| target.contains(mouse.column, mouse.row))
-            {
-                let action = self
-                    .explorer
-                    .activate_index(hits.explorer_offset.saturating_add(index));
-                self.apply_explorer_action(action, sender);
+                .map(|index| hits.explorer_offset.saturating_add(index));
+            if let Some(index) = pending {
+                self.explorer.select_index(index);
             }
-            return false;
+            let (offset, _, _) = self.explorer.tree_window(self.body_height());
+            self.drag = Some(NavDrag {
+                start_x: mouse.column,
+                start_y: mouse.row,
+                origin_scroll_x: self.explorer.scroll_x(),
+                origin_scroll_y: offset,
+                moved: false,
+                target: DragTarget::Explorer,
+                pending_index: pending,
+            });
+            return true;
         }
-        if let Some(index) = hits
+        let pending = hits
             .changelists
             .iter()
             .position(|target| target.contains(mouse.column, mouse.row))
-        {
-            self.selected = hits.changelist_offset.saturating_add(index);
-            self.open_selected_changelist();
+            .map(|index| hits.changelist_offset.saturating_add(index));
+        if let Some(index) = pending {
+            self.selected = index;
+        }
+        self.drag = Some(NavDrag {
+            start_x: mouse.column,
+            start_y: mouse.row,
+            origin_scroll_x: self.review_scroll_x,
+            origin_scroll_y: self.review_offset(self.body_height()),
+            moved: false,
+            target: DragTarget::Review,
+            pending_index: pending,
+        });
+        true
+    }
+
+    fn handle_left_drag(&mut self, mouse: MouseEvent) -> bool {
+        let Some(drag) = self.drag else {
+            return false;
+        };
+        let dx = drag.start_x as isize - mouse.column as isize;
+        let dy = drag.start_y as isize - mouse.row as isize;
+        let moved = dx.abs() >= 1 || dy.abs() >= 1;
+        match drag.target {
+            DragTarget::Explorer => {
+                self.explorer.set_scroll_x(
+                    drag.origin_scroll_x.saturating_add_signed(dx),
+                    self.body_width(),
+                    self.explorer_content_width(),
+                );
+                self.explorer.set_scroll_y(
+                    drag.origin_scroll_y.saturating_add_signed(dy),
+                    self.body_height(),
+                );
+            }
+            DragTarget::Review => {
+                self.review_follow = false;
+                self.set_review_scroll(
+                    drag.origin_scroll_y.saturating_add_signed(dy),
+                    drag.origin_scroll_x.saturating_add_signed(dx),
+                );
+            }
+        }
+        if let Some(drag) = self.drag.as_mut() {
+            drag.moved = drag.moved || moved;
+        }
+        moved
+    }
+
+    fn handle_left_up(&mut self, sender: &mpsc::Sender<PaneMessage>) -> bool {
+        let Some(drag) = self.drag.take() else {
+            return false;
+        };
+        if drag.moved {
+            return true;
+        }
+        match drag.target {
+            DragTarget::Explorer => {
+                if let Some(index) = drag.pending_index {
+                    let action = self.explorer.activate_index(index);
+                    self.apply_explorer_action(action, sender);
+                }
+            }
+            DragTarget::Review => {
+                if drag.pending_index.is_some() {
+                    self.open_selected_changelist();
+                }
+            }
+        }
+        true
+    }
+
+    fn scroll_active_view(&mut self, delta: isize) -> bool {
+        match self.view {
+            PaneView::Explorer => {
+                self.explorer.scroll_vertical(delta, self.body_height());
+            }
+            PaneView::Review => {
+                let height = self.body_height();
+                let offset = self.review_offset(height);
+                self.review_follow = false;
+                self.set_review_scroll(offset.saturating_add_signed(delta), self.review_scroll_x);
+            }
+        }
+        true
+    }
+
+    fn pan_active_view(&mut self, delta: isize) -> bool {
+        match self.view {
+            PaneView::Explorer => {
+                self.explorer.set_scroll_x(
+                    self.explorer.scroll_x().saturating_add_signed(delta),
+                    self.body_width(),
+                    self.explorer_content_width(),
+                );
+            }
+            PaneView::Review => {
+                self.set_review_scroll(
+                    self.review_scroll_y,
+                    self.review_scroll_x.saturating_add_signed(delta),
+                );
+            }
+        }
+        true
+    }
+
+    fn review_count(&self) -> usize {
+        match &self.overview {
+            OverviewState::Ready(overview) => overview.changes.len(),
+            OverviewState::Loading | OverviewState::Failed(_) => 0,
+        }
+    }
+
+    fn review_offset(&self, visible_rows: usize) -> usize {
+        let count = self.review_count();
+        if visible_rows == 0 || count == 0 {
+            return 0;
+        }
+        let height = visible_rows.min(count);
+        let max_offset = count.saturating_sub(height);
+        if self.review_follow {
+            self.selected
+                .saturating_add(1)
+                .saturating_sub(height)
+                .min(max_offset)
+        } else {
+            self.review_scroll_y.min(max_offset)
+        }
+    }
+
+    fn set_review_scroll(&mut self, y: usize, x: usize) {
+        let height = self.body_height();
+        let count = self.review_count();
+        let max_y = count.saturating_sub(height.min(count.max(1)));
+        self.review_scroll_y = y.min(max_y);
+        self.review_scroll_x = x.min(
+            self.review_content_width()
+                .saturating_sub(self.body_width()),
+        );
+    }
+
+    fn explorer_content_width(&self) -> usize {
+        let selected = self.explorer.selected_path();
+        self.explorer
+            .visible_rows()
+            .iter()
+            .map(|row| {
+                display_width(&ExplorerModel::format_row(
+                    row,
+                    selected.is_some_and(|path| path == row.path),
+                ))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn review_content_width(&self) -> usize {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return 0;
+        };
+        overview
+            .changes
+            .iter()
+            .enumerate()
+            .map(|(index, change)| {
+                display_width(&format_changelist_row(index == self.selected, change))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn open_menu_for_selection(&mut self) {
+        match self.view {
+            PaneView::Explorer => {
+                let target = self
+                    .explorer
+                    .selected_row_info()
+                    .map(|(path, kind, opened)| {
+                        (
+                            path,
+                            kind == crate::domain::ExplorerEntryKind::Directory,
+                            opened,
+                        )
+                    });
+                let (x, y) = self.selection_anchor();
+                self.show_explorer_menu(x, y, target);
+            }
+            PaneView::Review => {
+                if self.review_count() == 0 {
+                    return;
+                }
+                let (x, y) = self.selection_anchor();
+                self.show_review_menu(x, y, self.selected);
+            }
+        }
+    }
+
+    fn open_context_menu(&mut self, x: u16, y: u16, hits: &HitTargets) {
+        match self.view {
+            PaneView::Explorer => {
+                let target = hits
+                    .explorer_rows
+                    .iter()
+                    .position(|target| target.contains(x, y))
+                    .map(|index| hits.explorer_offset.saturating_add(index))
+                    .and_then(|index| {
+                        self.explorer.select_index(index);
+                        self.explorer
+                            .selected_row_info()
+                            .map(|(path, kind, opened)| {
+                                (
+                                    path,
+                                    kind == crate::domain::ExplorerEntryKind::Directory,
+                                    opened,
+                                )
+                            })
+                    });
+                self.show_explorer_menu(x, y, target);
+            }
+            PaneView::Review => {
+                if let Some(index) = hits
+                    .changelists
+                    .iter()
+                    .position(|target| target.contains(x, y))
+                {
+                    self.selected = hits.changelist_offset.saturating_add(index);
+                    self.show_review_menu(x, y, self.selected);
+                } else if self.review_count() > 0 {
+                    self.show_review_menu(x, y, self.selected);
+                }
+            }
+        }
+    }
+
+    fn show_explorer_menu(&mut self, x: u16, y: u16, target: Option<(PathBuf, bool, bool)>) {
+        let root = self.explorer.cwd();
+        let entries = explorer_menu_entries(target.as_ref().map(|(path, is_dir, opened)| {
+            ExplorerMenuTarget {
+                is_dir: *is_dir,
+                opened: *opened,
+                is_root: is_same_path(path, root),
+            }
+        }));
+        self.nav_overlay = NavOverlay::Menu {
+            x,
+            y,
+            kind: MenuKind::Explorer { target },
+            selected: first_action_index(&entries),
+            entries,
+        };
+    }
+
+    fn show_review_menu(&mut self, x: u16, y: u16, change_index: usize) {
+        let can_submit = self
+            .selected_changelist()
+            .is_some_and(|change| matches!(change.id, ChangelistId::Numbered(_)));
+        let entries = review_menu_entries(can_submit);
+        self.nav_overlay = NavOverlay::Menu {
+            x,
+            y,
+            kind: MenuKind::Review { change_index },
+            selected: first_action_index(&entries),
+            entries,
+        };
+    }
+
+    fn selection_anchor(&self) -> (u16, u16) {
+        (2, 2)
+    }
+
+    fn handle_nav_overlay_key<T: P4Transport + 'static>(
+        &mut self,
+        key: KeyEvent,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) -> bool {
+        if matches!(key.code, KeyCode::Esc) && self.nav_overlay.is_open() {
+            self.nav_overlay = NavOverlay::Closed;
+            return false;
+        }
+        if matches!(self.nav_overlay, NavOverlay::Menu { .. }) {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let NavOverlay::Menu {
+                        selected, entries, ..
+                    } = &mut self.nav_overlay
+                    {
+                        *selected = step_action_index(entries, *selected, -1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let NavOverlay::Menu {
+                        selected, entries, ..
+                    } = &mut self.nav_overlay
+                    {
+                        *selected = step_action_index(entries, *selected, 1);
+                    }
+                }
+                KeyCode::Enter => self.activate_menu_entry(service, sender),
+                _ => {}
+            }
+            return false;
+        }
+        if matches!(self.nav_overlay, NavOverlay::Prompt { .. }) {
+            match key.code {
+                KeyCode::Enter => self.confirm_prompt(sender),
+                KeyCode::Backspace => {
+                    if let NavOverlay::Prompt { input, .. } = &mut self.nav_overlay {
+                        input.pop();
+                    }
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let NavOverlay::Prompt { input, .. } = &mut self.nav_overlay {
+                        input.push(character);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+        if matches!(self.nav_overlay, NavOverlay::ConfirmDelete { .. }) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let (path, is_dir) = match &self.nav_overlay {
+                        NavOverlay::ConfirmDelete { path, is_dir } => (path.clone(), *is_dir),
+                        _ => return false,
+                    };
+                    self.nav_overlay = NavOverlay::Closed;
+                    self.apply_delete(&path, is_dir, sender);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.nav_overlay = NavOverlay::Closed;
+                }
+                _ => {}
+            }
+            return false;
         }
         false
     }
+
+    fn handle_nav_overlay_mouse<T: P4Transport + 'static>(
+        &mut self,
+        mouse: MouseEvent,
+        hits: &HitTargets,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.nav_overlay = NavOverlay::Closed;
+                self.open_context_menu(mouse.column, mouse.row, hits);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let NavOverlay::Menu {
+                    x,
+                    y,
+                    entries,
+                    selected,
+                    ..
+                } = &self.nav_overlay
+                else {
+                    return false;
+                };
+                let rect = menu_popup_rect(*x, *y, entries, self.nav_width, self.nav_height);
+                let inner_height = usize::from(rect.height.saturating_sub(2));
+                let offset = menu_window(*selected, entries.len(), inner_height);
+                let hit = menu_index_at(rect, mouse.column, mouse.row, entries.len(), offset);
+                let actionable =
+                    hit.is_some_and(|index| matches!(entries[index], MenuEntry::Action(..)));
+                if let Some(index) = hit.filter(|_| actionable) {
+                    if let NavOverlay::Menu { selected, .. } = &mut self.nav_overlay {
+                        *selected = index;
+                    }
+                    self.activate_menu_entry(service, sender);
+                    return true;
+                }
+                if hit.is_none() {
+                    self.nav_overlay = NavOverlay::Closed;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn activate_menu_entry<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        let NavOverlay::Menu {
+            kind,
+            entries,
+            selected,
+            ..
+        } = std::mem::replace(&mut self.nav_overlay, NavOverlay::Closed)
+        else {
+            return;
+        };
+        let MenuEntry::Action(action, _) = entries
+            .get(selected)
+            .copied()
+            .unwrap_or(MenuEntry::Separator)
+        else {
+            return;
+        };
+        match kind {
+            MenuKind::Explorer { target } => {
+                self.apply_explorer_menu(action, target, sender);
+            }
+            MenuKind::Review { change_index } => {
+                self.selected = change_index;
+                self.apply_review_menu(action, service, sender);
+            }
+        }
+    }
+
+    fn apply_explorer_menu(
+        &mut self,
+        action: MenuAction,
+        target: Option<(PathBuf, bool, bool)>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        let root = self.explorer.cwd().to_path_buf();
+        let create_dir = target
+            .as_ref()
+            .map(|(path, is_dir, _)| {
+                if *is_dir {
+                    path.clone()
+                } else {
+                    path.parent().unwrap_or(&root).to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| root.clone());
+        match action {
+            MenuAction::NewFile => {
+                self.nav_overlay = NavOverlay::Prompt {
+                    title: "New file".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewFile(create_dir),
+                };
+            }
+            MenuAction::NewFolder => {
+                self.nav_overlay = NavOverlay::Prompt {
+                    title: "New folder".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewFolder(create_dir),
+                };
+            }
+            MenuAction::Rename => {
+                if let Some((path, _, _)) = target {
+                    if is_same_path(&path, &root) {
+                        self.status = "The workspace root cannot be renamed".to_owned();
+                        return;
+                    }
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.nav_overlay = NavOverlay::Prompt {
+                        title: "Rename".into(),
+                        input: name,
+                        kind: PromptKind::Rename { path },
+                    };
+                }
+            }
+            MenuAction::Delete => {
+                if let Some((path, is_dir, _)) = target {
+                    if is_same_path(&path, &root) {
+                        self.status = "The workspace root cannot be deleted".to_owned();
+                        return;
+                    }
+                    self.nav_overlay = NavOverlay::ConfirmDelete { path, is_dir };
+                }
+            }
+            MenuAction::CopyPath => {
+                if let Some((path, _, _)) = target {
+                    self.copy_status(&path.display().to_string());
+                }
+            }
+            MenuAction::CopyRelativePath => {
+                if let Some((path, _, _)) = target {
+                    self.copy_status(&relative_path_text(&root, &path));
+                }
+            }
+            MenuAction::OpenExternal => {
+                if let Some((path, _, _)) = target {
+                    match open_with_default_app(&path) {
+                        Ok(()) => self.status = format!("Opened {}", path.display()),
+                        Err(error) => self.status = error,
+                    }
+                }
+            }
+            MenuAction::OpenDiff => {
+                self.open_selected_diff();
+            }
+            MenuAction::Reveal => {
+                let path = target
+                    .as_ref()
+                    .map(|(path, _, _)| path.as_path())
+                    .unwrap_or(&root);
+                actions::reveal(path);
+                self.status = format!("Revealed {}", path.display());
+            }
+            MenuAction::OpenChangelist | MenuAction::CopyChangelist | MenuAction::SubmitReview => {}
+        }
+        let _ = sender;
+    }
+
+    fn apply_review_menu<T: P4Transport + 'static>(
+        &mut self,
+        action: MenuAction,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        match action {
+            MenuAction::OpenChangelist => {
+                self.open_selected_changelist();
+            }
+            MenuAction::CopyChangelist => {
+                if let Some(change) = self.selected_changelist() {
+                    self.copy_status(&change.id.to_string());
+                }
+            }
+            MenuAction::Reveal => {
+                actions::reveal(&self.cwd);
+                self.status = format!("Revealed {}", self.cwd.display());
+            }
+            MenuAction::SubmitReview => {
+                let Some(change) = self
+                    .selected_changelist()
+                    .and_then(|change| match change.id {
+                        ChangelistId::Numbered(change) => Some(change),
+                        ChangelistId::Default => None,
+                    })
+                else {
+                    self.status = "Default changelist Submit is disabled".to_owned();
+                    return;
+                };
+                if let Some(request) = self.overlay.open(change) {
+                    self.issue_overlay_request(request, service, sender);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_prompt(&mut self, sender: &mpsc::Sender<PaneMessage>) {
+        let NavOverlay::Prompt { input, kind, .. } =
+            std::mem::replace(&mut self.nav_overlay, NavOverlay::Closed)
+        else {
+            return;
+        };
+        let Some(name) = validate_name(&input).map(str::to_owned) else {
+            self.status = "Enter a file name without path separators".to_owned();
+            return;
+        };
+        let result = match kind {
+            PromptKind::NewFile(dir) => actions::create_file(&dir, &name).map(|path| (dir, path)),
+            PromptKind::NewFolder(dir) => {
+                actions::create_folder(&dir, &name).map(|path| (dir, path))
+            }
+            PromptKind::Rename { path } => {
+                if is_same_path(&path, &self.cwd) {
+                    self.status = "The workspace root cannot be renamed".to_owned();
+                    return;
+                }
+                let parent = path.parent().unwrap_or(&self.cwd).to_path_buf();
+                actions::rename(&path, &name).map(|new_path| (parent, new_path))
+            }
+        };
+        match result {
+            Ok((parent, path)) => {
+                self.status = format!("Updated {}", path.display());
+                self.explorer.select_path(path);
+                self.reload_explorer_directory(parent, sender);
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn apply_delete(&mut self, path: &Path, is_dir: bool, sender: &mpsc::Sender<PaneMessage>) {
+        if is_same_path(path, &self.cwd) {
+            self.status = "The workspace root cannot be deleted".to_owned();
+            return;
+        }
+        match actions::delete(path, is_dir) {
+            Ok(()) => {
+                let parent = path.parent().unwrap_or(&self.cwd).to_path_buf();
+                self.status = format!("Deleted {}", path.display());
+                self.explorer.select_path(parent.clone());
+                self.reload_explorer_directory(parent, sender);
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn reload_explorer_directory(&mut self, path: PathBuf, sender: &mpsc::Sender<PaneMessage>) {
+        self.explorer.invalidate_directory(path);
+        self.apply_explorer_action(ExplorerAction::LoadDirectory, sender);
+    }
+
+    fn copy_status(&mut self, text: &str) {
+        match copy_to_clipboard(text) {
+            Ok(()) => self.status = "Copied to clipboard".to_owned(),
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+}
+
+fn format_changelist_row(selected: bool, change: &Changelist) -> String {
+    let marker = if selected { ">" } else { " " };
+    let description = change
+        .description
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("<no description>")
+        .trim();
+    format!(
+        "{marker} CL {}  {}  {description}",
+        change.id,
+        change.status.canonical_name()
+    )
+}
+
+fn menu_popup_rect(x: u16, y: u16, entries: &[MenuEntry], width: u16, height: u16) -> Rect {
+    let label_width = entries
+        .iter()
+        .map(|entry| match entry {
+            MenuEntry::Action(_, label) => display_width(label),
+            MenuEntry::Separator => 0,
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    let popup_width = (label_width.saturating_add(4)).min(width).max(8);
+    let popup_height = (entries.len() as u16).saturating_add(2).min(height).max(3);
+    let px = x.min(width.saturating_sub(popup_width));
+    let py = y.saturating_add(1).min(height.saturating_sub(popup_height));
+    Rect::area(px, py, popup_width, popup_height)
+}
+
+fn menu_index_at(rect: Rect, x: u16, y: u16, len: usize, offset: usize) -> Option<usize> {
+    if !rect.contains(x, y) {
+        return None;
+    }
+    if y <= rect.y || y >= rect.y.saturating_add(rect.height.max(1)).saturating_sub(1) {
+        return None;
+    }
+    let index = offset + usize::from(y.saturating_sub(rect.y.saturating_add(1)));
+    (index < len).then_some(index)
 }
 
 fn apply_message_effect(
@@ -889,11 +1701,34 @@ struct Rect {
     x: u16,
     y: u16,
     width: u16,
+    height: u16,
 }
 
 impl Rect {
+    fn row(x: u16, y: u16, width: u16) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height: 1,
+        }
+    }
+
+    fn area(x: u16, y: u16, width: u16, height: u16) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
     fn contains(self, x: u16, y: u16) -> bool {
-        y == self.y && x >= self.x && x < self.x.saturating_add(self.width)
+        let height = self.height.max(1);
+        y >= self.y
+            && y < self.y.saturating_add(height)
+            && x >= self.x
+            && x < self.x.saturating_add(self.width)
     }
 }
 
@@ -924,20 +1759,17 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         hits: HitTargets::default(),
     };
     render_view_tabs(&mut frame, pane.view, width);
-    put(
-        &mut frame.lines,
-        0,
-        1,
-        &format!("Workspace path: {}", pane.cwd.display()),
-    );
+    render_header(&mut frame, pane, width);
 
     match pane.view {
         PaneView::Explorer => render_explorer(&mut frame, pane, width, height),
         PaneView::Review => render_review(&mut frame, pane, width, height),
     }
     if height >= 1 {
-        put(&mut frame.lines, 0, height - 1, &pane.status);
+        put_display(&mut frame.lines, 0, height - 1, &pane.status);
     }
+
+    render_nav_overlay(&mut frame, pane, width, height);
 
     if !matches!(pane.overlay.state(), SubmitOverlayState::Closed) {
         render_overlay(
@@ -949,71 +1781,75 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         );
     }
     for line in &mut frame.lines {
-        *line = truncate_and_pad(line, width);
+        *line = pad_display(line, width);
     }
     frame
 }
 
 fn render_view_tabs(frame: &mut RenderedFrame, view: PaneView, _width: usize) {
-    let prefix = "Herdr Perforce  ";
     let explorer = if view == PaneView::Explorer {
-        "[1 Explorer]"
+        "▸ [📁 Explorer]"
     } else {
-        " 1 Explorer "
+        "  📁 Explorer "
     };
     let review = if view == PaneView::Review {
-        "[2 Review]"
+        "▸ [P4 Review]"
     } else {
-        " 2 Review "
+        "  P4 Review "
     };
-    put(
-        &mut frame.lines,
+    let gap = "  ";
+    put_display(&mut frame.lines, 0, 0, &format!("{explorer}{gap}{review}"));
+    let explorer_width = display_width(explorer) as u16;
+    frame.hits.view_explorer = Some(Rect::row(0, 0, explorer_width));
+    frame.hits.view_review = Some(Rect::row(
+        explorer_width + display_width(gap) as u16,
         0,
-        0,
-        &format!("{prefix}{explorer}  {review}"),
-    );
-    let explorer_x = prefix.chars().count() as u16;
-    let explorer_width = explorer.chars().count() as u16;
-    frame.hits.view_explorer = Some(Rect {
-        x: explorer_x,
-        y: 0,
-        width: explorer_width,
-    });
-    frame.hits.view_review = Some(Rect {
-        x: explorer_x + explorer_width + 2,
-        y: 0,
-        width: review.chars().count() as u16,
-    });
+        display_width(review) as u16,
+    ));
+}
+
+fn render_header(frame: &mut RenderedFrame, pane: &PaneModel, _width: usize) {
+    let header = match pane.view {
+        PaneView::Explorer => pane
+            .cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| pane.cwd.display().to_string())
+            .to_uppercase(),
+        PaneView::Review => match &pane.overview {
+            OverviewState::Ready(overview) => {
+                format!("{} · {}", overview.identity.client, overview.identity.user)
+            }
+            OverviewState::Loading => "Loading workspace…".to_owned(),
+            OverviewState::Failed(_) => "Workspace unavailable".to_owned(),
+        },
+    };
+    put_display(&mut frame.lines, 1, 1, &header);
 }
 
 fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
+    if height >= 2 {
+        put_display(&mut frame.lines, 0, height - 2, review_help(pane));
+    }
     match &pane.overview {
-        OverviewState::Loading => put(&mut frame.lines, 0, 3, "Loading changelists..."),
+        OverviewState::Loading => put_display(&mut frame.lines, 0, 2, "Loading changelists..."),
         OverviewState::Failed(message) => {
-            put(&mut frame.lines, 0, 3, "Workspace refresh failed");
-            put(&mut frame.lines, 0, 4, message);
-            put(
-                &mut frame.lines,
-                0,
-                6,
-                "r: retry read-only refresh   q: close pane",
-            );
+            put_display(&mut frame.lines, 0, 2, "Workspace refresh failed");
+            put_display(&mut frame.lines, 0, 3, message);
         }
         OverviewState::Ready(overview) => {
-            put(
-                &mut frame.lines,
-                0,
-                3,
-                &format!(
-                    "Client: {}   User: {}",
-                    overview.identity.client, overview.identity.user
-                ),
-            );
-            put(&mut frame.lines, 0, 5, "Pending changelists");
-            let available_rows = height.saturating_sub(9);
-            let (offset, visible) =
-                changelist_window(pane.selected, overview.changes.len(), available_rows);
+            let body_top = 2;
+            let body_height = height.saturating_sub(NAV_CHROME_ROWS);
+            if body_height == 0 {
+                return;
+            }
+            let offset = pane.review_offset(body_height);
+            let visible = body_height.min(overview.changes.len().saturating_sub(offset));
             frame.hits.changelist_offset = offset;
+            let text_width = width.saturating_sub(1);
+            let max_scroll_x = pane.review_content_width().saturating_sub(text_width);
+            let scroll_x = pane.review_scroll_x.min(max_scroll_x);
             for (visible_index, change) in overview
                 .changes
                 .iter()
@@ -1022,81 +1858,55 @@ fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, heig
                 .enumerate()
             {
                 let index = offset + visible_index;
-                let row = 6 + visible_index;
-                let marker = if index == pane.selected { ">" } else { " " };
-                let description = change
-                    .description
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("<no description>")
-                    .trim();
-                put(
-                    &mut frame.lines,
-                    0,
-                    row,
-                    &format!(
-                        "{marker} CL {}  {}  {description}",
-                        change.id,
-                        change.status.canonical_name()
-                    ),
-                );
-                frame.hits.changelists.push(Rect {
-                    x: 0,
-                    y: row as u16,
-                    width: width as u16,
-                });
+                let row = body_top + visible_index;
+                let line = format_changelist_row(index == pane.selected, change);
+                let shown = slice_display(&line, scroll_x, text_width);
+                put_display(&mut frame.lines, 0, row, &shown);
+                frame
+                    .hits
+                    .changelists
+                    .push(Rect::row(0, row as u16, text_width as u16));
             }
-            if height >= 2 {
-                put(
-                    &mut frame.lines,
-                    0,
-                    height - 2,
-                    "1/2: views   Enter: files   j/k: select   s: Submit review   r: refresh   q: close",
-                );
-            }
+            draw_scrollbar(
+                &mut frame.lines,
+                width.saturating_sub(1),
+                body_top,
+                body_height,
+                overview.changes.len(),
+                body_height,
+                offset,
+            );
         }
     }
 }
 
 fn render_explorer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
     if height >= 2 {
-        put(&mut frame.lines, 0, height - 2, explorer_help(pane));
+        put_display(&mut frame.lines, 0, height - 2, explorer_help(pane));
     }
     match pane.explorer.load_state() {
         ExplorerLoadState::Idle | ExplorerLoadState::Checking => {
-            put(&mut frame.lines, 0, 3, "Loading workspace files...");
+            put_display(&mut frame.lines, 0, 2, "Loading workspace files...");
         }
         ExplorerLoadState::NotInClientView => {
-            put(
+            put_display(
                 &mut frame.lines,
                 0,
-                3,
+                2,
                 "Workspace is not in the current client view",
             );
-            put(&mut frame.lines, 0, 5, connection_message());
+            put_display(&mut frame.lines, 0, 3, connection_message());
         }
         ExplorerLoadState::Failed(message) => {
-            put(&mut frame.lines, 0, 3, "Explorer refresh failed");
-            put(&mut frame.lines, 0, 4, message);
+            put_display(&mut frame.lines, 0, 2, "Explorer refresh failed");
+            put_display(&mut frame.lines, 0, 3, message);
         }
         ExplorerLoadState::Ready => {
-            if let OverviewState::Ready(overview) = &pane.overview {
-                put(
-                    &mut frame.lines,
-                    0,
-                    3,
-                    &format!(
-                        "Client: {}   User: {}",
-                        overview.identity.client, overview.identity.user
-                    ),
-                );
-            }
-            let body_top = 5;
-            let body_bottom = height.saturating_sub(2);
-            if body_bottom <= body_top {
+            let body_top = 2;
+            let body_height = height.saturating_sub(NAV_CHROME_ROWS);
+            if body_height == 0 {
                 return;
             }
-            let body_height = body_bottom - body_top;
             render_tree_column(frame, pane, 0, body_top, width, body_height);
         }
     }
@@ -1104,10 +1914,14 @@ fn render_explorer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, he
 
 fn explorer_help(pane: &PaneModel) -> &'static str {
     if pane.explorer.jump_target().is_some() {
-        "1/2: views   Enter: file   d: diff   j/k: select   o: external   r: refresh   q: close"
+        "1/2 views  m menu  Enter file  d diff  wheel/drag scroll  r refresh  q close"
     } else {
-        "1/2: views   Enter: file   j/k: select   o: external   r: refresh   q: close"
+        "1/2 views  m menu  Enter file  wheel/drag scroll  r refresh  q close"
     }
+}
+
+fn review_help(_pane: &PaneModel) -> &'static str {
+    "1/2 views  m menu  Enter files  s Submit  wheel/drag scroll  r refresh  q close"
 }
 
 fn render_tree_column(
@@ -1121,39 +1935,144 @@ fn render_tree_column(
     if height == 0 || width == 0 {
         return;
     }
-    put_clipped(&mut frame.lines, x, y, "> Files", width);
-    let (offset, visible, rows) = pane.explorer.tree_window(height.saturating_sub(1));
+    let text_width = width.saturating_sub(1);
+    let (offset, visible, rows) = pane.explorer.tree_window(height);
     frame.hits.explorer_offset = offset;
     let selected = pane.explorer.selected_path();
+    let content_width = rows
+        .iter()
+        .map(|row| {
+            display_width(&ExplorerModel::format_row(
+                row,
+                selected.is_some_and(|path| path == row.path),
+            ))
+        })
+        .max()
+        .unwrap_or(0);
+    let scroll_x = pane
+        .explorer
+        .scroll_x()
+        .min(content_width.saturating_sub(text_width));
     for (visible_index, row) in rows.iter().skip(offset).take(visible).enumerate() {
-        let screen_row = y + 1 + visible_index;
-        let caret = if selected.is_some_and(|path| path == row.path) {
-            ">"
+        let screen_row = y + visible_index;
+        let line = ExplorerModel::format_row(row, selected.is_some_and(|path| path == row.path));
+        let shown = slice_display(&line, scroll_x, text_width);
+        put_display(&mut frame.lines, x, screen_row, &shown);
+        frame
+            .hits
+            .explorer_rows
+            .push(Rect::row(x as u16, screen_row as u16, text_width as u16));
+    }
+    draw_scrollbar(
+        &mut frame.lines,
+        width.saturating_sub(1),
+        y,
+        height,
+        rows.len(),
+        height,
+        offset,
+    );
+}
+
+fn draw_scrollbar(
+    lines: &mut [String],
+    x: usize,
+    y: usize,
+    height: usize,
+    total: usize,
+    viewport: usize,
+    pos: usize,
+) {
+    if total <= viewport || height == 0 {
+        return;
+    }
+    let thumb = ((viewport * height) / total).max(1).min(height);
+    let travel = height.saturating_sub(thumb);
+    let max_pos = total.saturating_sub(viewport);
+    let thumb_pos = (pos * travel).checked_div(max_pos).unwrap_or(0);
+    for row in 0..height {
+        let glyph = if row >= thumb_pos && row < thumb_pos + thumb {
+            "┃"
         } else {
-            " "
+            "│"
         };
-        let glyph = match row.kind {
-            crate::domain::ExplorerEntryKind::Directory if row.expanded => "📂",
-            crate::domain::ExplorerEntryKind::Directory => "📁",
-            crate::domain::ExplorerEntryKind::File => "📄",
-        };
-        let indent = "  ".repeat(row.depth);
-        let badge = row
-            .decoration
-            .as_ref()
-            .map(|decoration| decoration.badge())
-            .unwrap_or("");
-        let line = if badge.is_empty() {
-            format!("{caret}{indent}{glyph} {}", row.name)
-        } else {
-            format!("{caret}{indent}{glyph} {}  {badge}", row.name)
-        };
-        put_clipped(&mut frame.lines, x, screen_row, &line, width);
-        frame.hits.explorer_rows.push(Rect {
-            x: x as u16,
-            y: screen_row as u16,
-            width: width as u16,
-        });
+        put_display(lines, x, y + row, glyph);
+    }
+}
+
+fn render_nav_overlay(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
+    match &pane.nav_overlay {
+        NavOverlay::Closed => {}
+        NavOverlay::Menu {
+            x,
+            y,
+            entries,
+            selected,
+            ..
+        } => {
+            let rect = menu_popup_rect(*x, *y, entries, width as u16, height as u16);
+            let inner_width = rect.width.saturating_sub(2) as usize;
+            let inner_height = usize::from(rect.height.saturating_sub(2));
+            let offset = menu_window(*selected, entries.len(), inner_height);
+            let horizontal = "─".repeat(inner_width.max(1));
+            put_display(
+                &mut frame.lines,
+                rect.x as usize,
+                rect.y as usize,
+                &format!("┌{horizontal}┐"),
+            );
+            for (visible_index, (index, entry)) in entries
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(inner_height)
+                .enumerate()
+            {
+                let row = rect.y as usize + 1 + visible_index;
+                let content = match entry {
+                    MenuEntry::Separator => "─".repeat(inner_width.max(1)),
+                    MenuEntry::Action(_, label) => {
+                        let marker = if index == *selected { ">" } else { " " };
+                        format!("{marker} {label}")
+                    }
+                };
+                put_display(
+                    &mut frame.lines,
+                    rect.x as usize,
+                    row,
+                    &format!("│{}│", pad_display(&content, inner_width)),
+                );
+            }
+            let bottom = rect.y.saturating_add(rect.height).saturating_sub(1) as usize;
+            if bottom < height {
+                put_display(
+                    &mut frame.lines,
+                    rect.x as usize,
+                    bottom,
+                    &format!("└{horizontal}┘"),
+                );
+            }
+        }
+        NavOverlay::Prompt { title, input, .. } => {
+            put_display(
+                &mut frame.lines,
+                0,
+                height.saturating_sub(2),
+                &format!(" {title}: {input}█  (Enter ok · Esc cancel)"),
+            );
+        }
+        NavOverlay::ConfirmDelete { path, .. } => {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            put_display(
+                &mut frame.lines,
+                0,
+                height.saturating_sub(2),
+                &format!(" Delete '{name}' permanently? (y/N)"),
+            );
+        }
     }
 }
 
@@ -1289,16 +2208,16 @@ fn render_overlay(
             let submit_x = x + cancel_text.len() + 3;
             put(&mut frame.lines, cancel_x, button_row, cancel_text);
             put(&mut frame.lines, submit_x, button_row, submit_text);
-            frame.hits.cancel = Some(Rect {
-                x: cancel_x as u16,
-                y: button_row as u16,
-                width: cancel_text.len() as u16,
-            });
-            frame.hits.submit = Some(Rect {
-                x: submit_x as u16,
-                y: button_row as u16,
-                width: submit_text.len() as u16,
-            });
+            frame.hits.cancel = Some(Rect::row(
+                cancel_x as u16,
+                button_row as u16,
+                cancel_text.len() as u16,
+            ));
+            frame.hits.submit = Some(Rect::row(
+                submit_x as u16,
+                button_row as u16,
+                submit_text.len() as u16,
+            ));
         }
         SubmitOverlayState::Running { change, .. } => {
             put(
@@ -1374,19 +2293,15 @@ fn render_overlay(
                 x
             } else {
                 put(&mut frame.lines, x, button_row, "[Close]");
-                frame.hits.cancel = Some(Rect {
-                    x: x as u16,
-                    y: button_row as u16,
-                    width: 7,
-                });
+                frame.hits.cancel = Some(Rect::row(x as u16, button_row as u16, 7));
                 x + 10
             };
             put(&mut frame.lines, refresh_x, button_row, refresh_text);
-            frame.hits.refresh = Some(Rect {
-                x: refresh_x as u16,
-                y: button_row as u16,
-                width: refresh_text.len() as u16,
-            });
+            frame.hits.refresh = Some(Rect::row(
+                refresh_x as u16,
+                button_row as u16,
+                refresh_text.len() as u16,
+            ));
         }
         SubmitOverlayState::Success { result, reconciled } => {
             put(&mut frame.lines, x, top + 2, "Submit confirmed");
@@ -1413,6 +2328,7 @@ fn render_overlay(
     }
 }
 
+#[allow(dead_code)]
 fn changelist_window(selected: usize, count: usize, visible_rows: usize) -> (usize, usize) {
     if visible_rows == 0 || count == 0 {
         return (0, 0);
@@ -1449,9 +2365,11 @@ fn action_summary(actions: &crate::p4::SubmitActionCounts) -> String {
     }
 }
 
-fn put_clipped(lines: &mut [String], column: usize, row: usize, value: &str, width: usize) {
-    let clipped: String = value.chars().take(width).collect();
-    put(lines, column, row, &clipped);
+fn put_display(lines: &mut [String], column: usize, row: usize, value: &str) {
+    let Some(line) = lines.get_mut(row) else {
+        return;
+    };
+    *line = splice_display(line, column, value);
 }
 
 fn put(lines: &mut [String], column: usize, row: usize, value: &str) {
@@ -1469,6 +2387,7 @@ fn put(lines: &mut [String], column: usize, row: usize, value: &str) {
     *line = characters.into_iter().collect();
 }
 
+#[allow(dead_code)]
 fn truncate_and_pad(value: &str, width: usize) -> String {
     let mut output = truncate_chars(value, width);
     let count = output.chars().count();
@@ -1541,11 +2460,22 @@ mod tests {
     }
 
     #[test]
-    fn pane_snapshot_keeps_submit_as_review_not_direct_write() {
+    fn pane_opens_on_file_explorer() {
         let pane = pane_with_changes();
+        assert_eq!(pane.view, PaneView::Explorer);
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("Explorer"));
+        assert!(rendered.contains("▸ [📁 Explorer]"));
+        assert!(!rendered.contains("CL 42  pending"));
+    }
+
+    #[test]
+    fn pane_snapshot_keeps_submit_as_review_not_direct_write() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
         let frame = render_frame(&pane, 80, 24);
         let rendered = frame.lines.join("\n");
-        assert!(rendered.contains("s: Submit review"));
+        assert!(rendered.contains("Submit"));
         assert!(rendered.contains("CL 42  pending  Fix submit overlay"));
         assert!(!rendered.contains("p4 submit -c"));
     }
@@ -1577,7 +2507,7 @@ mod tests {
         let pane = pane_with_changes();
         let frame = render_frame(&pane, 20, 5);
         assert_eq!(frame.lines.len(), 5);
-        assert!(frame.lines.iter().all(|line| line.chars().count() == 20));
+        assert!(frame.lines.iter().all(|line| display_width(line) == 20));
     }
 
     fn sample_changelist(id: u64, description: &str) -> Changelist {
@@ -1628,6 +2558,7 @@ mod tests {
     #[test]
     fn key_release_does_not_move_the_changelist_selection() {
         let mut pane = pane_with_numbered_changes(3);
+        pane.view = PaneView::Review;
         dispatch_key(
             &mut pane,
             KeyEvent::new_with_kind(
@@ -1646,14 +2577,15 @@ mod tests {
 
     #[test]
     fn selected_changelist_stays_in_the_visible_window() {
-        let mut pane = pane_with_numbered_changes(20);
-        pane.selected = 19;
+        let mut pane = pane_with_numbered_changes(40);
+        pane.view = PaneView::Review;
+        pane.selected = 39;
         let frame = render_frame(&pane, 80, 24);
         let rendered = frame.lines.join("\n");
-        assert!(rendered.contains("> CL 20"));
+        assert!(rendered.contains("> CL 40"));
         assert!(!rendered.contains("CL 1  pending"));
-        assert_eq!(frame.hits.changelist_offset, 5);
-        assert_eq!(frame.hits.changelists.len(), 15);
+        assert_eq!(frame.hits.changelist_offset, 20);
+        assert_eq!(frame.hits.changelists.len(), 20);
     }
 
     #[test]
@@ -1843,7 +2775,7 @@ mod tests {
         assert_eq!(pane.view, PaneView::Explorer);
         assert!(pane.status.contains("HERDR_PANE_ID"));
         let rendered = render_frame(&pane, 80, 24).lines.join("\n");
-        assert!(rendered.contains("[1 Explorer]"));
+        assert!(rendered.contains("Explorer"));
         assert!(rendered.contains("Foo.cpp"));
         assert!(!rendered.contains("File diff:"));
     }
@@ -1856,7 +2788,7 @@ mod tests {
             .install_not_in_view(pane.explorer.generation());
         let frame = render_frame(&pane, 80, 24);
         let rendered = frame.lines.join("\n");
-        assert!(rendered.contains("[1 Explorer]"));
+        assert!(rendered.contains("Explorer"));
         assert!(rendered.contains("not in the current client view"));
         assert!(frame.hits.explorer_rows.is_empty());
         assert!(!rendered.contains("p4 add"));
@@ -1896,7 +2828,7 @@ mod tests {
             });
         pane.view = PaneView::Explorer;
         let rendered = render_frame(&pane, 100, 24).lines.join("\n");
-        assert!(rendered.contains("[1 Explorer]"));
+        assert!(rendered.contains("Explorer"));
         assert!(rendered.contains("Foo.cpp"));
         assert!(rendered.contains("src"));
         assert!(rendered.contains("📂"));
@@ -1929,5 +2861,166 @@ mod tests {
             panic!("overview should stay ready");
         };
         assert_eq!(overview.changes[0].id, ChangelistId::Numbered(42));
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn dispatch_mouse(pane: &mut PaneModel, event: MouseEvent) {
+        let service = Arc::new(P4WriteService::new(
+            P4Client::new_with_directory_environment(
+                crate::p4::fake::FakeP4Transport::default(),
+                "p4",
+                &pane.cwd,
+                Default::default(),
+            ),
+        ));
+        let (sender, _receiver) = mpsc::channel();
+        pane.set_nav_size(80, 24);
+        let frame = render_frame(pane, 80, 24);
+        pane.handle_mouse(event, &frame.hits, &service, &sender);
+    }
+
+    #[test]
+    fn keyboard_m_opens_explorer_context_menu() {
+        let mut pane = pane_with_changes();
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: PathBuf::from("C:/Example Workspace"),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "Foo.cpp".into(),
+                    path: PathBuf::from("C:/Example Workspace/Foo.cpp"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: None,
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        pane.explorer.select_index(1);
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("Copy Path"));
+        assert!(rendered.contains("Rename"));
+        assert!(rendered.contains("Reveal in File Explorer"));
+        assert!(!rendered.contains("p4 add"));
+    }
+
+    #[test]
+    fn workspace_root_menu_omits_destructive_actions() {
+        let mut pane = pane_with_changes();
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: PathBuf::from("C:/Example Workspace"),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "Foo.cpp".into(),
+                    path: PathBuf::from("C:/Example Workspace/Foo.cpp"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: None,
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("New File"));
+        assert!(rendered.contains("Reveal in File Explorer"));
+        assert!(!rendered.contains("Rename"));
+        assert!(!rendered.contains("Delete"));
+    }
+
+    #[test]
+    fn review_wheel_keeps_the_visible_offset() {
+        let mut pane = pane_with_numbered_changes(40);
+        pane.view = PaneView::Review;
+        pane.selected = 25;
+        pane.set_nav_size(80, 24);
+        let before = render_frame(&pane, 80, 24).hits.changelist_offset;
+        assert_eq!(before, 6);
+        dispatch_mouse(&mut pane, mouse(MouseEventKind::ScrollDown, 2, 8));
+        let after = render_frame(&pane, 80, 24).hits.changelist_offset;
+        assert_eq!(after, before + 3);
+    }
+
+    #[test]
+    fn explorer_wheel_scrolls_without_changing_selection() {
+        let mut pane = pane_with_changes();
+        let root = PathBuf::from("C:/Example Workspace");
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: root.clone(),
+                entries: (0..40)
+                    .map(|index| crate::domain::ExplorerEntry {
+                        name: format!("file-{index:02}.txt"),
+                        path: root.join(format!("file-{index:02}.txt")),
+                        kind: crate::domain::ExplorerEntryKind::File,
+                        decoration: None,
+                        file_type: Some(crate::domain::FileType::new("text")),
+                        have_rev: Some(1),
+                        head_rev: Some(1),
+                    })
+                    .collect(),
+                truncated: false,
+            });
+        pane.set_nav_size(80, 24);
+        let selected = pane.explorer.selected_path().map(Path::to_path_buf);
+        let before = render_frame(&pane, 80, 24).hits.explorer_offset;
+        dispatch_mouse(&mut pane, mouse(MouseEventKind::ScrollDown, 2, 8));
+        let after = render_frame(&pane, 80, 24);
+        assert_eq!(pane.explorer.selected_path(), selected.as_deref());
+        assert!(after.hits.explorer_offset > before);
+        assert!(after.lines.join("\n").contains("file-10.txt"));
+    }
+
+    #[test]
+    fn explorer_rows_stay_single_line_and_pan_horizontally() {
+        let mut pane = pane_with_changes();
+        let long_name = "very-long-source-file-name-that-cannot-fit.cpp";
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: PathBuf::from("C:/Example Workspace"),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: long_name.into(),
+                    path: PathBuf::from("C:/Example Workspace").join(long_name),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: None,
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        pane.set_nav_size(24, 16);
+        let clipped = render_frame(&pane, 24, 16);
+        assert!(clipped.lines.iter().all(|line| !line.contains('\n')));
+        assert!(clipped.lines.iter().any(|line| line.contains("very-long")));
+        assert!(
+            !clipped
+                .lines
+                .iter()
+                .any(|line| line.contains("cannot-fit.cpp"))
+        );
+        pane.explorer.set_scroll_x(32, 23, 80);
+        let panned = render_frame(&pane, 24, 16).lines.join("\n");
+        assert!(
+            panned.contains("cannot-fit")
+                || panned.contains("fit.cpp")
+                || panned.contains("that-cannot")
+        );
     }
 }

@@ -5,8 +5,8 @@ mod freshness;
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 pub use diff::{
-    DEFAULT_FOLD_CONTEXT, FileDiff, FileDiffKind, FoldRange, IntraSpan, MAX_FOLD_CONTEXT,
-    OverlayKind, OverlayLine, build_file_diff,
+    DEFAULT_FOLD_CONTEXT, EXPAND_CHUNK, FileDiff, FileDiffKind, FoldRange, IntraSpan,
+    MAX_FOLD_CONTEXT, MIN_FOLD_HIDDEN, OverlayKind, OverlayLine, build_file_diff,
 };
 pub use explorer::{
     ExplorerDecoration, ExplorerEntry, ExplorerEntryKind, FileP4Facts, MAX_DIRECTORY_ENTRIES,

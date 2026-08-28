@@ -792,7 +792,7 @@ enum Document {
     Diff {
         title: String,
         context: String,
-        view: DiffViewState,
+        view: Box<DiffViewState>,
         back: Option<ContentRequest>,
     },
     Changelist {
@@ -1097,10 +1097,10 @@ impl ViewerState {
         let visual = self
             .scroll_y
             .saturating_add(row.saturating_sub(header) as usize);
-        let Some(fold_id) = view.fold_at_visual_row(visual, self.body_width.max(1)) else {
+        let Some(edge) = view.fold_at_visual_row(visual, self.body_width.max(1)) else {
             return false;
         };
-        view.expand_fold(fold_id);
+        view.expand_edge(edge.id, edge.direction);
         self.clamp_scroll();
         true
     }
@@ -1331,7 +1331,7 @@ fn diff_document(
             Document::Diff {
                 title,
                 context,
-                view: DiffViewState::new(filename(path), model, truncated),
+                view: Box::new(DiffViewState::new(filename(path), model, truncated)),
                 back,
             }
         }
@@ -1569,9 +1569,9 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     let footer = match &state.document {
         Document::Changelist { .. } => "↑↓/wheel: select   Enter: diff   q/Esc: close",
         Document::Diff { back: Some(_), .. } => {
-            "[/]: hunk   e: folds   click fold: expand   Esc: back   q: close"
+            "[/]: hunk   e: folds   click ▲/▼: +20   Esc: back   q: close"
         }
-        Document::Diff { .. } => "[/]: hunk   e: folds   click fold: expand   q/Esc: close",
+        Document::Diff { .. } => "[/]: hunk   e: folds   click ▲/▼: +20   q/Esc: close",
         Document::Text { back: Some(_), .. } => {
             "↑↓/wheel: scroll   PgUp/PgDn: page   Esc: back   q: close"
         }

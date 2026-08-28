@@ -49,6 +49,9 @@ pub struct ExplorerModel {
     pending_load: Option<PathBuf>,
     jump: Option<(ChangelistId, PathBuf, FileAction)>,
     restore_selected: Option<PathBuf>,
+    scroll_y: usize,
+    scroll_x: usize,
+    follow_selection: bool,
 }
 
 impl ExplorerModel {
@@ -66,7 +69,20 @@ impl ExplorerModel {
             pending_load: None,
             jump: None,
             restore_selected: None,
+            scroll_y: 0,
+            scroll_x: 0,
+            follow_selection: true,
         }
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    #[must_use]
+    pub fn scroll_x(&self) -> usize {
+        self.scroll_x
     }
 
     #[must_use]
@@ -281,6 +297,7 @@ impl ExplorerModel {
             index.saturating_add(delta as usize).min(rows.len() - 1)
         };
         self.selected = Some(rows[next].path.clone());
+        self.follow_selection = true;
         self.update_jump();
     }
 
@@ -370,13 +387,88 @@ impl ExplorerModel {
         if visible_rows == 0 || rows.is_empty() {
             return (0, 0, rows);
         }
-        let selected = self.selected_index(&rows);
         let height = visible_rows.min(rows.len());
-        let offset = selected
-            .saturating_add(1)
-            .saturating_sub(height)
-            .min(rows.len().saturating_sub(height));
+        let max_offset = rows.len().saturating_sub(height);
+        let offset = if self.follow_selection {
+            self.selected_index(&rows)
+                .saturating_add(1)
+                .saturating_sub(height)
+                .min(max_offset)
+        } else {
+            self.scroll_y.min(max_offset)
+        };
         (offset, height, rows)
+    }
+
+    pub fn scroll_vertical(&mut self, delta: isize, visible_rows: usize) {
+        let (offset, _, rows) = self.tree_window(visible_rows);
+        if rows.is_empty() || visible_rows == 0 {
+            return;
+        }
+        let max_offset = rows.len().saturating_sub(visible_rows.min(rows.len()));
+        self.follow_selection = false;
+        self.scroll_y = (offset as isize + delta).clamp(0, max_offset as isize) as usize;
+    }
+
+    pub fn set_scroll_x(&mut self, value: usize, view_width: usize, content_width: usize) {
+        self.scroll_x = value.min(content_width.saturating_sub(view_width));
+    }
+
+    pub fn set_scroll_y(&mut self, value: usize, visible_rows: usize) {
+        let rows = self.visible_rows();
+        if rows.is_empty() || visible_rows == 0 {
+            self.scroll_y = 0;
+            self.follow_selection = false;
+            return;
+        }
+        let max_offset = rows.len().saturating_sub(visible_rows.min(rows.len()));
+        self.follow_selection = false;
+        self.scroll_y = value.min(max_offset);
+    }
+
+    pub fn selected_row_info(&self) -> Option<(PathBuf, ExplorerEntryKind, bool)> {
+        let rows = self.visible_rows();
+        let row = self.selected_row(&rows)?;
+        let opened = matches!(row.decoration, Some(ExplorerDecoration::Opened { .. }));
+        Some((row.path.clone(), row.kind, opened))
+    }
+
+    pub fn select_path(&mut self, path: PathBuf) {
+        self.selected = Some(path);
+        self.follow_selection = true;
+        self.update_jump();
+    }
+
+    pub fn invalidate_directory(&mut self, path: PathBuf) {
+        self.listings
+            .retain(|listed, _| listed != &path && !listed.starts_with(&path));
+        self.expanded
+            .retain(|listed| listed != &path && !listed.starts_with(&path));
+        if path == self.cwd {
+            self.expanded.insert(self.cwd.clone());
+        }
+        self.pending_load = Some(path);
+    }
+
+    #[must_use]
+    pub fn format_row(row: &VisibleExplorerRow, selected: bool) -> String {
+        let caret = if selected { ">" } else { " " };
+        let glyph = match row.kind {
+            ExplorerEntryKind::Directory if row.expanded => "📂",
+            ExplorerEntryKind::Directory => "📁",
+            ExplorerEntryKind::File => "📄",
+        };
+        let indent = "  ".repeat(row.depth);
+        let badge = row
+            .decoration
+            .as_ref()
+            .map(ExplorerDecoration::badge)
+            .unwrap_or("");
+        if badge.is_empty() {
+            format!("{caret}{indent}{glyph} {}", row.name)
+        } else {
+            format!("{caret}{indent}{glyph} {}  {badge}", row.name)
+        }
     }
 
     #[cfg(test)]
@@ -609,6 +701,54 @@ mod tests {
             }),
         );
         assert_eq!(explorer.selected_path(), Some(file.as_path()));
+    }
+
+    #[test]
+    fn wheel_scroll_does_not_move_selection() {
+        let root = PathBuf::from("C:/ws");
+        let mut explorer = ExplorerModel::new(root.clone());
+        let entries = (0..30)
+            .map(|index| file_entry(&root, &format!("file-{index:02}.txt"), None))
+            .collect();
+        explorer.install_ready_listing_for_test(LoadedDirectory {
+            path: root,
+            entries,
+            truncated: false,
+        });
+        let selected = explorer.selected_path().map(Path::to_path_buf);
+        let (before, _, _) = explorer.tree_window(8);
+        explorer.scroll_vertical(3, 8);
+        let (after, _, _) = explorer.tree_window(8);
+        assert_eq!(explorer.selected_path(), selected.as_deref());
+        assert_eq!(before, 0);
+        assert_eq!(after, 3);
+        explorer.move_selection(1);
+        let (followed, _, _) = explorer.tree_window(8);
+        assert_eq!(followed, 0);
+    }
+
+    #[test]
+    fn pointer_selection_keeps_manual_scroll() {
+        let root = PathBuf::from("C:/ws");
+        let mut explorer = ExplorerModel::new(root.clone());
+        let entries = (0..30)
+            .map(|index| file_entry(&root, &format!("file-{index:02}.txt"), None))
+            .collect();
+        explorer.install_ready_listing_for_test(LoadedDirectory {
+            path: root,
+            entries,
+            truncated: false,
+        });
+        explorer.scroll_vertical(3, 8);
+        explorer.select_index(3);
+        let (offset, _, _) = explorer.tree_window(8);
+        assert_eq!(offset, 3);
+        assert_eq!(
+            explorer.selected_path().and_then(|path| path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())),
+            Some("file-02.txt".into())
+        );
     }
 
     fn identity_for_test(root: &Path) -> WorkspaceIdentity {

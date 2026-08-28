@@ -10,7 +10,9 @@ pub const DEFAULT_FOLD_CONTEXT: usize = 5;
 /// Rejected above this in panel.json so a typo cannot disable folding forever.
 pub const MAX_FOLD_CONTEXT: usize = 200;
 /// Do not fold a run unless at least this many lines would actually be hidden.
-const MIN_FOLD_HIDDEN: usize = 4;
+pub const MIN_FOLD_HIDDEN: usize = 4;
+/// Extra unchanged lines revealed by one click on a hunk-adjacent expand row.
+pub const EXPAND_CHUNK: usize = 20;
 /// Bound the intra-line DP so a 2k-character minified line cannot explode memory.
 const MAX_INTRA_TOKENS: usize = 256;
 

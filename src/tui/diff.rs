@@ -4,21 +4,24 @@
 //! `+/-` live in the gutter, add/delete use muted full-line tints, and paired
 //! replacements highlight the changed tokens more brightly.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
-use crate::domain::{FileDiff, FoldRange, IntraSpan, OverlayKind, OverlayLine};
+use crate::domain::{
+    EXPAND_CHUNK, FileDiff, FoldRange, IntraSpan, MIN_FOLD_HIDDEN, OverlayKind, OverlayLine,
+};
 
 use super::{syntax, wrap};
 
 const ADD_LINE_BG: Color = Color::Rgb(33, 58, 43);
-const DEL_LINE_BG: Color = Color::Rgb(74, 34, 29);
+const DEL_LINE_BG: Color = Color::Rgb(110, 32, 38);
 const ADD_WORD_BG: Color = Color::Rgb(46, 104, 64);
-const DEL_WORD_BG: Color = Color::Rgb(122, 48, 42);
+const DEL_WORD_BG: Color = Color::Rgb(182, 48, 52);
+const DEL_FG: Color = Color::Rgb(255, 168, 168);
 const FOLD_FG: Color = Color::Rgb(125, 174, 199);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,9 +39,26 @@ pub(crate) struct ToolbarHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpandDirection {
+    /// Reveal more lines at the bottom of a hidden range (the splitter above a hunk).
+    Up,
+    /// Reveal more lines at the top of a hidden range (the splitter below a hunk).
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FoldEdge {
+    pub id: usize,
+    pub direction: ExpandDirection,
+    pub remaining: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VisibleItem {
     Line(usize),
-    Fold(FoldRange),
+    FoldEdge(FoldEdge),
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +68,8 @@ pub(crate) struct DiffViewState {
     pub current_hunk: usize,
     pub gutter_width: usize,
     pub truncated: Option<String>,
+    revealed_start: BTreeMap<usize, usize>,
+    revealed_end: BTreeMap<usize, usize>,
     highlighted: Option<Vec<Line<'static>>>,
 }
 
@@ -68,21 +90,82 @@ impl DiffViewState {
             current_hunk: 0,
             gutter_width: number_width + 2,
             truncated,
+            revealed_start: BTreeMap::new(),
+            revealed_end: BTreeMap::new(),
             highlighted,
         }
+    }
+
+    fn fold_reveal(&self, fold: &FoldRange) -> (usize, usize, usize) {
+        if self.expanded.contains(&fold.id) {
+            return (fold.hidden(), 0, 0);
+        }
+        let hidden = fold.hidden();
+        let from_start = self
+            .revealed_start
+            .get(&fold.id)
+            .copied()
+            .unwrap_or(0)
+            .min(hidden);
+        let from_end = self
+            .revealed_end
+            .get(&fold.id)
+            .copied()
+            .unwrap_or(0)
+            .min(hidden.saturating_sub(from_start));
+        (
+            from_start,
+            from_end,
+            hidden.saturating_sub(from_start + from_end),
+        )
     }
 
     pub(crate) fn visible_items(&self) -> Vec<VisibleItem> {
         let mut items = Vec::new();
         let mut index = 0;
-        while index < self.model.lines.len() {
-            if let Some(fold) = self
-                .model
-                .folds
-                .iter()
-                .find(|fold| fold.start == index && !self.expanded.contains(&fold.id))
-            {
-                items.push(VisibleItem::Fold(*fold));
+        let line_count = self.model.lines.len();
+        while index < line_count {
+            if let Some(fold) = self.model.folds.iter().find(|fold| fold.start == index) {
+                let (from_start, from_end, remaining) = self.fold_reveal(fold);
+                let remaining_start = fold.start + from_start;
+                let remaining_end = fold.end - from_end;
+                for line_index in fold.start..remaining_start {
+                    items.push(VisibleItem::Line(line_index));
+                }
+                if remaining > 0 {
+                    let show_down = remaining_start > 0;
+                    let show_up = remaining_end < line_count;
+                    if show_down {
+                        items.push(VisibleItem::FoldEdge(FoldEdge {
+                            id: fold.id,
+                            direction: ExpandDirection::Down,
+                            remaining,
+                            start: remaining_start,
+                            end: remaining_end,
+                        }));
+                    }
+                    if show_up {
+                        items.push(VisibleItem::FoldEdge(FoldEdge {
+                            id: fold.id,
+                            direction: ExpandDirection::Up,
+                            remaining,
+                            start: remaining_start,
+                            end: remaining_end,
+                        }));
+                    }
+                    if !show_down && !show_up {
+                        items.push(VisibleItem::FoldEdge(FoldEdge {
+                            id: fold.id,
+                            direction: ExpandDirection::Down,
+                            remaining,
+                            start: remaining_start,
+                            end: remaining_end,
+                        }));
+                    }
+                }
+                for line_index in remaining_end..fold.end {
+                    items.push(VisibleItem::Line(line_index));
+                }
                 index = fold.end;
                 continue;
             }
@@ -109,8 +192,8 @@ impl DiffViewState {
                         })
                         .cloned(),
                 ),
-                VisibleItem::Fold(fold) => {
-                    paint_fold_line(&self.model.lines, fold, self.gutter_width)
+                VisibleItem::FoldEdge(edge) => {
+                    paint_expand_line(&self.model.lines, edge, self.gutter_width)
                 }
             })
             .collect();
@@ -139,7 +222,7 @@ impl DiffViewState {
                 .model
                 .folds
                 .iter()
-                .all(|fold| self.expanded.contains(&fold.id))
+                .all(|fold| self.fold_reveal(fold).2 == 0)
     }
 
     pub(crate) fn toggle_folds(&mut self) {
@@ -148,13 +231,42 @@ impl DiffViewState {
         }
         if self.folds_all_expanded() {
             self.expanded.clear();
+            self.revealed_start.clear();
+            self.revealed_end.clear();
         } else {
             self.expanded = self.model.folds.iter().map(|fold| fold.id).collect();
+            self.revealed_start.clear();
+            self.revealed_end.clear();
         }
     }
 
     pub(crate) fn expand_fold(&mut self, id: usize) {
         self.expanded.insert(id);
+        self.revealed_start.remove(&id);
+        self.revealed_end.remove(&id);
+    }
+
+    pub(crate) fn expand_edge(&mut self, id: usize, direction: ExpandDirection) -> bool {
+        let Some(fold) = self.model.folds.iter().copied().find(|fold| fold.id == id) else {
+            return false;
+        };
+        let (mut from_start, mut from_end, remaining) = self.fold_reveal(&fold);
+        if remaining == 0 {
+            return false;
+        }
+        let chunk = EXPAND_CHUNK.min(remaining);
+        let leftover = remaining - chunk;
+        if leftover < MIN_FOLD_HIDDEN {
+            self.expand_fold(id);
+            return true;
+        }
+        match direction {
+            ExpandDirection::Down => from_start += chunk,
+            ExpandDirection::Up => from_end += chunk,
+        }
+        self.revealed_start.insert(id, from_start);
+        self.revealed_end.insert(id, from_end);
+        true
     }
 
     pub(crate) fn step_hunk(&mut self, delta: isize) -> bool {
@@ -188,11 +300,11 @@ impl DiffViewState {
                 VisibleItem::Line(index) => {
                     paint_overlay_line(&self.model.lines[index], self.gutter_width, None)
                 }
-                VisibleItem::Fold(fold) => {
-                    if overlay_index >= fold.start && overlay_index < fold.end {
+                VisibleItem::FoldEdge(edge) => {
+                    if overlay_index >= edge.start && overlay_index < edge.end {
                         return visual;
                     }
-                    paint_fold_line(&self.model.lines, fold, self.gutter_width)
+                    paint_expand_line(&self.model.lines, edge, self.gutter_width)
                 }
             };
             visual += wrap::wrap_line_with_gutter(&line, width.max(1), self.gutter_width).len();
@@ -200,22 +312,22 @@ impl DiffViewState {
         visual
     }
 
-    pub(crate) fn fold_at_visual_row(&self, visual_row: usize, width: usize) -> Option<usize> {
+    pub(crate) fn fold_at_visual_row(&self, visual_row: usize, width: usize) -> Option<FoldEdge> {
         let mut visual = 0;
         for item in self.visible_items() {
             let line = match item {
                 VisibleItem::Line(index) => {
                     paint_overlay_line(&self.model.lines[index], self.gutter_width, None)
                 }
-                VisibleItem::Fold(fold) => {
-                    paint_fold_line(&self.model.lines, fold, self.gutter_width)
+                VisibleItem::FoldEdge(edge) => {
+                    paint_expand_line(&self.model.lines, edge, self.gutter_width)
                 }
             };
             let height = wrap::wrap_line_with_gutter(&line, width.max(1), self.gutter_width).len();
             if visual_row >= visual && visual_row < visual + height {
                 return match item {
-                    VisibleItem::Fold(fold) if fold.expandable => Some(fold.id),
-                    _ => None,
+                    VisibleItem::FoldEdge(edge) => Some(edge),
+                    VisibleItem::Line(_) => None,
                 };
             }
             visual += height;
@@ -363,7 +475,7 @@ fn paint_overlay_line(
     let number_width = gutter_width.saturating_sub(2);
     let (sign, line_bg, sign_fg) = match line.kind {
         OverlayKind::Insert => ('+', Some(ADD_LINE_BG), Color::Green),
-        OverlayKind::Delete => ('-', Some(DEL_LINE_BG), Color::Red),
+        OverlayKind::Delete => ('-', Some(DEL_LINE_BG), DEL_FG),
         OverlayKind::Context => (' ', None, Color::DarkGray),
     };
     let gutter = format!("{number:>number_width$} {sign}");
@@ -387,33 +499,28 @@ fn paint_body(line: &OverlayLine, syntax_line: Option<Line<'static>>) -> Vec<Spa
         OverlayKind::Delete => Some(DEL_WORD_BG),
         OverlayKind::Context => None,
     };
-    let dim = line.kind == OverlayKind::Delete;
-    let syntax_spans = syntax_line.filter(|syntax| {
-        syntax
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-            == line.text
-    });
+    let syntax_spans = syntax_line
+        .filter(|_| line.kind != OverlayKind::Delete)
+        .filter(|syntax| {
+            syntax
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                == line.text
+        });
     let base = match syntax_spans {
         Some(syntax) => syntax.spans,
         None => vec![Span::styled(
             line.text.clone(),
             match line.kind {
                 OverlayKind::Insert => Style::default().fg(Color::Green),
-                OverlayKind::Delete => Style::default().fg(Color::Red),
+                OverlayKind::Delete => Style::default().fg(DEL_FG),
                 OverlayKind::Context => Style::default(),
             },
         )],
     };
-    let mut painted = apply_intra_spans(base, &line.intra, word_bg);
-    if dim {
-        for span in &mut painted {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        }
-    }
-    painted
+    apply_intra_spans(base, &line.intra, word_bg)
 }
 
 fn apply_intra_spans(
@@ -463,22 +570,29 @@ fn apply_intra_spans(
     output
 }
 
-fn paint_fold_line(lines: &[OverlayLine], fold: FoldRange, gutter_width: usize) -> Line<'static> {
+fn paint_expand_line(lines: &[OverlayLine], edge: FoldEdge, gutter_width: usize) -> Line<'static> {
     let first = lines
-        .get(fold.start)
+        .get(edge.start)
         .and_then(|line| line.new_no.or(line.old_no));
     let last = lines
-        .get(fold.end.saturating_sub(1))
+        .get(edge.end.saturating_sub(1))
         .and_then(|line| line.new_no.or(line.old_no));
     let range = match (first, last) {
-        (Some(start), Some(end)) => format!(" · {start}–{end}"),
+        (Some(start), Some(end)) => format!(" {start}–{end}"),
         _ => String::new(),
     };
-    let hint = if fold.expandable { "  [expand]" } else { "" };
+    let show = EXPAND_CHUNK.min(edge.remaining);
+    let (arrow, side) = match edge.direction {
+        ExpandDirection::Up => ('▲', "above"),
+        ExpandDirection::Down => ('▼', "below"),
+    };
     Line::from(vec![
         Span::styled(" ".repeat(gutter_width), Color::DarkGray),
         Span::styled(
-            format!("▸ {} unchanged lines{range}{hint}", fold.hidden()),
+            format!(
+                "── {arrow} {show} more {side} · {remaining} hidden{range} ──",
+                remaining = edge.remaining
+            ),
             Style::default().fg(FOLD_FG),
         ),
     ])
@@ -550,9 +664,10 @@ mod tests {
         let mut view = DiffViewState::new("a.cpp".into(), model, None);
         assert!(!view.model.folds.is_empty());
         let body = view.body_lines();
-        assert!(body.iter().any(
-            |line| texts(line).contains("unchanged lines") && texts(line).contains("[expand]")
-        ));
+        assert!(body.iter().any(|line| {
+            let text = texts(line);
+            text.contains("hidden") && (text.contains("▲") || text.contains("▼"))
+        }));
         let fold_id = view.model.folds[0].id;
         view.expand_fold(fold_id);
         assert!(view.expanded.contains(&fold_id));
@@ -625,5 +740,74 @@ mod tests {
                 .any(|line| texts(line).contains("truncated: 4000 line diff budget exceeded"))
         );
         assert!(view.highlighted.is_some());
+    }
+
+    #[test]
+    fn deleted_text_stays_bright_without_dim() {
+        let model = build_file_diff(
+            &["new".into()],
+            &["@@ -1 +1 @@".into(), "-old".into(), "+new".into()],
+            Some(FileDiffKind::Edit),
+            5,
+        );
+        let view = DiffViewState::new("a.rs".into(), model, None);
+        let deleted = &view.body_lines()[0];
+        assert_eq!(deleted.style.bg, Some(DEL_LINE_BG));
+        assert!(deleted.spans.iter().any(|span| span.content.contains("old")
+            && span.style.fg == Some(DEL_FG)
+            && !span.style.add_modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn hunk_splitters_expand_twenty_lines_from_each_edge() {
+        let mut file: Vec<String> = (1..=80).map(|index| format!("line-{index}")).collect();
+        file[49] = "changed".into();
+        let diff = vec![
+            "@@ -48,5 +48,5 @@".into(),
+            " line-48".into(),
+            " line-49".into(),
+            "-line-50".into(),
+            "+changed".into(),
+            " line-51".into(),
+            " line-52".into(),
+        ];
+        let model = build_file_diff(&file, &diff, Some(FileDiffKind::Edit), 5);
+        let mut view = DiffViewState::new("a.cpp".into(), model, None);
+        let leading = view
+            .model
+            .folds
+            .iter()
+            .find(|fold| fold.start == 0)
+            .copied()
+            .expect("leading fold");
+        let trailing = view
+            .model
+            .folds
+            .iter()
+            .find(|fold| fold.end == view.model.lines.len())
+            .copied()
+            .expect("trailing fold");
+        let before = view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, VisibleItem::Line(_)))
+            .count();
+        assert!(view.expand_edge(leading.id, ExpandDirection::Up));
+        let after_up = view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, VisibleItem::Line(_)))
+            .count();
+        assert_eq!(after_up, before + EXPAND_CHUNK);
+        assert!(view.expand_edge(trailing.id, ExpandDirection::Down));
+        let after_down = view
+            .visible_items()
+            .iter()
+            .filter(|item| matches!(item, VisibleItem::Line(_)))
+            .count();
+        assert_eq!(after_down, after_up + EXPAND_CHUNK);
+        let body = view.body_lines();
+        assert!(body.iter().any(|line| texts(line).contains("▲")));
+        assert!(body.iter().any(|line| texts(line).contains("▼")));
     }
 }
