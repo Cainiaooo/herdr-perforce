@@ -83,11 +83,14 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 
 ```json
 {
-  "open_mode": "manual"
+  "open_mode": "manual",
+  "diff_fold_context": 5
 }
 ```
 
-删除该文件，或改为 `{ "open_mode": "remembered" }`，即可恢复默认行为。配置损坏、包含未知字段或未知 mode 时会失败关闭，不自动恢复 pane；已保存的 workspace 记录不会被覆盖。
+`diff_fold_context` 是 Diff 折叠时每侧保留的未改行数，默认 `5`，允许 `0`–`200`；`0` 表示不折叠。省略该字段时使用默认值。
+
+删除该文件，或改为 `{ "open_mode": "remembered" }`，即可恢复默认行为。配置损坏、包含未知字段、未知 mode 或非法 `diff_fold_context` 时会失败关闭，不自动恢复 pane；已保存的 workspace 记录不会被覆盖。
 
 ## 使用方法
 
@@ -117,6 +120,8 @@ Submit overlay：
 overlay 打开时，背景列表不会响应 Submit 或导航快捷键。SubmitRunning 期间无法从插件内取消、关闭或启动第二次提交。
 
 内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；从 CL 文件列表进入 Diff 后，`Esc` 返回列表。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 使用 `📂`、`📁`、`📄` 区分展开目录、折叠目录和文件。
+
+Diff 以当前文件为画布：未改行就是文件本身，删除为红底 `-`，新增为绿底 `+`，行内替换会把变化的词标得更亮。远距未改默认折叠，点击折叠行或 `e` / **Expand all** 展开；**Prev** / **Next** 或 `[` / `]` 跳到上一/下一处改动。
 
 ## Submit 安全模型
 
@@ -232,7 +237,7 @@ herdr plugin unlink herdr.perforce
 
 ## 当前限制
 
-- 当前版本已接入本地目录树、独立 File/Diff/CL 内容 pane 和滚动/高亮；review comment 与 Description Apply UI 尚未接完。
+- 当前版本已接入本地目录树、独立 File/Diff/CL 内容 pane、内联叠加 Diff（折叠/hunk 跳转/行内高亮）和滚动/高亮；review comment 与 Description Apply UI 尚未接完。
 - 自动打开只覆盖成功手动打开过的 remembered workspaces；当前版本不会扫描全部 Herdr workspace 并运行 `p4 info` 自动判定。
 - 不支持 default changelist、部分文件、其他用户或其他 client 的 Submit。
 - 不支持自动 resolve、lock 修复或任何自主提交。

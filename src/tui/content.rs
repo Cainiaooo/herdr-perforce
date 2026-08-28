@@ -14,16 +14,20 @@ use std::{
 };
 
 use crate::{
-    domain::{ChangedFile, Changelist, ChangelistId, PreviewContent, PreviewTruncation},
+    domain::{
+        ChangedFile, Changelist, ChangelistId, FileAction, FileDiffKind, PreviewContent,
+        PreviewTruncation, build_file_diff,
+    },
     p4::{
         P4Client, P4Query, StdProcessTransport, changed_files_from_opened,
         changelist_from_describe, load_workspace_diff, read_workspace_preview,
     },
-    panel_restore::strip_verbatim_prefix,
+    panel_restore::{self, strip_verbatim_prefix},
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -38,7 +42,10 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 
-use super::{syntax, wrap};
+use super::{
+    diff::{self, DiffToolbarAction, DiffViewState},
+    syntax, wrap,
+};
 
 pub const CONTROL_ENV: &str = "HERDR_P4_CONTENT_CONTROL";
 const CONTENT_SOURCE: &str = "herdr-perforce-content";
@@ -72,9 +79,18 @@ impl PaneRect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ContentRequest {
-    File { path: PathBuf },
-    Diff { change: ChangelistId, path: PathBuf },
-    Changelist { change: ChangelistId },
+    File {
+        path: PathBuf,
+    },
+    Diff {
+        change: ChangelistId,
+        path: PathBuf,
+        action: Option<FileAction>,
+        fold_context: usize,
+    },
+    Changelist {
+        change: ChangelistId,
+    },
 }
 
 impl ContentRequest {
@@ -85,12 +101,24 @@ impl ContentRequest {
                 "kind": "file",
                 "path": path_to_text(path)?,
             }),
-            Self::Diff { change, path } => json!({
-                "version": 1,
-                "kind": "diff",
-                "change": change.as_p4_arg(),
-                "path": path_to_text(path)?,
-            }),
+            Self::Diff {
+                change,
+                path,
+                action,
+                fold_context,
+            } => {
+                let mut value = json!({
+                    "version": 1,
+                    "kind": "diff",
+                    "change": change.as_p4_arg(),
+                    "path": path_to_text(path)?,
+                    "diff_fold_context": fold_context,
+                });
+                if let Some(action) = action {
+                    value["action"] = json!(action.canonical_name());
+                }
+                value
+            }
             Self::Changelist { change } => json!({
                 "version": 1,
                 "kind": "changelist",
@@ -127,6 +155,11 @@ impl ContentRequest {
             Some("diff") => Ok(Self::Diff {
                 change: change()?,
                 path: path()?,
+                action: value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(FileAction::from_p4),
+                fold_context: parse_request_fold_context(&value),
             }),
             Some("changelist") => Ok(Self::Changelist { change: change()? }),
             _ => Err("content request has an unsupported kind".to_owned()),
@@ -221,9 +254,19 @@ impl ContentPaneClient {
         Ok(format!("Opened file content: {name}"))
     }
 
-    pub fn show_diff(&mut self, change: ChangelistId, path: PathBuf) -> Result<String, String> {
+    pub fn show_diff(
+        &mut self,
+        change: ChangelistId,
+        path: PathBuf,
+        action: Option<FileAction>,
+    ) -> Result<String, String> {
         let name = filename(&path);
-        self.open(ContentRequest::Diff { change, path })?;
+        self.open(ContentRequest::Diff {
+            change,
+            path,
+            action,
+            fold_context: diff_fold_context(),
+        })?;
         Ok(format!("Opened CL {change} diff: {name}"))
     }
 
@@ -432,7 +475,13 @@ fn spawn_content_pane(navigation_pane: &str, cwd: &Path, control: &Path) -> Resu
     launch_path.push(if cfg!(windows) { ";" } else { ":" });
     launch_path.push(inherited_path);
 
-    let args = split_args(&target, cwd, control, &launch_path);
+    let args = split_args(
+        &target,
+        cwd,
+        control,
+        &launch_path,
+        env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref(),
+    );
     let response = run_herdr_json(&args)?;
     let pane = pane_id_from_response(&response)
         .ok_or_else(|| "Herdr opened a content split without returning its pane id".to_owned())?;
@@ -480,8 +529,14 @@ fn start_viewer_in_pane(pane_id: &str) -> Result<(), String> {
     .ok_or_else(|| "content pane exists but the viewer process did not start".to_owned())
 }
 
-fn split_args(target: &str, cwd: &Path, control: &Path, launch_path: &OsStr) -> Vec<OsString> {
-    vec![
+fn split_args(
+    target: &str,
+    cwd: &Path,
+    control: &Path,
+    launch_path: &OsStr,
+    config_dir: Option<&OsStr>,
+) -> Vec<OsString> {
+    let mut args = vec![
         OsString::from("pane"),
         OsString::from("split"),
         OsString::from("--pane"),
@@ -496,8 +551,13 @@ fn split_args(target: &str, cwd: &Path, control: &Path, launch_path: &OsStr) -> 
         env_assignment(CONTROL_ENV, control.as_os_str()),
         OsString::from("--env"),
         env_assignment("PATH", launch_path),
-        OsString::from("--focus"),
-    ]
+    ];
+    if let Some(config_dir) = config_dir {
+        args.push(OsString::from("--env"));
+        args.push(env_assignment("HERDR_PLUGIN_CONFIG_DIR", config_dir));
+    }
+    args.push(OsString::from("--focus"));
+    args
 }
 
 fn ensure_content_layout(navigation_pane: &str, content_pane: &str) -> Result<(), String> {
@@ -729,6 +789,12 @@ enum Document {
         gutter_width: Option<usize>,
         back: Option<ContentRequest>,
     },
+    Diff {
+        title: String,
+        context: String,
+        view: DiffViewState,
+        back: Option<ContentRequest>,
+    },
     Changelist {
         title: String,
         context: String,
@@ -746,6 +812,7 @@ impl Document {
     fn title(&self) -> &str {
         match self {
             Self::Text { title, .. }
+            | Self::Diff { title, .. }
             | Self::Changelist { title, .. }
             | Self::Failed { title, .. } => title,
         }
@@ -753,8 +820,24 @@ impl Document {
 
     fn context(&self) -> &str {
         match self {
-            Self::Text { context, .. } | Self::Changelist { context, .. } => context,
+            Self::Text { context, .. }
+            | Self::Diff { context, .. }
+            | Self::Changelist { context, .. } => context,
             Self::Failed { message, .. } => message,
+        }
+    }
+
+    fn back(&self) -> Option<&ContentRequest> {
+        match self {
+            Self::Text { back, .. } | Self::Diff { back, .. } => back.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn header_height(&self) -> u16 {
+        match self {
+            Self::Diff { .. } => 3,
+            _ => 2,
         }
     }
 }
@@ -766,6 +849,7 @@ struct ViewerState {
     scroll_y: usize,
     body_width: usize,
     body_height: usize,
+    toolbar_hits: Vec<diff::ToolbarHit>,
 }
 
 impl ViewerState {
@@ -778,6 +862,7 @@ impl ViewerState {
             scroll_y: 0,
             body_width: 1,
             body_height: 1,
+            toolbar_hits: Vec::new(),
         }
     }
 
@@ -785,12 +870,14 @@ impl ViewerState {
         self.document = load_document(&self.cwd, &request, None);
         self.request = request;
         self.scroll_y = 0;
+        self.toolbar_hits.clear();
         rename_own_pane(self.document.title());
     }
 
     fn render_lines(&self) -> Vec<Line<'static>> {
         match &self.document {
             Document::Text { lines, .. } => lines.clone(),
+            Document::Diff { view, .. } => view.body_lines(),
             Document::Failed { message, .. } => vec![Line::styled(
                 message.clone(),
                 Style::default().fg(Color::Red),
@@ -842,26 +929,32 @@ impl ViewerState {
     }
 
     fn render_rows(&self) -> Vec<Line<'static>> {
-        let gutter_width = match &self.document {
-            Document::Text { gutter_width, .. } => *gutter_width,
-            _ => None,
-        };
+        let gutter_width = self.gutter_width();
+        let width = self.body_width.max(1);
         self.render_lines()
             .iter()
             .flat_map(|line| {
-                gutter_width.map_or_else(
-                    || wrap::wrap_line(line, self.body_width.max(1)),
-                    |gutter| wrap::wrap_line_with_gutter(line, self.body_width.max(1), gutter),
-                )
+                let wrapped = gutter_width.map_or_else(
+                    || wrap::wrap_line(line, width),
+                    |gutter| wrap::wrap_line_with_gutter(line, width, gutter),
+                );
+                wrapped
+                    .into_iter()
+                    .map(move |row| diff::pad_background(row, width))
             })
             .collect()
     }
 
-    fn visual_row_offset(&self, source_row: usize) -> usize {
-        let gutter_width = match &self.document {
+    fn gutter_width(&self) -> Option<usize> {
+        match &self.document {
             Document::Text { gutter_width, .. } => *gutter_width,
+            Document::Diff { view, .. } => Some(view.gutter_width),
             _ => None,
-        };
+        }
+    }
+
+    fn visual_row_offset(&self, source_row: usize) -> usize {
+        let gutter_width = self.gutter_width();
         self.render_lines()
             .iter()
             .take(source_row)
@@ -942,7 +1035,13 @@ impl ViewerState {
             ContentRequest::Changelist { change } => change,
             _ => return,
         };
-        let request = ContentRequest::Diff { change, path };
+        let action = files.get(*selected).map(|file| file.action.clone());
+        let request = ContentRequest::Diff {
+            change,
+            path,
+            action,
+            fold_context: diff_fold_context(),
+        };
         self.document = load_document(&self.cwd, &request, Some(back));
         self.request = request;
         self.scroll_y = 0;
@@ -950,22 +1049,108 @@ impl ViewerState {
     }
 
     fn go_back(&mut self) -> bool {
-        let Document::Text {
-            back: Some(back), ..
-        } = &self.document
-        else {
+        let Some(back) = self.document.back().cloned() else {
             return false;
         };
-        let back = back.clone();
         self.install(back);
         true
+    }
+
+    fn handle_diff_key(&mut self, code: KeyCode) -> bool {
+        {
+            let Document::Diff { view, .. } = &mut self.document else {
+                return false;
+            };
+            match code {
+                KeyCode::Char('[') => {
+                    view.step_hunk(-1);
+                }
+                KeyCode::Char(']') => {
+                    view.step_hunk(1);
+                }
+                KeyCode::Char('e') => view.toggle_folds(),
+                _ => return false,
+            }
+        }
+        if matches!(code, KeyCode::Char('[') | KeyCode::Char(']')) {
+            self.scroll_to_current_hunk();
+        } else {
+            self.clamp_scroll();
+        }
+        true
+    }
+
+    fn handle_diff_click(&mut self, column: u16, row: u16) -> bool {
+        let header = self.document.header_height();
+        if row < header {
+            if row + 1 != header {
+                return false;
+            }
+            let Some(action) = diff::hit_action(&self.toolbar_hits, column) else {
+                return false;
+            };
+            return self.apply_toolbar(action);
+        }
+        let Document::Diff { view, .. } = &mut self.document else {
+            return false;
+        };
+        let visual = self
+            .scroll_y
+            .saturating_add(row.saturating_sub(header) as usize);
+        let Some(fold_id) = view.fold_at_visual_row(visual, self.body_width.max(1)) else {
+            return false;
+        };
+        view.expand_fold(fold_id);
+        self.clamp_scroll();
+        true
+    }
+
+    fn apply_toolbar(&mut self, action: DiffToolbarAction) -> bool {
+        {
+            let Document::Diff { view, .. } = &mut self.document else {
+                return false;
+            };
+            match action {
+                DiffToolbarAction::PrevHunk => {
+                    view.step_hunk(-1);
+                }
+                DiffToolbarAction::NextHunk => {
+                    view.step_hunk(1);
+                }
+                DiffToolbarAction::ToggleFolds => view.toggle_folds(),
+            }
+        }
+        match action {
+            DiffToolbarAction::PrevHunk | DiffToolbarAction::NextHunk => {
+                self.scroll_to_current_hunk();
+            }
+            DiffToolbarAction::ToggleFolds => self.clamp_scroll(),
+        }
+        true
+    }
+
+    fn scroll_to_current_hunk(&mut self) {
+        let Document::Diff { view, .. } = &self.document else {
+            return;
+        };
+        let Some(overlay) = view.current_hunk_overlay_index() else {
+            return;
+        };
+        let visual = view.visual_row_for_overlay(overlay, self.body_width.max(1));
+        self.scroll_y = visual.saturating_sub(1);
+        self.clamp_scroll();
     }
 }
 
 fn load_document(cwd: &Path, request: &ContentRequest, back: Option<ContentRequest>) -> Document {
     match request {
         ContentRequest::File { path } => file_document(path),
-        ContentRequest::Diff { change, path } => diff_document(cwd, *change, path, back),
+        ContentRequest::Diff {
+            change,
+            path,
+            action,
+            fold_context,
+        } => diff_document(cwd, *change, path, action.as_ref(), *fold_context, back),
         ContentRequest::Changelist { change } => changelist_document(cwd, *change),
     }
 }
@@ -1091,50 +1276,92 @@ fn diff_document(
     cwd: &Path,
     change: ChangelistId,
     path: &Path,
+    action: Option<&FileAction>,
+    fold_context: usize,
     back: Option<ContentRequest>,
 ) -> Document {
     let title = format!("Diff · {}", filename(path));
-    let context = format!("CL {change} · {}", path.display());
     let client = P4Client::new(StdProcessTransport, "p4", cwd);
-    match load_workspace_diff(&client, path) {
-        Ok(raw) => {
-            let mut lines = raw.into_iter().map(diff_line).collect::<Vec<_>>();
-            if lines.is_empty() {
-                lines.push(Line::styled(
-                    "(p4 diff reported no textual differences)",
-                    Color::DarkGray,
-                ));
-            }
+    let unified = match load_workspace_diff(&client, path) {
+        Ok(lines) => lines,
+        Err(error) => {
+            return Document::Failed {
+                title,
+                message: error.to_string(),
+            };
+        }
+    };
+    match read_workspace_preview(path, None, None, None) {
+        PreviewContent::Binary { .. } | PreviewContent::Directory { .. } => {
+            let lines = metadata_lines(read_workspace_preview(path, None, None, None));
             Document::Text {
                 title,
-                context,
+                context: format!("CL {change} · {}", path.display()),
                 lines,
                 gutter_width: None,
                 back,
             }
         }
-        Err(error) => Document::Failed {
-            title,
-            message: error.to_string(),
-        },
+        preview => {
+            let (new_lines, truncated) = match preview {
+                PreviewContent::Text { lines, truncated } => (lines, truncated),
+                PreviewContent::Failed { .. } | PreviewContent::None => (Vec::new(), None),
+                PreviewContent::Binary { .. } | PreviewContent::Directory { .. } => unreachable!(),
+            };
+            let kind = action.map(FileDiffKind::from_action);
+            let model = build_file_diff(&new_lines, &unified, kind, fold_context);
+            let action_label = action.map(FileAction::canonical_name).unwrap_or("diff");
+            let context = format!(
+                "CL {change} · {action_label} · +{} -{} · {}",
+                model.added,
+                model.removed,
+                path.display()
+            );
+            let truncated = merge_truncation_notices(
+                truncated.map(|reason| match reason {
+                    PreviewTruncation::ByteBudget { limit } => {
+                        format!("truncated: {limit} byte preview budget exceeded")
+                    }
+                    PreviewTruncation::LineBudget { limit } => {
+                        format!("truncated: {limit} line preview budget exceeded")
+                    }
+                }),
+                model.truncated.clone(),
+            );
+            Document::Diff {
+                title,
+                context,
+                view: DiffViewState::new(filename(path), model, truncated),
+                back,
+            }
+        }
     }
 }
 
-fn diff_line(line: String) -> Line<'static> {
-    let style = if line.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
-    } else if line.starts_with('+') && !line.starts_with("+++") {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(Color::Red)
-    } else if line.starts_with("---") || line.starts_with("+++") {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    Line::styled(line, style)
+fn diff_fold_context() -> usize {
+    panel_restore::load_panel_config(
+        env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+            .map(PathBuf::from)
+            .as_deref(),
+    )
+    .map(|config| config.diff_fold_context)
+    .unwrap_or(crate::domain::DEFAULT_FOLD_CONTEXT)
+}
+
+fn parse_request_fold_context(value: &Value) -> usize {
+    match value.get("diff_fold_context").and_then(Value::as_u64) {
+        Some(parsed) if parsed <= crate::domain::MAX_FOLD_CONTEXT as u64 => parsed as usize,
+        Some(_) => crate::domain::MAX_FOLD_CONTEXT,
+        None => diff_fold_context(),
+    }
+}
+
+fn merge_truncation_notices(preview: Option<String>, diff: Option<String>) -> Option<String> {
+    match (preview, diff) {
+        (Some(left), Some(right)) if left == right => Some(left),
+        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
+        (left, right) => left.or(right),
+    }
 }
 
 fn changelist_document(cwd: &Path, change: ChangelistId) -> Document {
@@ -1264,11 +1491,16 @@ fn viewer_loop(
                         state.scroll_y = state.render_rows().len();
                         state.clamp_scroll();
                     }
-                    _ => {}
+                    other => {
+                        let _ = state.handle_diff_key(other);
+                    }
                 },
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => state.move_vertical(-3),
                     MouseEventKind::ScrollDown => state.move_vertical(3),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let _ = state.handle_diff_click(mouse.column, mouse.row);
+                    }
                     _ => {}
                 },
                 Event::Resize(_, _)
@@ -1294,24 +1526,37 @@ fn viewer_loop(
 }
 
 fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
+    let header_height = state.document.header_height();
     let chunks = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(header_height),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(frame.area());
-    let header = vec![
-        Line::from(vec![
-            Span::styled(
-                state.document.title().to_owned(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  [auto wrap]"),
-        ]),
+    let mut title_spans = vec![
+        Span::styled(
+            state.document.title().to_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  [auto wrap]"),
+    ];
+    if let Document::Diff { view, .. } = &state.document {
+        title_spans.push(Span::raw("  "));
+        title_spans.extend(diff::stats_spans(&view.model));
+    }
+    let mut header = vec![
+        Line::from(title_spans),
         Line::styled(state.document.context().to_owned(), Color::DarkGray),
     ];
+    if let Document::Diff { view, .. } = &state.document {
+        let (toolbar, hits) = diff::toolbar_line(view, chunks[0].width as usize);
+        state.toolbar_hits = hits;
+        header.push(toolbar);
+    } else {
+        state.toolbar_hits.clear();
+    }
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
     state.body_width = chunks[1].width as usize;
@@ -1323,6 +1568,10 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
 
     let footer = match &state.document {
         Document::Changelist { .. } => "↑↓/wheel: select   Enter: diff   q/Esc: close",
+        Document::Diff { back: Some(_), .. } => {
+            "[/]: hunk   e: folds   click fold: expand   Esc: back   q: close"
+        }
+        Document::Diff { .. } => "[/]: hunk   e: folds   click fold: expand   q/Esc: close",
         Document::Text { back: Some(_), .. } => {
             "↑↓/wheel: scroll   PgUp/PgDn: page   Esc: back   q: close"
         }
@@ -1397,6 +1646,8 @@ mod tests {
             ContentRequest::Diff {
                 change: ChangelistId::Numbered(42),
                 path: PathBuf::from(r"C:\Workspace\src\main.rs"),
+                action: Some(FileAction::Edit),
+                fold_context: 8,
             },
             ContentRequest::Changelist {
                 change: ChangelistId::Default,
@@ -1418,6 +1669,7 @@ mod tests {
             Path::new(r"C:\Workspace with spaces"),
             Path::new(r"C:\Temp\content.json"),
             OsStr::new(r"C:\Plugin\bin;C:\Windows"),
+            Some(OsStr::new(r"C:\Herdr\plugin-config")),
         );
         assert_eq!(args[3], "workspace:p1");
         assert_eq!(args[7], "0.5");
@@ -1426,6 +1678,22 @@ mod tests {
             arg.to_string_lossy()
                 .starts_with("HERDR_P4_CONTENT_CONTROL=")
         }));
+        assert!(args.iter().any(|arg| {
+            arg.to_string_lossy()
+                .starts_with(r"HERDR_PLUGIN_CONFIG_DIR=C:\Herdr\plugin-config")
+        }));
+        let without_config = split_args(
+            "workspace:p1",
+            Path::new(r"C:\Workspace"),
+            Path::new(r"C:\Temp\content.json"),
+            OsStr::new(r"C:\Plugin\bin"),
+            None,
+        );
+        assert!(
+            without_config
+                .iter()
+                .all(|arg| !arg.to_string_lossy().contains("HERDR_PLUGIN_CONFIG_DIR="))
+        );
     }
 
     #[test]
@@ -1544,9 +1812,51 @@ mod tests {
     }
 
     #[test]
-    fn diff_lines_have_distinct_semantic_colors() {
-        assert_eq!(diff_line("+added".into()).style.fg, Some(Color::Green));
-        assert_eq!(diff_line("-removed".into()).style.fg, Some(Color::Red));
-        assert_eq!(diff_line("@@ hunk".into()).style.fg, Some(Color::Cyan));
+    fn diff_request_round_trips_optional_action() {
+        let encoded = ContentRequest::Diff {
+            change: ChangelistId::Default,
+            path: PathBuf::from(r"C:\ws\a.rs"),
+            action: None,
+            fold_context: 0,
+        }
+        .to_json()
+        .expect("encode");
+        assert!(
+            !encoded.contains("action"),
+            "absent action must stay omitted: {encoded}"
+        );
+        assert!(encoded.contains("\"diff_fold_context\":0"));
+        assert_eq!(
+            ContentRequest::from_json(&encoded).expect("decode"),
+            ContentRequest::Diff {
+                change: ChangelistId::Default,
+                path: PathBuf::from(r"C:\ws\a.rs"),
+                action: None,
+                fold_context: 0,
+            }
+        );
+        let legacy = r#"{"version":1,"kind":"diff","change":"default","path":"C:\\ws\\a.rs"}"#;
+        let ContentRequest::Diff {
+            fold_context: recovered,
+            ..
+        } = ContentRequest::from_json(legacy).expect("legacy")
+        else {
+            panic!("expected diff");
+        };
+        assert_eq!(recovered, diff_fold_context());
+    }
+
+    #[test]
+    fn truncation_notices_from_preview_and_diff_are_both_kept() {
+        assert_eq!(
+            merge_truncation_notices(
+                Some("truncated: 512 byte preview budget exceeded".into()),
+                Some("truncated: 4000 line diff budget exceeded".into()),
+            )
+            .as_deref(),
+            Some(
+                "truncated: 512 byte preview budget exceeded; truncated: 4000 line diff budget exceeded"
+            )
+        );
     }
 }

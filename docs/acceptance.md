@@ -191,7 +191,7 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 - `↑`/`↓`、PageUp/PageDown 和鼠标滚轮可到达加载预算内的全部行。
 - File、Diff 和 CL 长行按 Content pane 的当前宽度自动换成多行，并且所有换行后的显示行均可纵向滚动到达；文件续行不重复行号，但保留等宽空白 gutter，正文起点与首行一致。
-- 文件按类型高亮，diff 的 header/hunk/add/delete 可区分。
+- 文件按类型高亮；Diff 的新增（绿 `+`）、删除（红 `-`）和行内修改可区分，折叠行可展开。
 - 长行和滚动不改变最右 Navigation 的宽度或树对齐。
 
 ### ACC-UI-005（P1）终端适配矩阵
@@ -365,7 +365,7 @@ fixture 覆盖：unopened、opened edit/add/delete、out-of-date、not in view�
 
 ### ACC-DIFF-001（P0）Pending edit
 
-期望：本地文件与正确 have revision 比较；unified hunk、行号和增删统计正确。
+期望：本地文件与正确 have revision 比较；Content pane 以当前文件为画布，在改动位置插入红 `-` / 绿 `+` 行，带行号和 `+N -M` 统计；不再把 `---` / `@@` patch 头当正文。
 
 ### ACC-DIFF-002（P0）Pending add/delete
 
@@ -423,7 +423,16 @@ fixture 和 Level B 只读环境至少覆盖普通 binary 与 `+l` binary。期�
 
 ### ACC-DIFF-008（P1）Diff 导航
 
-期望：`[`/`]` 和 `f`/`F` 在首尾边界行为稳定；刷新后尽量保留当前 hunk。
+期望：`[`/`]` 与工具栏 Prev/Next 在首尾边界行为稳定；刷新后尽量保留当前 hunk。点击折叠行只展开该段；`e` 与 Expand all / Fold unchanged 切换全部折叠。
+
+### ACC-DIFF-009（P1）折叠与行内修改
+
+期望：
+
+- 未改连续行超过 `2 * diff_fold_context + 3` 时中间折叠，折叠行标明隐藏行数且可展开。
+- `diff_fold_context = 0` 时不折叠。
+- 无效或超出 0–200 的配置被拒绝，与其它 `panel.json` 字段相同。
+- 配对的删/增行把变化 token 标得比整行底色更亮；完全无关的替换不强行做词级高亮。
 
 ## 9. Agent 审阅反馈
 

@@ -1,3 +1,4 @@
 {
-  "open_mode": "manual"
+  "open_mode": "manual",
+  "diff_fold_context": 5
 }

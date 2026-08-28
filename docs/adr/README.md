@@ -12,5 +12,6 @@ ADR 只描述一项已接受决策、理由和后果。产品设计见 [design.m
 | [ADR-0004](0004-agent-generator-trust-boundary.md) | Accepted | 可执行生成器配置仅来自 Herdr 用户级插件配置目录 |
 | [ADR-0005](0005-in-plugin-file-explorer.md) | Accepted | 工作区 File Explorer 在本插件内独立实现，不依赖社区插件 |
 | [ADR-0006](0006-standalone-content-pane.md) | Accepted | Agent 与最右导航之间按需创建可复用的独立 Content pane |
+| [ADR-0007](0007-inline-overlay-diff.md) | Accepted | Diff 以当前文件为画布做内联叠加，而不是 unified patch 原文 |
 
 新 ADR 使用递增四位编号。已接受 ADR 不静默改写结论；如结论改变，应新增 superseding ADR 并更新索引。

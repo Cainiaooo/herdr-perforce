@@ -1,6 +1,7 @@
 //! Terminal pane: workspace File Explorer and Submit review views.
 
 mod content;
+mod diff;
 mod explorer;
 mod syntax;
 mod wrap;
@@ -413,13 +414,13 @@ impl PaneModel {
     }
 
     fn open_selected_diff(&mut self) -> bool {
-        let Some((change, path)) = self.explorer.jump_target() else {
+        let Some((change, path, action)) = self.explorer.jump_target() else {
             self.status = "Selected file is not opened in a changelist".to_owned();
             return false;
         };
         self.status = self
             .content
-            .show_diff(change, path)
+            .show_diff(change, path, Some(action))
             .unwrap_or_else(|error| error);
         true
     }

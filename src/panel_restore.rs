@@ -11,6 +11,8 @@ use std::{
 
 use serde_json::{Map, Value, json};
 
+use crate::domain::{DEFAULT_FOLD_CONTEXT, MAX_FOLD_CONTEXT};
+
 const CONFIG_FILE: &str = "panel.json";
 const STATE_FILE: &str = "remembered-workspaces.json";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
@@ -21,6 +23,21 @@ const MAX_REMEMBERED_WORKSPACES: usize = 128;
 pub enum PanelOpenMode {
     Manual,
     Remembered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelConfig {
+    pub open_mode: PanelOpenMode,
+    pub diff_fold_context: usize,
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            open_mode: PanelOpenMode::Remembered,
+            diff_fold_context: DEFAULT_FOLD_CONTEXT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,19 +63,47 @@ pub struct HerdrPane {
 }
 
 pub fn load_panel_open_mode(config_dir: Option<&Path>) -> Result<PanelOpenMode, &'static str> {
+    Ok(load_panel_config(config_dir)?.open_mode)
+}
+
+pub fn load_panel_config(config_dir: Option<&Path>) -> Result<PanelConfig, &'static str> {
     let Some(config_dir) = config_dir else {
-        return Ok(PanelOpenMode::Remembered);
+        return Ok(PanelConfig::default());
     };
     let path = config_dir.join(CONFIG_FILE);
     if !path.exists() {
-        return Ok(PanelOpenMode::Remembered);
+        return Ok(PanelConfig::default());
     }
     let value = read_bounded_json(&path, MAX_CONFIG_BYTES, "panel config could not be read")?;
-    let object = strict_object(&value, &["open_mode"], "panel config is invalid")?;
-    match object.get("open_mode").and_then(Value::as_str) {
-        Some("manual") => Ok(PanelOpenMode::Manual),
-        Some("remembered") => Ok(PanelOpenMode::Remembered),
-        _ => Err("panel config open_mode must be manual or remembered"),
+    let object = strict_object(
+        &value,
+        &["open_mode", "diff_fold_context"],
+        "panel config is invalid",
+    )?;
+    let open_mode = match object.get("open_mode").and_then(Value::as_str) {
+        Some("manual") => PanelOpenMode::Manual,
+        Some("remembered") => PanelOpenMode::Remembered,
+        _ => return Err("panel config open_mode must be manual or remembered"),
+    };
+    Ok(PanelConfig {
+        open_mode,
+        diff_fold_context: parse_diff_fold_context(object.get("diff_fold_context"))?,
+    })
+}
+
+fn parse_diff_fold_context(value: Option<&Value>) -> Result<usize, &'static str> {
+    match value {
+        None => Ok(DEFAULT_FOLD_CONTEXT),
+        Some(Value::Number(number)) => {
+            let parsed = number
+                .as_u64()
+                .ok_or("panel config diff_fold_context must be an integer from 0 to 200")?;
+            if parsed > MAX_FOLD_CONTEXT as u64 {
+                return Err("panel config diff_fold_context must be an integer from 0 to 200");
+            }
+            Ok(parsed as usize)
+        }
+        _ => Err("panel config diff_fold_context must be an integer from 0 to 200"),
     }
 }
 
@@ -420,6 +465,43 @@ mod tests {
         );
         fs::write(root.join(CONFIG_FILE), br#"{"open_mode":"manual"}"#).expect("config");
         assert_eq!(load_panel_open_mode(Some(&root)), Ok(PanelOpenMode::Manual));
+        assert_eq!(
+            load_panel_config(Some(&root))
+                .expect("config")
+                .diff_fold_context,
+            DEFAULT_FOLD_CONTEXT
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn config_accepts_diff_fold_context_and_rejects_out_of_range() {
+        let root = temp_dir("fold-config");
+        fs::write(
+            root.join(CONFIG_FILE),
+            br#"{"open_mode":"remembered","diff_fold_context":8}"#,
+        )
+        .expect("config");
+        let config = load_panel_config(Some(&root)).expect("fold");
+        assert_eq!(config.open_mode, PanelOpenMode::Remembered);
+        assert_eq!(config.diff_fold_context, 8);
+        fs::write(
+            root.join(CONFIG_FILE),
+            br#"{"open_mode":"remembered","diff_fold_context":0}"#,
+        )
+        .expect("config");
+        assert_eq!(
+            load_panel_config(Some(&root))
+                .expect("zero")
+                .diff_fold_context,
+            0
+        );
+        fs::write(
+            root.join(CONFIG_FILE),
+            br#"{"open_mode":"remembered","diff_fold_context":201}"#,
+        )
+        .expect("config");
+        assert!(load_panel_config(Some(&root)).is_err());
         fs::remove_dir_all(root).ok();
     }
 

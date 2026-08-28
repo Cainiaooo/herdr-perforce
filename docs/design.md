@@ -78,7 +78,7 @@
 ### 4.2 Content pane
 
 - File：显示行号和按扩展名/首行选择的语法高亮。
-- Diff：统一 diff 头、hunk、增加和删除使用不同颜色。
+- Diff：以当前文件为画布的内联叠加；增/删/行内修改用不同颜色和 gutter 符号；远距未改可折叠。
 - CL：显示描述和文件列表，Enter 下钻 Diff，`Esc` 返回。
 - File、Diff 和 CL 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动。
 
@@ -184,13 +184,17 @@ Files
 
 ### 6.2 文件 Diff
 
-选择文件后显示 unified diff：
+选择文件后显示 **整文件内联叠加**（见 [ADR-0007](adr/0007-inline-overlay-diff.md)），而不是 `p4 diff -du` 原文：
 
-- 行号、hunk header、增加/删除样式。
-- 语法高亮。
-- 当前 hunk 和当前选中行范围。
-- add/delete/move/binary 的显式状态。
-- diff 太大时显示截断原因和继续加载入口。
+- 基底是工作区当前文件；未改行与 File 预览相同（行号 + 语法高亮）。
+- 删除行插在改动位置（红底、gutter `-` 与旧行号）；新增行就地显示（绿底、gutter `+` 与新行号）。
+- 配对的删/增行再做词级高亮，只标出真正变化的 token。
+- 工具栏：`Prev` / `Next` 跳到上一/下一处改动；有折叠时提供 `Expand all` / `Fold unchanged`。
+- `[` / `]` 与工具栏 hunk 按钮等价；`e` 展开或收起全部折叠；点击折叠行展开该段。
+- 远距未改默认折叠，每侧保留 `diff_fold_context` 行（默认 5；`0` 表示不折叠）。隐藏不足 4 行时不折叠。
+- add 为整份绿 `+`；delete 为整份红 `-`。
+- 当前 hunk 和增删统计（`+N -M`）显示在标题/上下文行。
+- diff 太大时显示截断原因。
 - P4 无权限、文件不在 client view 或本地文件缺失时，显示对应诊断。
 
 不得把以下情况混为“空 diff”：
@@ -226,7 +230,8 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 | `Left` / `Right` | 折叠或展开节点 |
 | `Enter` | Explorer 打开 File；Review 打开 CL 文件列表；Content 的 CL 列表下钻 Diff |
 | `d` | 为 Explorer 中已 opened 的文件打开 Diff |
-| `[` / `]` | 上一个/下一个 hunk |
+| `[` / `]` | 上一个/下一个 hunk（与 Diff 工具栏 Prev/Next 相同） |
+| `e` | Diff 中展开或收起全部远距未改折叠 |
 | `f` / `F` | 下一个/上一个文件 |
 | `v` | 开始或结束 diff 行选择 |
 | `c` | 为选中行或范围编写审阅备注 |
@@ -551,6 +556,7 @@ Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-pan
 用户可编辑配置只放在 `HERDR_PLUGIN_CONFIG_DIR`：
 
 - `panel.json` 的 `open_mode = manual|remembered`。
+- `panel.json` 的 `diff_fold_context`（整数 0–200，默认 5）：Diff 折叠时每侧保留的未改行数；`0` 关闭折叠。
 - Agent description generator。
 - keybindings。
 - theme。

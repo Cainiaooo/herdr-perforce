@@ -1,8 +1,13 @@
+mod diff;
 mod explorer;
 mod freshness;
 
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
+pub use diff::{
+    DEFAULT_FOLD_CONTEXT, FileDiff, FileDiffKind, FoldRange, IntraSpan, MAX_FOLD_CONTEXT,
+    OverlayKind, OverlayLine, build_file_diff,
+};
 pub use explorer::{
     ExplorerDecoration, ExplorerEntry, ExplorerEntryKind, FileP4Facts, MAX_DIRECTORY_ENTRIES,
     MAX_PREVIEW_BYTES, MAX_PREVIEW_LINES, PreviewContent, PreviewTruncation, VisibleExplorerRow,

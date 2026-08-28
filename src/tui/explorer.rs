@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     domain::{
-        ChangelistId, ExplorerDecoration, ExplorerEntry, ExplorerEntryKind, VisibleExplorerRow,
-        WorkspaceIdentity, flatten_explorer_tree,
+        ChangelistId, ExplorerDecoration, ExplorerEntry, ExplorerEntryKind, FileAction,
+        VisibleExplorerRow, WorkspaceIdentity, flatten_explorer_tree,
     },
     p4::{ExplorerError, LoadedDirectory},
 };
@@ -47,7 +47,7 @@ pub struct ExplorerModel {
     expanded: BTreeSet<PathBuf>,
     selected: Option<PathBuf>,
     pending_load: Option<PathBuf>,
-    jump: Option<(ChangelistId, PathBuf)>,
+    jump: Option<(ChangelistId, PathBuf, FileAction)>,
     restore_selected: Option<PathBuf>,
 }
 
@@ -85,7 +85,7 @@ impl ExplorerModel {
     }
 
     #[must_use]
-    pub fn jump_target(&self) -> Option<(ChangelistId, PathBuf)> {
+    pub fn jump_target(&self) -> Option<(ChangelistId, PathBuf, FileAction)> {
         self.jump.clone()
     }
 
@@ -354,12 +354,15 @@ impl ExplorerModel {
 
     fn update_jump(&mut self) {
         let rows = self.visible_rows();
-        self.jump = self.selected_row(&rows).and_then(|row| {
-            row.decoration
-                .as_ref()
-                .and_then(ExplorerDecoration::opened_change)
-                .map(|change| (change, row.path.clone()))
-        });
+        self.jump = self
+            .selected_row(&rows)
+            .and_then(|row| match row.decoration.as_ref()? {
+                ExplorerDecoration::Opened {
+                    action,
+                    change: Some(change),
+                } => Some((*change, row.path.clone(), action.clone())),
+                _ => None,
+            });
     }
 
     pub fn tree_window(&self, visible_rows: usize) -> (usize, usize, Vec<VisibleExplorerRow>) {
@@ -504,7 +507,11 @@ mod tests {
         assert_eq!(explorer.activate_selection(), ExplorerAction::OpenFile);
         assert_eq!(
             explorer.jump_target(),
-            Some((ChangelistId::Numbered(7), root.join("a.txt")))
+            Some((
+                ChangelistId::Numbered(7),
+                root.join("a.txt"),
+                FileAction::Edit,
+            ))
         );
     }
 
