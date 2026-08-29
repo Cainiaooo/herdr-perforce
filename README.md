@@ -57,7 +57,7 @@ herdr plugin action invoke open-windows --plugin herdr.perforce
 herdr plugin action invoke open --plugin herdr.perforce
 ```
 
-也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
+也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。Review 上方内嵌当前 CL 的描述与 **Review & Submit** 入口，下方是 Changelists，并预留与其同级的 File History / Workspace History。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
 
 ### Panel 加载与自动恢复
 
@@ -106,7 +106,7 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 | 滚轮 / 拖动 | 树与 CL 列表纵向滚动；横向拖动查看被截断的单行名称 |
 | `d` | Explorer 中为 opened file 打开 Diff |
 | `o` | 使用系统默认应用打开 Explorer 选中路径 |
-| `s` | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
+| `s` / 点击 **Review & Submit** | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
 | `r` | 重新执行只读 workspace/CL 刷新 |
 | `q` | 在没有阻塞 overlay 时关闭插件 pane |
 
@@ -122,7 +122,21 @@ Submit overlay：
 
 overlay 打开时，背景列表不会响应 Submit 或导航快捷键。SubmitRunning 期间无法从插件内取消、关闭或启动第二次提交。
 
-内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；从 CL 文件列表进入 Diff 后，`Esc` 返回列表。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 使用 `📂`、`📁`、`📄` 区分展开目录、折叠目录和文件。
+内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；CL 文件列表支持鼠标单击选择，`Enter` 打开 Diff，进入 Diff 后 `Esc` 返回列表。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 使用按文件类型区分的可爱图标，例如 `🦀` Rust、`🔩` C/C++、`📝` Markdown、`📷` 图片，目录仍使用 `📂` / `📁`。
+
+Explorer 的 P4 状态采用与 IDE Source Control 类似的颜色和短标记：
+
+| 标记 | 含义 |
+|---|---|
+| `A` | 已在 Perforce 中打开为新增或 branch |
+| `M` | 已打开为修改、integrate 或 import |
+| `D` | 已打开为删除、purge 或 archive |
+| `R` | `move/add` 或 `move/delete` |
+| `U` | 本地存在但尚未被 Perforce 管理 |
+| `↓` | 已被 Perforce 管理，但 `haveRev < headRev`，工作区版本落后 |
+| `⊘` / `?` | 不在 client view / 无法建立映射 |
+
+状态查询严格按目录懒加载：初始只查询 Explorer 根目录的直接条目，展开 folder 后才批量查询该 folder 的 `where` / `fstat` / `opened`。折叠目录不会递归探测，也不会显示潜在的子孙状态。当前目录中已打开为 delete 或 move/delete、因而已从磁盘消失的文件，会以只读虚拟行显示。
 
 Diff 以当前文件为画布：未改行就是文件本身，删除为红底 `-`，新增为绿底 `+`，行内替换会把变化的词标得更亮。远距未改默认折叠；修改区域上方和下方各有一条分割行，点击后朝该方向再展开 20 行上下文。`e` / **Expand all** 展开全部；**Prev** / **Next** 或 `[` / `]` 跳到上一/下一处改动。
 

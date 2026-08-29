@@ -14,6 +14,8 @@ use crate::{
     p4::{ExplorerError, LoadedDirectory},
 };
 
+use super::icons::explorer_icon;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplorerLoadState {
     Idle,
@@ -433,6 +435,25 @@ impl ExplorerModel {
         Some((row.path.clone(), row.kind, opened))
     }
 
+    pub fn selected_status(&self) -> Option<(String, String)> {
+        let rows = self.visible_rows();
+        let row = self.selected_row(&rows)?;
+        if row.kind == ExplorerEntryKind::Directory {
+            if let Some(
+                decoration @ (ExplorerDecoration::NotInView | ExplorerDecoration::Unmapped),
+            ) = row.decoration.as_ref()
+            {
+                return Some((decoration.badge().to_owned(), decoration.label()));
+            }
+            return Some((
+                "📁".to_owned(),
+                "folder status loads on expand; descendants are not scanned".to_owned(),
+            ));
+        }
+        let decoration = row.decoration.as_ref()?;
+        Some((decoration.badge().to_owned(), decoration.label()))
+    }
+
     pub fn select_path(&mut self, path: PathBuf) {
         self.selected = Some(path);
         self.follow_selection = true;
@@ -454,11 +475,11 @@ impl ExplorerModel {
     #[must_use]
     pub fn format_row(row: &VisibleExplorerRow, selected: bool) -> String {
         let caret = if selected { ">" } else { " " };
-        let glyph = match row.kind {
-            ExplorerEntryKind::Directory if row.expanded => "📂",
-            ExplorerEntryKind::Directory => "📁",
-            ExplorerEntryKind::File => "📄",
-        };
+        let glyph = explorer_icon(
+            &row.name,
+            row.kind == ExplorerEntryKind::Directory,
+            row.expanded,
+        );
         let indent = "  ".repeat(row.depth);
         let badge = row
             .decoration
@@ -749,6 +770,47 @@ mod tests {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())),
             Some("file-02.txt".into())
+        );
+    }
+
+    #[test]
+    fn directory_status_reports_its_own_mapping_failure() {
+        let root = PathBuf::from("C:/ws");
+        let mut explorer = ExplorerModel::new(root.clone());
+        explorer.install_ready_listing_for_test(LoadedDirectory {
+            path: root.clone(),
+            entries: vec![
+                ExplorerEntry {
+                    name: "outside".into(),
+                    path: root.join("outside"),
+                    kind: ExplorerEntryKind::Directory,
+                    decoration: Some(ExplorerDecoration::NotInView),
+                    file_type: None,
+                    have_rev: None,
+                    head_rev: None,
+                },
+                ExplorerEntry {
+                    name: "unmapped".into(),
+                    path: root.join("unmapped"),
+                    kind: ExplorerEntryKind::Directory,
+                    decoration: Some(ExplorerDecoration::Unmapped),
+                    file_type: None,
+                    have_rev: None,
+                    head_rev: None,
+                },
+            ],
+            truncated: false,
+        });
+
+        explorer.select_index(1);
+        assert_eq!(
+            explorer.selected_status(),
+            Some(("⊘".into(), "not in view".into()))
+        );
+        explorer.select_index(2);
+        assert_eq!(
+            explorer.selected_status(),
+            Some(("?".into(), "unmapped".into()))
         );
     }
 

@@ -255,7 +255,8 @@ Submit 测试还应覆盖：
 
 - 默认保持 `Agent CLI | 最右导航`，导航约占 20%；打开内容后保持 `Agent CLI | Content | 最右导航`，前两栏近似等宽。
 - File/Diff/CL 复用同一个 Content pane；关闭 Content 后 split 正常折叠，不替换或关闭 Agent pane。
-- 验证 Content 按 pane 宽度自动换行、文件续行保留空白行号 gutter 并与正文对齐、换行后完整纵向滚动、语法高亮、CL→Diff→返回，以及长行不会改变导航树宽度。
+- 验证 Content 按 pane 宽度自动换行、文件续行保留空白行号 gutter 并与正文对齐、换行后完整纵向滚动、语法高亮、CL 文件鼠标单击选择→Enter 打开 Diff→返回，以及长行不会改变导航树宽度。
+- Explorer fixture 分目录验证 `A/M/D/R/U/↓/⊘/?`、delete/move-delete 虚拟行和查询失败无装饰；用 fake transport 断言未展开目录不会产生 `where/fstat/opened` 请求。Review 验证内嵌描述/Review & Submit 仅进入 preflight，并显示 Changelists / File History / Workspace History 同级 section。
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。

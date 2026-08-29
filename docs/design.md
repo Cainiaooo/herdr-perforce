@@ -71,7 +71,7 @@
 | View | 布局 | 职责 |
 |---|---|---|
 | Explorer | 本地目录树 | 浏览 client 内未 opened 的文件；只读 P4 装饰；Enter 打开 File，`d` 打开 opened-file Diff |
-| Review | CL 树 | Enter 在 Content pane 打开 CL 文件列表；保留生成描述和 Submit 入口 |
+| Review | Submit 区 + CL 列表 | 上方显示当前 CL 描述和安全的 Review & Submit 入口；下方 Changelists 与 File History / Workspace History 同级，后两项暂作占位 |
 
 切换 view 不得重置当前 CL/文件选择，也不得重置 Explorer 的展开和滚动。`1` / `2` 只切换 Explorer 与 Review；Content pane 的滚动和返回栈独立于导航。
 
@@ -79,7 +79,7 @@
 
 - File：显示行号和按扩展名/首行选择的语法高亮。
 - Diff：以当前文件为画布的内联叠加；增/删/行内修改用不同颜色和 gutter 符号；远距未改可折叠。
-- CL：显示描述和文件列表，Enter 下钻 Diff，`Esc` 返回。
+- CL：显示描述和带颜色动作标记的文件列表；单击选择、Enter 下钻 Diff，`Esc` 返回。
 - File、Diff 和 CL 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动。
 
 ## 5. Changelist/File 树
@@ -145,8 +145,9 @@ Explorer 根：
 
 树行为：
 
-- 懒展开本地目录；遵守常见忽略（如 `.git` 目录可显示但默认折叠策略由实现决定，不读取 Git status）。
-- 装饰只读，来自对该路径的 `p4 fstat`/`opened`/`have`：unopened、opened（及 action）、out-of-date、not in view、unmapped。查询失败时装饰为空，不假装是 Git。
+- 懒展开本地目录；初始只查询根目录直接条目，folder 真正展开时才对它的直接条目批量运行 `where` / `fstat` / scoped `opened`。不递归探测折叠目录，也不聚合或显示其潜在子孙状态。
+- 装饰只读：`A` add/branch、`M` edit/integrate/import、`D` delete/purge/archive、`R` move/add 或 move/delete、`U` 本地未受控、`↓` have revision 落后、`⊘` not in view、`?` unmapped。状态使用与 IDE Source Control 接近的颜色；查询失败时装饰为空，不假装是 Git。
+- 当前已加载目录中的 delete / move-delete 文件即使已不在磁盘，也从该目录范围内的 `opened` 结果恢复成只读虚拟行；这不会触发对子目录的扫描。
 - 单击文件：在中间 Content pane 预览 **工作区当前内容**（文本 + 行号 + 语法高亮）。binary 用与 §6.3 同类的 metadata card，不解析资产内容。
 - 若该文件已 opened：提供在同一 Content pane 查看对应 Diff 的入口，不在 Explorer 里再画一份 submit UI。
 - 双击或 “Open with default app” 可交给 OS；首版不在树里执行 `p4 add/edit/delete/sync/revert`。

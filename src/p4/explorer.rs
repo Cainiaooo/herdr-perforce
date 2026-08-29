@@ -82,27 +82,27 @@ pub fn load_explorer_directory<T: P4Transport>(
     client: &P4Client<T>,
     identity: &WorkspaceIdentity,
     directory: &Path,
-    opened_records: &[StructuredRecord],
 ) -> Result<LoadedDirectory, ExplorerError> {
     let ignore_case = path_comparison_is_case_insensitive(&identity.case_handling);
     if !path_is_within_root(directory, &identity.root, ignore_case) {
         return Err(ExplorerError::OutsideClientRoot);
     }
 
-    let local = list_local_directory(directory, &identity.root, &identity.case_handling)
+    let mut local = list_local_directory(directory, &identity.root, &identity.case_handling)
         .map_err(ExplorerError::Io)?;
-    let truncated = local.len() > MAX_DIRECTORY_ENTRIES;
-    let local: Vec<LocalEntry> = local.into_iter().take(MAX_DIRECTORY_ENTRIES).collect();
-    if local.is_empty() {
-        return Ok(LoadedDirectory {
-            path: directory.to_path_buf(),
-            entries: Vec::new(),
-            truncated,
-        });
-    }
+    let mut truncated = local.len() > MAX_DIRECTORY_ENTRIES;
+    local.truncate(MAX_DIRECTORY_ENTRIES);
+
+    // `*` preserves directory-level lazy loading; `...` would scan descendants.
+    let opened_records = client
+        .run_records(&P4Query::OpenedInDirectory {
+            directory: directory.to_path_buf(),
+        })
+        .map(|response| response.records)
+        .unwrap_or_default();
 
     let paths: Vec<PathBuf> = local.iter().map(|entry| entry.path.clone()).collect();
-    let where_records = match collect_path_records(client, QueryKind::Where, &paths) {
+    let mut where_records = match collect_path_records(client, QueryKind::Where, &paths) {
         Ok(records) => records,
         Err(_) => {
             return Ok(LoadedDirectory {
@@ -112,6 +112,30 @@ pub fn load_explorer_directory<T: P4Transport>(
             });
         }
     };
+
+    let opened_depots = opened_depot_paths(&opened_records);
+    if !opened_depots.is_empty() {
+        if let Ok(opened_where) = collect_path_records(client, QueryKind::Where, &opened_depots) {
+            where_records.extend(opened_where);
+        }
+    }
+
+    truncated |= add_missing_opened_entries(
+        &mut local,
+        directory,
+        identity,
+        &where_records,
+        &opened_records,
+    );
+    if local.is_empty() {
+        return Ok(LoadedDirectory {
+            path: directory.to_path_buf(),
+            entries: Vec::new(),
+            truncated,
+        });
+    }
+
+    let paths: Vec<PathBuf> = local.iter().map(|entry| entry.path.clone()).collect();
     let fstat_records = match collect_path_records(client, QueryKind::Fstat, &paths) {
         Ok(records) => records,
         Err(_) => {
@@ -130,10 +154,87 @@ pub fn load_explorer_directory<T: P4Transport>(
             identity,
             &where_records,
             &fstat_records,
-            opened_records,
+            &opened_records,
         ),
         truncated,
     })
+}
+
+fn opened_depot_paths(records: &[StructuredRecord]) -> Vec<PathBuf> {
+    records
+        .iter()
+        .filter(|record| matches!(record.code, RecordCode::Stat))
+        .filter_map(|record| record.string("depotFile"))
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn add_missing_opened_entries(
+    entries: &mut Vec<LocalEntry>,
+    directory: &Path,
+    identity: &WorkspaceIdentity,
+    where_records: &[StructuredRecord],
+    opened_records: &[StructuredRecord],
+) -> bool {
+    let ignore_case = path_comparison_is_case_insensitive(&identity.case_handling);
+    let depot_to_local: BTreeMap<String, PathBuf> = where_records
+        .iter()
+        .filter(|record| matches!(record.code, RecordCode::Stat))
+        .filter_map(|record| Some((record.string("depotFile")?, record_local_path(record)?)))
+        .collect();
+    let mut existing: BTreeSet<String> = entries
+        .iter()
+        .map(|entry| path_lookup_key(&entry.path, ignore_case))
+        .collect();
+    let directory_key = path_lookup_key(directory, ignore_case);
+    let Ok(opened) = changed_files_from_opened(opened_records) else {
+        return false;
+    };
+    let mut truncated = false;
+    for file in opened {
+        if !matches!(file.action, FileAction::Delete | FileAction::MoveDelete) {
+            continue;
+        }
+        let Some(path) = depot_to_local.get(&file.depot_path) else {
+            continue;
+        };
+        if path
+            .parent()
+            .map(|parent| path_lookup_key(parent, ignore_case))
+            .as_deref()
+            != Some(directory_key.as_str())
+        {
+            continue;
+        }
+        let key = path_lookup_key(path, ignore_case);
+        if existing.contains(&key) {
+            continue;
+        }
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            truncated = true;
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        entries.push(LocalEntry {
+            name,
+            path: path.clone(),
+            kind: ExplorerEntryKind::File,
+        });
+        existing.insert(key);
+    }
+    entries.sort_by(|left, right| match (left.kind, right.kind) {
+        (ExplorerEntryKind::Directory, ExplorerEntryKind::File) => std::cmp::Ordering::Less,
+        (ExplorerEntryKind::File, ExplorerEntryKind::Directory) => std::cmp::Ordering::Greater,
+        _ => compare_entry_names(&left.name, &right.name, ignore_case),
+    });
+    truncated
 }
 
 #[derive(Clone, Copy)]
@@ -273,6 +374,7 @@ pub fn decorate_entries(
             let key = path_lookup_key(&entry.path, ignore_case);
             let facts = facts_for_entry(
                 &key,
+                entry.kind == ExplorerEntryKind::File,
                 where_index.get(&key),
                 fstat_index.get(&key),
                 opened_index.get(&key),
@@ -319,6 +421,7 @@ struct OpenedFact {
 
 fn facts_for_entry(
     _key: &str,
+    is_file: bool,
     where_fact: Option<&WhereFact>,
     fstat: Option<&FstatFact>,
     opened: Option<&OpenedFact>,
@@ -341,6 +444,7 @@ fn facts_for_entry(
     FileP4Facts {
         not_in_view,
         mapped,
+        untracked: is_file && mapped && fstat.is_none() && opened.is_none() && !query_failed,
         opened_action,
         opened_change,
         have_rev: fstat.and_then(|fact| fact.have_rev),
@@ -393,7 +497,9 @@ fn index_fstat_records(
     for record in records {
         if matches!(record.code, RecordCode::Error) {
             if let Some(path) = path_from_any_error(record) {
-                failed.insert(path_lookup_key(&path, ignore_case));
+                if !is_expected_fstat_miss(record) {
+                    failed.insert(path_lookup_key(&path, ignore_case));
+                }
             } else {
                 unscoped_failure = true;
             }
@@ -429,6 +535,16 @@ fn index_fstat_records(
         );
     }
     (index, failed, unscoped_failure)
+}
+
+fn is_expected_fstat_miss(record: &StructuredRecord) -> bool {
+    record.string("data").is_some_and(|data| {
+        let data = data.to_ascii_lowercase();
+        data.contains("no such file(s)")
+            || data.contains("no such file")
+            || data.contains("not in client view")
+            || data.contains("client's root")
+    })
 }
 
 fn index_opened_records(
@@ -779,6 +895,64 @@ mod tests {
         assert_eq!(by_name["secret.rs"], Some(ExplorerDecoration::NotInView));
     }
 
+    #[test]
+    fn mapped_local_file_missing_from_fstat_is_untracked() {
+        let tree = TempTree::new("untracked");
+        let path = tree.write("notes.txt", b"local only");
+        let local =
+            list_local_directory(&tree.root, &tree.root, &CaseHandling::Insensitive).expect("list");
+        let where_records = parse(&format!(
+            "{}\n",
+            json_line(&format!(
+                r#""depotFile":"//d/notes.txt","path":{}"#,
+                json_path(&path)
+            ))
+        ));
+        let fstat_records = parse(
+            &serde_json::json!({
+                "code": "error",
+                "data": format!("{} - no such file(s).\n", path.display())
+            })
+            .to_string(),
+        );
+        let decorated = decorate_entries(
+            local,
+            &identity_for(&tree.root),
+            &where_records,
+            &fstat_records,
+            &[],
+        );
+        assert_eq!(decorated[0].decoration, Some(ExplorerDecoration::Untracked));
+    }
+
+    #[test]
+    fn opened_delete_is_restored_as_a_lazy_directory_ghost_row() {
+        let tree = TempTree::new("deleted-ghost");
+        let deleted = tree.root.join("gone.txt");
+        let where_records = parse(&format!(
+            "{}\n",
+            json_line(&format!(
+                r#""depotFile":"//d/gone.txt","path":{}"#,
+                json_path(&deleted)
+            ))
+        ));
+        let opened_records = parse(
+            r#"{"code":"stat","depotFile":"//d/gone.txt","clientFile":"//ExampleClient/gone.txt","action":"delete","change":"42","type":"text","rev":"3"}"#,
+        );
+        let mut entries = Vec::new();
+        let truncated = add_missing_opened_entries(
+            &mut entries,
+            &tree.root,
+            &identity_for(&tree.root),
+            &where_records,
+            &opened_records,
+        );
+        assert!(!truncated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "gone.txt");
+        assert_eq!(entries[0].path, deleted);
+    }
+
     fn json_path(path: &Path) -> String {
         format!("\"{}\"", path.display().to_string().replace('\\', "\\\\"))
     }
@@ -836,6 +1010,12 @@ mod tests {
         tree.write("a.txt", b"a");
         let fake = FakeP4Transport::default();
         fake.push_output(RawP4Output {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        fake.push_output(RawP4Output {
             stdout: format!(
                 "{}\n",
                 json_line(&format!(
@@ -851,10 +1031,181 @@ mod tests {
         fake.push_error(crate::p4::TransportError::TimedOut);
         let client =
             P4Client::new_with_directory_environment(fake, "p4", &tree.root, BTreeMap::new());
-        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root, &[])
+        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root)
             .expect("local listing still works");
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].decoration, None);
+    }
+
+    #[test]
+    fn opened_query_failure_keeps_independent_file_decorations() {
+        let tree = TempTree::new("opened-failure");
+        let root_file = tree.write("root.txt", b"root");
+        let fake = FakeP4Transport::default();
+        fake.push_error(crate::p4::TransportError::TimedOut);
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n",
+                json_line(&format!(
+                    r#""depotFile":"//d/root.txt","path":{}"#,
+                    json_path(&root_file)
+                ))
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n",
+                json_line(&format!(
+                    r#""depotFile":"//d/root.txt","path":{},"isMapped":"1","type":"text","haveRev":"1","headRev":"2""#,
+                    json_path(&root_file)
+                ))
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        let client =
+            P4Client::new_with_directory_environment(fake, "p4", &tree.root, BTreeMap::new());
+
+        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root)
+            .expect("opened discovery is optional");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(
+            loaded.entries[0].decoration,
+            Some(ExplorerDecoration::OutOfDate)
+        );
+    }
+
+    #[test]
+    fn opened_where_failure_skips_ghosts_without_losing_local_decorations() {
+        let tree = TempTree::new("opened-where-failure");
+        let root_file = tree.write("root.txt", b"root");
+        let fake = FakeP4Transport::default();
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n",
+                json_line(
+                    r#""depotFile":"//d/gone.txt","clientFile":"//ExampleClient/gone.txt","action":"delete","change":"42","type":"text","rev":"3""#
+                )
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n",
+                json_line(&format!(
+                    r#""depotFile":"//d/root.txt","path":{}"#,
+                    json_path(&root_file)
+                ))
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        fake.push_error(crate::p4::TransportError::TimedOut);
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n",
+                json_line(&format!(
+                    r#""depotFile":"//d/root.txt","path":{},"isMapped":"1","type":"text","haveRev":"1","headRev":"1""#,
+                    json_path(&root_file)
+                ))
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        let client =
+            P4Client::new_with_directory_environment(fake, "p4", &tree.root, BTreeMap::new());
+
+        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root)
+            .expect("ghost recovery is optional");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].name, "root.txt");
+        assert_eq!(
+            loaded.entries[0].decoration,
+            Some(ExplorerDecoration::Unopened)
+        );
+    }
+
+    #[test]
+    fn directory_load_queries_only_immediate_rows_and_scopes_opened() {
+        let tree = TempTree::new("lazy-scope");
+        let child = tree.mkdir("src");
+        let root_file = tree.write("root.txt", b"root");
+        let nested = tree.write("src/nested.txt", b"nested");
+        let fake = FakeP4Transport::default();
+        fake.push_output(RawP4Output {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n{}\n",
+                json_line(&format!(
+                    r#""depotFile":"//d/src","path":{}"#,
+                    json_path(&child)
+                )),
+                json_line(&format!(
+                    r#""depotFile":"//d/root.txt","path":{}"#,
+                    json_path(&root_file)
+                ))
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        fake.push_output(RawP4Output {
+            stdout: format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "code": "error",
+                    "data": format!("{} - no such file(s).\n", child.display())
+                }),
+                json_line(&format!(
+                    r#""depotFile":"//d/root.txt","path":{},"isMapped":"1","type":"text","haveRev":"1","headRev":"1""#,
+                    json_path(&root_file)
+                ))
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
+        let client = P4Client::new_with_directory_environment(
+            fake.clone(),
+            "p4",
+            &tree.root,
+            BTreeMap::new(),
+        );
+
+        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root)
+            .expect("root directory");
+        assert_eq!(loaded.entries.len(), 2);
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].args[2], "opened");
+        assert!(requests[0].args[3].to_string_lossy().ends_with('*'));
+        for request in &requests {
+            assert!(
+                request.args.iter().all(|arg| arg != nested.as_os_str()),
+                "collapsed descendant leaked into request: {:?}",
+                request.args
+            );
+        }
     }
 
     #[test]
@@ -863,6 +1214,12 @@ mod tests {
         let mapped = tree.write("ok.txt", b"ok");
         let skipped = tree.write("skip.txt", b"no");
         let fake = FakeP4Transport::default();
+        fake.push_output(RawP4Output {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::ZERO,
+        });
         fake.push_output(RawP4Output {
             stdout: format!(
                 "{}\n{}\n",
@@ -895,7 +1252,7 @@ mod tests {
         });
         let client =
             P4Client::new_with_directory_environment(fake, "p4", &tree.root, BTreeMap::new());
-        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root, &[])
+        let loaded = load_explorer_directory(&client, &identity_for(&tree.root), &tree.root)
             .expect("mixed where");
         let by_name: BTreeMap<_, _> = loaded
             .entries

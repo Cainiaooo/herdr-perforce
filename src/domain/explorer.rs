@@ -30,6 +30,7 @@ pub enum ExplorerEntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplorerDecoration {
     Unopened,
+    Untracked,
     Opened {
         action: FileAction,
         change: Option<ChangelistId>,
@@ -44,9 +45,10 @@ impl ExplorerDecoration {
     pub fn badge(&self) -> &'static str {
         match self {
             Self::Unopened => "",
-            Self::Opened { action, .. } => short_action(action),
-            Self::OutOfDate => "*",
-            Self::NotInView => "-",
+            Self::Untracked => "U",
+            Self::Opened { action, .. } => action.short_badge(),
+            Self::OutOfDate => "↓",
+            Self::NotInView => "⊘",
             Self::Unmapped => "?",
         }
     }
@@ -54,12 +56,13 @@ impl ExplorerDecoration {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            Self::Unopened => "unopened".to_owned(),
+            Self::Unopened => "tracked and current".to_owned(),
+            Self::Untracked => "not under Perforce control".to_owned(),
             Self::Opened { action, change } => match change {
                 Some(change) => format!("{} in CL {change}", action.canonical_name()),
                 None => action.canonical_name().to_owned(),
             },
-            Self::OutOfDate => "out-of-date".to_owned(),
+            Self::OutOfDate => "behind depot revision".to_owned(),
             Self::NotInView => "not in view".to_owned(),
             Self::Unmapped => "unmapped".to_owned(),
         }
@@ -71,17 +74,6 @@ impl ExplorerDecoration {
             Self::Opened { change, .. } => *change,
             _ => None,
         }
-    }
-}
-
-fn short_action(action: &FileAction) -> &'static str {
-    match action {
-        FileAction::Add | FileAction::MoveAdd | FileAction::Branch => "A",
-        FileAction::Edit | FileAction::Integrate | FileAction::Import => "M",
-        FileAction::Delete | FileAction::MoveDelete | FileAction::Purge | FileAction::Archive => {
-            "D"
-        }
-        FileAction::Unknown(_) => "?",
     }
 }
 
@@ -100,6 +92,7 @@ pub struct ExplorerEntry {
 pub struct FileP4Facts {
     pub not_in_view: bool,
     pub mapped: bool,
+    pub untracked: bool,
     pub opened_action: Option<FileAction>,
     pub opened_change: Option<ChangelistId>,
     pub have_rev: Option<u64>,
@@ -114,6 +107,7 @@ impl FileP4Facts {
         Self {
             not_in_view: false,
             mapped: false,
+            untracked: false,
             opened_action: None,
             opened_change: None,
             have_rev: None,
@@ -126,8 +120,8 @@ impl FileP4Facts {
 
 /// Maps P4 where/fstat/opened facts to a decoration.
 ///
-/// Precedence: query failure → no badge; not in view; unmapped; opened;
-/// out-of-date; unopened.
+/// Precedence: query failure → no badge; not in view; opened; untracked;
+/// unmapped; out-of-date; clean tracked file.
 #[must_use]
 pub fn decoration_from_facts(facts: &FileP4Facts) -> Option<ExplorerDecoration> {
     if facts.query_failed {
@@ -136,14 +130,17 @@ pub fn decoration_from_facts(facts: &FileP4Facts) -> Option<ExplorerDecoration> 
     if facts.not_in_view {
         return Some(ExplorerDecoration::NotInView);
     }
-    if !facts.mapped {
-        return Some(ExplorerDecoration::Unmapped);
-    }
     if let Some(action) = facts.opened_action.clone() {
         return Some(ExplorerDecoration::Opened {
             action,
             change: facts.opened_change,
         });
+    }
+    if facts.untracked {
+        return Some(ExplorerDecoration::Untracked);
+    }
+    if !facts.mapped {
+        return Some(ExplorerDecoration::Unmapped);
     }
     if is_out_of_date(facts.have_rev, facts.head_rev) {
         return Some(ExplorerDecoration::OutOfDate);
@@ -343,6 +340,7 @@ mod tests {
         FileP4Facts {
             not_in_view: false,
             mapped: true,
+            untracked: false,
             opened_action: None,
             opened_change: None,
             have_rev: Some(3),
@@ -361,6 +359,13 @@ mod tests {
         assert_eq!(
             decoration_from_facts(&facts),
             Some(ExplorerDecoration::NotInView)
+        );
+
+        facts = facts_mapped();
+        facts.untracked = true;
+        assert_eq!(
+            decoration_from_facts(&facts),
+            Some(ExplorerDecoration::Untracked)
         );
 
         facts = facts_mapped();
@@ -406,6 +411,22 @@ mod tests {
             decoration_from_facts(&facts_mapped()),
             Some(ExplorerDecoration::Unopened)
         );
+    }
+
+    #[test]
+    fn badges_distinguish_move_untracked_and_behind_states() {
+        assert_eq!(ExplorerDecoration::Untracked.badge(), "U");
+        assert_eq!(ExplorerDecoration::OutOfDate.badge(), "↓");
+        for action in [FileAction::MoveAdd, FileAction::MoveDelete] {
+            assert_eq!(
+                ExplorerDecoration::Opened {
+                    action,
+                    change: Some(ChangelistId::Numbered(42)),
+                }
+                .badge(),
+                "R"
+            );
+        }
     }
 
     #[test]

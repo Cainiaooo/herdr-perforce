@@ -191,6 +191,17 @@ impl FileAction {
             Self::Unknown(value) => value,
         }
     }
+
+    #[must_use]
+    pub fn short_badge(&self) -> &'static str {
+        match self {
+            Self::Add | Self::Branch => "A",
+            Self::Edit | Self::Integrate | Self::Import => "M",
+            Self::Delete | Self::Purge | Self::Archive => "D",
+            Self::MoveAdd | Self::MoveDelete => "R",
+            Self::Unknown(_) => "?",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

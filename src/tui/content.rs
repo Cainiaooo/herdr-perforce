@@ -271,7 +271,7 @@ impl ContentPaneClient {
 
     pub fn show_changelist(&mut self, change: ChangelistId) -> Result<String, String> {
         self.open(ContentRequest::Changelist { change })?;
-        Ok(format!("Opened CL {change} files"))
+        Ok(format!("Showing CL {change} files in Content pane"))
     }
 
     #[cfg(test)]
@@ -1028,23 +1028,30 @@ impl ViewerState {
                 ));
                 for (index, file) in files.iter().enumerate() {
                     let marker = if index == *selected { ">" } else { " " };
-                    let path = file
+                    let mut path = file
                         .client_path
                         .as_ref()
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| file.depot_path.clone());
-                    let style = if index == *selected {
+                    if let Some(from) = file.moved_from.as_deref() {
+                        path.push_str(&format!("  ← {from}"));
+                    } else if let Some(to) = file.moved_to.as_deref() {
+                        path.push_str(&format!("  → {to}"));
+                    }
+                    let base = if index == *selected {
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .bg(Color::DarkGray)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
-                    lines.push(Line::styled(
-                        format!("{marker} {:<11} {path}", file.action.canonical_name()),
-                        style,
-                    ));
+                    let badge = file.action.short_badge();
+                    let color = file_action_color(&file.action);
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker} "), base),
+                        Span::styled(format!("{badge}  "), base.fg(color)),
+                        Span::styled(path, base),
+                    ]));
                 }
                 lines
             }
@@ -1250,6 +1257,44 @@ impl ViewerState {
         true
     }
 
+    fn select_changelist_file_at(&mut self, row: u16) -> bool {
+        if row < self.body_y || row >= self.body_y.saturating_add(self.body_height as u16) {
+            return false;
+        }
+        let visual_row = self
+            .scroll_y
+            .saturating_add(row.saturating_sub(self.body_y) as usize);
+        let first_file_row = match &self.document {
+            Document::Changelist { description, .. } => description.len().max(1) + 3,
+            _ => return false,
+        };
+        let lines = self.render_lines();
+        let mut visual_start = 0usize;
+        let mut selected_file = None;
+        for (source_row, line) in lines.iter().enumerate() {
+            let height = wrap::wrap_line(line, self.body_width.max(1)).len().max(1);
+            if visual_row >= visual_start && visual_row < visual_start.saturating_add(height) {
+                selected_file = source_row.checked_sub(first_file_row);
+                break;
+            }
+            visual_start = visual_start.saturating_add(height);
+        }
+        let Some(index) = selected_file else {
+            return false;
+        };
+        let Document::Changelist {
+            files, selected, ..
+        } = &mut self.document
+        else {
+            return false;
+        };
+        if index >= files.len() {
+            return false;
+        }
+        *selected = index;
+        true
+    }
+
     fn apply_toolbar(&mut self, action: DiffToolbarAction) -> bool {
         {
             let Document::Diff { view, .. } = &mut self.document else {
@@ -1284,6 +1329,16 @@ impl ViewerState {
         let visual = view.visual_row_for_overlay(overlay, self.body_width.max(1));
         self.scroll_y = visual.saturating_sub(1);
         self.clamp_scroll();
+    }
+}
+
+fn file_action_color(action: &FileAction) -> Color {
+    match action {
+        FileAction::Add | FileAction::Branch => Color::LightGreen,
+        FileAction::Edit | FileAction::Integrate | FileAction::Import => Color::Yellow,
+        FileAction::Delete | FileAction::Purge | FileAction::Archive => Color::Red,
+        FileAction::MoveAdd | FileAction::MoveDelete => Color::LightCyan,
+        FileAction::Unknown(_) => Color::Gray,
     }
 }
 
@@ -1663,8 +1718,11 @@ fn viewer_loop(
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => state.move_vertical(-3),
                     MouseEventKind::ScrollDown => state.move_vertical(3),
-                    MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Up(MouseButton::Left) => {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let _ = state.select_changelist_file_at(mouse.row)
+                            || state.handle_diff_click(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
                         let _ = state.handle_diff_click(mouse.column, mouse.row);
                     }
                     _ => {}
@@ -1734,7 +1792,7 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     frame.render_widget(paragraph, chunks[1]);
 
     let footer = match &state.document {
-        Document::Changelist { .. } => "↑↓/wheel: select   Enter: diff   q/Esc: close",
+        Document::Changelist { .. } => "click/↑↓/wheel: select   Enter: diff   q/Esc: close",
         Document::Diff { back: Some(_), .. } => {
             "[: prev change  ]: next change  e: unfold all  Enter/click ⋯: +20 lines  Esc: back  q: close"
         }
@@ -2072,6 +2130,47 @@ mod tests {
                 "truncated: 512 byte preview budget exceeded; truncated: 4000 line diff budget exceeded"
             )
         );
+    }
+
+    #[test]
+    fn clicking_a_changelist_file_row_changes_the_selection() {
+        let file = |name: &str, action: FileAction| ChangedFile {
+            depot_path: format!("//SampleDepot/{name}"),
+            client_path: Some(PathBuf::from("C:/ws").join(name)),
+            action,
+            file_type: crate::domain::FileType::new("text"),
+            base_revision: Some(1),
+            moved_from: None,
+            moved_to: None,
+        };
+        let mut state = ViewerState {
+            cwd: PathBuf::from("C:/ws"),
+            request: ContentRequest::Changelist {
+                change: ChangelistId::Numbered(42),
+            },
+            document: Document::Changelist {
+                title: "CL 42".into(),
+                context: "pending".into(),
+                description: vec!["A useful description".into()],
+                files: vec![
+                    file("first.rs", FileAction::Edit),
+                    file("second.rs", FileAction::MoveAdd),
+                ],
+                selected: 0,
+            },
+            scroll_y: 0,
+            body_width: 100,
+            body_height: 20,
+            body_y: 2,
+            toolbar_hits: Vec::new(),
+            last_fold_click: None,
+        };
+
+        assert!(state.select_changelist_file_at(7));
+        let Document::Changelist { selected, .. } = state.document else {
+            panic!("expected changelist");
+        };
+        assert_eq!(selected, 1);
     }
 
     #[test]

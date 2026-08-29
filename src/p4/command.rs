@@ -32,6 +32,11 @@ pub enum P4Query {
     Fstat {
         paths: Vec<PathBuf>,
     },
+    /// Opened files directly inside one local directory. The trailing `*` is
+    /// an intentional Perforce wildcard; the directory itself is escaped.
+    OpenedInDirectory {
+        directory: PathBuf,
+    },
     OpenedOnClient,
 }
 
@@ -103,10 +108,24 @@ impl P4Query {
                         .map(|path| escape_p4_file_arg(path.as_os_str())),
                 );
             }
+            Self::OpenedInDirectory { directory } => {
+                args.push(OsString::from("opened"));
+                args.push(directory_wildcard(directory));
+            }
             Self::OpenedOnClient => args.push(OsString::from("opened")),
         }
         args
     }
+}
+
+fn directory_wildcard(directory: &std::path::Path) -> OsString {
+    let mut value = escape_p4_file_arg(directory.as_os_str());
+    let raw = directory.as_os_str().to_string_lossy();
+    if !raw.is_empty() && !raw.ends_with('/') && !raw.ends_with('\\') {
+        value.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    value.push("*");
+    value
 }
 
 /// Percent-encodes Perforce revision/wildcard metacharacters in a file argument.
@@ -225,6 +244,17 @@ mod tests {
     fn opened_on_client_does_not_pass_a_changelist_filter() {
         let args = P4Query::OpenedOnClient.args();
         assert_eq!(args, ["-ztag", "-Mj", "opened"].map(OsString::from));
+    }
+
+    #[test]
+    fn opened_directory_query_keeps_only_the_trailing_wildcard_active() {
+        let directory = PathBuf::from("C:/Example#Workspace/src");
+        let args = P4Query::OpenedInDirectory { directory }.args();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[2], "opened");
+        let pattern = args[3].to_string_lossy();
+        assert!(pattern.contains("Example%23Workspace"));
+        assert!(pattern.ends_with(&format!("{}*", std::path::MAIN_SEPARATOR)));
     }
 
     #[test]

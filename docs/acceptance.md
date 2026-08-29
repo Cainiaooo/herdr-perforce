@@ -191,6 +191,7 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 - `↑`/`↓`、PageUp/PageDown 和鼠标滚轮可到达加载预算内的全部行。
 - File、Diff 和 CL 长行按 Content pane 的当前宽度自动换成多行，并且所有换行后的显示行均可纵向滚动到达；文件续行不重复行号，但保留等宽空白 gutter，正文起点与首行一致。
+- CL 文件列表可用鼠标单击切换高亮选择，`Enter` 从该选择打开 Diff；鼠标选择长路径的任一换行也命中同一文件。
 - 文件按类型高亮；Diff 的新增（绿 `+`）、删除（红 `-`）和行内修改可区分，折叠行可展开。
 - 长行和滚动不改变最右 Navigation 的宽度或树对齐。
 
@@ -344,7 +345,7 @@ Explorer 是 Dogfood Gate 能力（ADR-0005）。不替代 ACC-TREE；CL 树与�
 期望：
 
 - 显示 workspace cwd 下的目录树，不列出 Client root 之外的路径。
-- 懒展开；刷新后尽量保持展开和选中。
+- 懒展开；根加载只查询根的直接条目，展开 folder 后才查询该 folder 的直接条目。不得为折叠目录递归运行状态查询或聚合潜在状态；刷新后尽量保持展开和选中。
 - 不属于 client view 时不画树，显示连接说明。
 
 ### ACC-EXPLORER-002（P0）文本预览
@@ -354,13 +355,17 @@ Explorer 是 Dogfood Gate 能力（ADR-0005）。不替代 ACC-TREE；CL 树与�
 
 ### ACC-EXPLORER-003（P0）只读 P4 装饰
 
-fixture 覆盖：unopened、opened edit/add/delete、out-of-date、not in view。
-期望：装饰来自 P4 只读查询；查询失败时无装饰，不显示 Git status。树上不能发起 add/edit/delete/sync/revert。
+fixture 覆盖：clean tracked、untracked、opened add/edit/delete/move、out-of-date、not in view、unmapped，以及已经从磁盘消失的 opened delete/move-delete。
+期望：装饰来自当前已加载目录范围内的 P4 只读查询；`A/M/D/R/U/↓/⊘/?` 的符号、颜色和说明一致。删除或 move-delete 以当前目录的只读虚拟行显示。查询失败时无装饰，不显示 Git status。树上不能发起 add/edit/delete/sync/revert。
 
 ### ACC-EXPLORER-004（P0）与 Review view 切换
 
 步骤：在 Explorer 选中已 opened 文件并打开 Diff，切到 Review（`2`），打开 CL 文件列表，再切回 Explorer（`1`）。
 期望：两边选择不丢；File/Diff/CL 复用 Content pane。Submit overlay 只存在于 Review。
+
+### ACC-EXPLORER-005（P0）Review pane 的 IDE 式层级
+
+期望：Review 上方固定显示当前 CL 描述框和 Review & Submit 入口；点击入口只打开既有 preflight/确认 overlay，不直接运行 submit。下方 `CHANGELISTS`、`FILE HISTORY`、`WORKSPACE HISTORY` 是同级 section，后两项明确为未实现占位；CL 选择变化会刷新上方描述。
 
 ## 8. Diff
 
