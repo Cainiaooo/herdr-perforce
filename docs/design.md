@@ -37,8 +37,8 @@
 | 一致性 | 双 freshness token、request epoch 和有界 cache | 不能用单个时间戳覆盖 pending 本地内容；见 [ADR-0002](adr/0002-consistency-and-async-invalidation.md) |
 | 首版写操作 | 更新 pending CL 描述；提交指定 numbered pending CL | 满足日用闭环，其余写操作继续保持非目标 |
 | Agent 描述 | 可配置 Agent CLI、argv 和 Prompt 的 one-shot 生成器 | 支持不同 Agent；配置只能来自受信任用户目录，见 [ADR-0004](adr/0004-agent-generator-trust-boundary.md) |
-| 自动化边界 | 不允许自动提交；所有写操作均需要显式人工确认 | 单键只能打开确认 UI，不能构成写入授权；见 [ADR-0003](adr/0003-key-ownership-and-destructive-actions.md) |
-| Pane 生命周期 | 首次手动打开后按 workspace cwd 记忆，Herdr server startup 时幂等恢复 | 不修改 Herdr 全局快捷键；不在启动阶段扫描目录或探测 P4；缺失 workspace 安全跳过 |
+| 自动化边界 | 不允许自动提交；所有写操作均需要显式人工确认 | Description 的专用 Apply 按钮/组合键可构成一次授权；Submit 仍需独立确认 UI；见 [ADR-0003](adr/0003-key-ownership-and-destructive-actions.md) |
+| Pane 生命周期 | client-view 预检通过并手动打开后按 workspace cwd 记忆，Herdr server startup 时幂等恢复 | 不修改 Herdr 全局快捷键；只复查 remembered cwd，不扫描其他目录；缺失或已 unmapped workspace 安全清理 |
 
 ## 3. 宿主布局
 
@@ -546,11 +546,11 @@ Description Apply 前重新查询并比较 `spec_token`；Submit confirmation �
 
 首版不依赖 Herdr 的 Git worktree provenance；P4 workspace identity 完全由当前 cwd 和 P4 查询决定。
 
-Link/install 持久注册 manifest；terminal pane 是 Herdr session 的运行时对象，不因插件已注册就自动出现在每个 workspace。默认 `open_mode = remembered`：一次成功的 `open-pane` action 把 workspace cwd、Herdr workspace id hint 和 pane id hint 写入插件 state 目录。同一 Herdr workspace id 只保留一条记忆记录。
+Link/install 持久注册 manifest；terminal pane 是 Herdr session 的运行时对象，不因插件已注册就自动出现在每个 workspace。默认 `open_mode = remembered`：`open-pane` action 先对当前 cwd 执行有界、只读的 client-view 映射检查；只有映射成立且 pane 打开成功，才把 workspace cwd、Herdr workspace id hint 和 pane id hint 写入插件 state 目录。同一 Herdr workspace id 只保留一条记忆记录。映射明确不成立时不 split，并删除该 workspace 的旧 remembered 记录。
 
-Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-panes`。恢复流程先读取 Herdr workspace/pane snapshot，再按 workspace id（其次 cwd）匹配记忆记录；id hint 只用于优先匹配，不能覆盖 cwd 边界。同一 workspace 中 label 为 `Perforce` 的 pane 都是候选，插件还必须通过 `pane process-info` 确认前台存在 `herdr-p4 ... pane`（Windows 上包括 PowerShell 包装启动）才视为健康。同一 workspace 若已有健康导航 pane，不再打开第二个；多余的健康重复 pane 关掉并保留最右侧那个。标题仍是 `Perforce` 但前台只剩默认 shell 的 pane 是 corpse：Herdr 只恢复了槽位，进程已经死掉。恢复必须先清理这些空壳和残留 Content。Content 由普通 `pane split` 创建，重启后可能没有 plugin token；此时只有标题匹配、`process-info` 确认前台仍是 viewer 或默认 shell、并且布局确认它与导航候选水平相邻，才允许采用 plugin-first、plain-fallback 关闭。全部清理成功后，才从剩余的非插件 pane（通常是 Agent）右侧打开真正的导航 pane，并根据按 workspace 保存的最后 Content 请求重建中间 pane。任一关闭失败则不能继续 split。新 pane 和恢复的 Content 都使用 `--no-focus`。每个 workspace 使用独立的 `layout-<hash>.json` 保存导航比例、Explorer/Review 视图和最后 Content 请求，避免多个 pane 进程并发覆盖；旧版全局 `layout.json` 只作为迁移 fallback。
+Herdr server 恢复 session 并暴露 API 后，startup hook 执行 `restore-panes`。恢复流程读取 remembered state 与 Herdr workspace/pane snapshot，并只对每条 remembered cwd 执行一次有界、只读的 `p4 where`；它不枚举其他目录或 client。明确 unmapped 的记录必须先安全关闭已确认属于插件的 Navigation/Content pane，再删除 remembered 记录；连接、认证、权限或查询错误保留原记录并失败关闭，不能伪装成 unmapped。其余记录按 workspace id（其次 cwd）匹配；id hint 只用于优先匹配，不能覆盖 cwd 边界。同一 workspace 中 label 为 `Perforce` 的 pane 都是候选，插件还必须通过 `pane process-info` 确认前台存在 `herdr-p4 ... pane`（Windows 上包括 PowerShell 包装启动）才视为健康。同一 workspace 若已有健康导航 pane，不再打开第二个；多余的健康重复 pane 关掉并保留最右侧那个。标题仍是 `Perforce` 但前台只剩默认 shell 的 pane 是 corpse：Herdr 只恢复了槽位，进程已经死掉。恢复必须先清理这些空壳和残留 Content。Content 由普通 `pane split` 创建，重启后可能没有 plugin token；此时只有标题匹配、`process-info` 确认前台仍是 viewer 或默认 shell、并且布局确认它与导航候选水平相邻，才允许采用 plugin-first、plain-fallback 关闭。全部清理成功后，才从剩余的非插件 pane（通常是 Agent）右侧打开真正的导航 pane，并根据按 workspace 保存的最后 Content 请求重建中间 pane。任一关闭失败则不能继续 split。新 pane 和恢复的 Content 都使用 `--no-focus`。每个 workspace 使用独立的 `layout-<hash>.json` 保存导航比例、Explorer/Review 视图和最后 Content 请求，避免多个 pane 进程并发覆盖；旧版全局 `layout.json` 只作为迁移 fallback。
 
-关闭当前 pane 只改变当前 session，不表示忘记 workspace。首版不实现 `detected` 模式，不在 startup 中对所有 workspace 执行 `p4 info`。
+关闭当前 pane 只改变当前 session，不表示忘记 workspace。首版不实现 `detected` 模式；startup 不对所有 Herdr workspace 执行 P4 探测，只复查插件自己已经记住的 cwd。
 
 ## 13. 配置与状态
 

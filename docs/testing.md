@@ -260,9 +260,9 @@ Submit 测试还应覆盖：
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。
-- 首次成功手动打开后检查状态只写入 `HERDR_PLUGIN_STATE_DIR`；重启 Herdr server 后恢复 remembered workspace，重复 startup 不创建第二个 Perforce pane。同一 workspace 因不同 cwd 产生的重复记忆记录必须合并；Windows 上 PowerShell 包装的 `herdr-p4 pane` 视为健康进程。标题仍是 `Perforce` 但进程已是默认 shell 的 pane 必须先关闭再打开。按 workspace 验证导航比例、Explorer/Review 视图和最后 Content 请求；恢复后重建正确的两栏或三栏顺序，不得停在 50/50，也不得被另一 workspace 的比例覆盖。
+- 手动打开先用 fake P4 验证 remembered cwd 的只读 client-view 映射；mapped 且 pane 打开成功后，状态只写入 `HERDR_PLUGIN_STATE_DIR`。unmapped 时不得 split，并删除该 workspace 的旧记录；连接/认证/查询失败不得删除旧记录。重启 Herdr server 后恢复 remembered workspace，重复 startup 不创建第二个 Perforce pane。同一 workspace 因不同 cwd 产生的重复记忆记录必须合并；Windows 上 PowerShell 包装的 `herdr-p4 pane` 视为健康进程。标题仍是 `Perforce` 但进程已是默认 shell 的 pane 必须先关闭再打开。按 workspace 验证导航比例、Explorer/Review 视图和最后 Content 请求；恢复后重建正确的两栏或三栏顺序，不得停在 50/50，也不得被另一 workspace 的比例覆盖。
 - 同一 server 上仅重新连接客户端不应重复执行 startup；缺失 workspace 安全 skip，恢复 pane 使用 `--no-focus`。
-- startup 期间用 fake `herdr` 捕获 argv，确认只执行 workspace/pane/process-info/layout 查询、plugin pane open 和对确认 stale pane 的 pane close；带完整 token 的 Content 可正常清理，token 丢失的标题候选必须同时通过 viewer/默认-shell 进程身份和与导航候选水平相邻的布局检查，之后按 plugin-first、plain-fallback 清理。任一检查或关闭失败后不得继续 open。不得关闭仅标题相似的 Agent pane；不运行 `p4`，也不同时传 `--workspace` 与 `--target-pane`。
+- startup 期间用 fake `herdr` 与 fake `p4` 捕获 argv，确认 P4 侧只对 remembered cwd 执行有界只读 `where`，不扫描其他 workspace/client；Herdr 侧只执行 workspace/pane/process-info/layout 查询、plugin pane open 和对确认 stale pane 的 pane close。unmapped 记录只有在已确认插件 pane 全部清理成功后才删除；查询错误保留记录。带完整 token 的 Content 可正常清理，token 丢失的标题候选必须同时通过 viewer/默认-shell 进程身份和与导航候选水平相邻的布局检查，之后按 plugin-first、plain-fallback 清理。任一检查或关闭失败后不得继续 open。不得关闭仅标题相似的 Agent pane，也不得同时传 `--workspace` 与 `--target-pane`。
 
 ### 6.5 故障注入
 

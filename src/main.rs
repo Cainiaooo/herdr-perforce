@@ -6,11 +6,13 @@ use std::{
     process::{Command as ProcessCommand, ExitCode, ExitStatus, Output},
 };
 
-use herdr_perforce::p4::{P4Client, StdProcessTransport, run_level_b_read_only};
+use herdr_perforce::p4::{
+    P4Client, StdProcessTransport, cwd_is_in_client_view, run_level_b_read_only,
+};
 use herdr_perforce::panel_restore::{
-    HerdrPane, PanelOpenMode, RememberedWorkspace, load_content_request, load_navigator_share,
-    load_panel_open_mode, load_remembered_workspaces, matching_workspace, opened_pane_id,
-    pane_process_is_active, parse_pane_list, perforce_content_label_panes,
+    HerdrPane, PanelOpenMode, RememberedWorkspace, forget_workspace, load_content_request,
+    load_navigator_share, load_panel_open_mode, load_remembered_workspaces, matching_workspace,
+    opened_pane_id, pane_process_is_active, parse_pane_list, perforce_content_label_panes,
     perforce_pane_candidates, preferred_perforce_pane, remember_workspace, restore_decision,
     save_navigator_share, workspace_layout_exists,
 };
@@ -279,6 +281,27 @@ fn open_herdr_pane() -> ExitCode {
     let workspace_cwd = context
         .as_ref()
         .and_then(|context| workspace_cwd_from_context(context, plugin_root.as_deref()));
+    let pane_cwd = context
+        .as_ref()
+        .and_then(|context| pane_cwd_from_context(context, plugin_root.as_deref()));
+    let Some(pane_cwd) = pane_cwd.as_deref() else {
+        eprintln!("Perforce pane was not opened: workspace cwd is unavailable");
+        return ExitCode::from(66);
+    };
+    match workspace_cwd_is_mapped(pane_cwd) {
+        Ok(true) => {}
+        Ok(false) => {
+            forget_context_workspace(context.as_ref(), pane_cwd, workspace_cwd.as_deref());
+            eprintln!(
+                "Perforce pane was not opened: the workspace path is not in the current client view"
+            );
+            return ExitCode::from(66);
+        }
+        Err(error) => {
+            eprintln!("Perforce pane was not opened: workspace mapping check failed: {error}");
+            return ExitCode::from(69);
+        }
+    }
     let mut command = ProcessCommand::new(&executable);
     let args = herdr_open_pane_args(context.as_ref(), plugin_root.as_deref());
     command.args(args);
@@ -299,6 +322,28 @@ fn open_herdr_pane() -> ExitCode {
             eprintln!("Could not invoke the Herdr binary from HERDR_BIN_PATH");
             ExitCode::from(69)
         }
+    }
+}
+
+fn workspace_cwd_is_mapped(cwd: &Path) -> Result<bool, String> {
+    let client = P4Client::new(StdProcessTransport, "p4", cwd);
+    cwd_is_in_client_view(&client, cwd).map_err(|error| error.to_string())
+}
+
+fn forget_context_workspace(
+    context: Option<&Value>,
+    pane_cwd: &Path,
+    workspace_cwd: Option<&Path>,
+) {
+    let Some(state_dir) = env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let workspace_cwd = workspace_cwd.unwrap_or(pane_cwd);
+    let workspace_id = context
+        .and_then(|value| value.get("workspace_id"))
+        .and_then(Value::as_str);
+    if let Err(error) = forget_workspace(&state_dir, pane_cwd, workspace_cwd, workspace_id) {
+        eprintln!("Perforce workspace record could not be removed: {error}");
     }
 }
 
@@ -396,11 +441,71 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
     let mut failed = 0usize;
     let mut stale_closed = 0usize;
     let mut duplicates_closed = 0usize;
+    let mut unmapped_removed = 0usize;
     for entry in remembered.iter().filter(|entry| {
         requested_workspace
             .as_deref()
             .is_none_or(|requested| paths_equal(requested, &entry.workspace_cwd))
     }) {
+        match workspace_cwd_is_mapped(&entry.cwd) {
+            Ok(true) => {}
+            Ok(false) => {
+                let mut cleanup_failed = 0usize;
+                if let Some(workspace) = matching_workspace(entry, &panes) {
+                    let candidates = perforce_pane_candidates(entry, &workspace, &panes);
+                    let session_content_panes = perforce_content_label_panes(&workspace, &panes)
+                        .into_iter()
+                        .filter(|pane| !pane.content_owned)
+                        .collect::<Vec<_>>();
+                    let session_content_ids = match authenticated_session_content_ids(
+                        &executable,
+                        &session_content_panes,
+                        &candidates,
+                    ) {
+                        Ok(ids) => ids,
+                        Err(_) => {
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    let decision = restore_decision(entry, &workspace, &panes, &[], &[]);
+                    let content_cleanup =
+                        close_restored_panes(&executable, &decision.leftover_content_ids);
+                    stale_closed += content_cleanup.closed;
+                    cleanup_failed += content_cleanup.failed;
+                    let session_cleanup = close_restored_panes(&executable, &session_content_ids);
+                    stale_closed += session_cleanup.closed;
+                    cleanup_failed += session_cleanup.failed;
+                    let navigation_cleanup =
+                        close_restored_panes(&executable, &decision.stale_nav_ids);
+                    stale_closed += navigation_cleanup.closed;
+                    cleanup_failed += navigation_cleanup.failed;
+                }
+                if cleanup_failed > 0 {
+                    failed += cleanup_failed;
+                    continue;
+                }
+                let Some(state_dir) = state_dir.as_deref() else {
+                    failed += 1;
+                    continue;
+                };
+                match forget_workspace(
+                    state_dir,
+                    &entry.cwd,
+                    &entry.workspace_cwd,
+                    entry.workspace_id.as_deref(),
+                ) {
+                    Ok(true) => unmapped_removed += 1,
+                    Ok(false) => {}
+                    Err(_) => failed += 1,
+                }
+                continue;
+            }
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        }
         let Some(workspace) = matching_workspace(entry, &panes) else {
             unavailable += 1;
             continue;
@@ -551,7 +656,7 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
     }
 
     println!(
-        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, duplicates-closed={duplicates_closed}, unavailable={unavailable}, failed={failed}"
+        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, duplicates-closed={duplicates_closed}, unmapped-removed={unmapped_removed}, unavailable={unavailable}, failed={failed}"
     );
     if failed == 0 {
         ExitCode::SUCCESS

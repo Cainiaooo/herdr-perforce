@@ -214,6 +214,37 @@ pub fn remember_workspace(
         entries.drain(..excess);
     }
 
+    write_remembered_workspaces(state_dir, &entries)
+}
+
+pub fn forget_workspace(
+    state_dir: &Path,
+    cwd: &Path,
+    workspace_cwd: &Path,
+    workspace_id: Option<&str>,
+) -> Result<bool, &'static str> {
+    let cwd = strip_verbatim_prefix(cwd);
+    let workspace_cwd = strip_verbatim_prefix(workspace_cwd);
+    if !cwd.is_absolute() || !workspace_cwd.is_absolute() {
+        return Err("forgotten workspace identity is invalid");
+    }
+    let mut entries = load_remembered_workspaces(Some(state_dir))?;
+    let before = entries.len();
+    entries
+        .retain(|entry| !remembered_workspace_matches(entry, &cwd, &workspace_cwd, workspace_id));
+    if entries.len() == before {
+        return Ok(false);
+    }
+    write_remembered_workspaces(state_dir, &entries)?;
+    Ok(true)
+}
+
+fn write_remembered_workspaces(
+    state_dir: &Path,
+    entries: &[RememberedWorkspace],
+) -> Result<(), &'static str> {
+    fs::create_dir_all(state_dir).map_err(|_| "panel state directory could not be created")?;
+
     let value = json!({
         "version": 1,
         "workspaces": entries.iter().map(|entry| json!({
@@ -992,6 +1023,25 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].workspace_id.as_deref(), Some("w2"));
         assert_eq!(entries[0].pane_id.as_deref(), Some("w2:p3"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn forgetting_workspace_removes_only_the_matching_record() {
+        let root = temp_dir("forget-state");
+        let left = root.join("LeftWorkspace");
+        let right = root.join("RightWorkspace");
+        fs::create_dir_all(&left).expect("left workspace");
+        fs::create_dir_all(&right).expect("right workspace");
+        remember_workspace(&root, &left, &left, Some("w1"), Some("w1:p2")).expect("remember left");
+        remember_workspace(&root, &right, &right, Some("w2"), Some("w2:p3"))
+            .expect("remember right");
+
+        assert_eq!(forget_workspace(&root, &left, &left, Some("w1")), Ok(true));
+        assert_eq!(forget_workspace(&root, &left, &left, Some("w1")), Ok(false));
+        let entries = load_remembered_workspaces(Some(&root)).expect("state");
+        assert_eq!(entries.len(), 1);
+        assert!(paths_equal(&entries[0].workspace_cwd, &right));
         fs::remove_dir_all(root).ok();
     }
 

@@ -228,7 +228,8 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 步骤：在两个 Herdr workspace 中只对其中一个成功执行一次 Open Perforce review，重启 Herdr server，并再次触发一次 startup/handoff。
 期望：
 
-- 只恢复被记住且本次 session 仍存在的 workspace；不扫描其他目录、不运行 `p4`。
+- 只恢复被记住且本次 session 仍存在的 workspace；不扫描其他目录，只对 remembered cwd 执行有界、只读的 client-view 映射检查。
+- 明确 unmapped 的旧记录先安全关闭已确认属于插件的 Navigation/Content pane，再从 state 移除；连接、认证、权限或查询错误不得删除记录或继续创建重复 pane。
 - 已有匹配且 process-info 确认运行 `herdr-p4 ... pane`（含 Windows PowerShell 包装）的健康 pane 时不重复打开；同一 workspace 只保留一个导航 pane。
 - 标题是 `Perforce` 但前台只剩默认 shell 的 pane 视为 corpse：必须先关掉空壳和残留 Content pane，再打开真正的插件 pane。带完整 Content token 的 pane 可正常清理；重启后 token 丢失但标题匹配的候选还必须确认前台是 viewer/默认 shell 且与导航候选水平相邻，之后按 plugin-first、plain-fallback 清理。不得把同名 Agent 当成插件 pane。任一检查或清理关闭失败不得再 split，也不得静默忽略。
 - 用户拖动过的导航宽度按 workspace 写入插件 state；不同 workspace 的比例不得互相覆盖。重启后恢复 Explorer/Review 视图和最后 File/Diff/CL 内容，并保持 `Agent | Content | Navigation`；没有 Content 时保持 `Agent | Navigation`。不得被默认 50/50 覆盖。
@@ -251,10 +252,11 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 ### ACC-P4-002（P0）非 P4 目录
 
-步骤：从不属于任何有效 client view 的目录打开 pane。
+步骤：从不属于任何有效 client view 的目录调用 Open Perforce review，并在 state 中预置一条该 workspace 的旧 remembered 记录后触发 startup。
 期望：
 
-- 显示可操作的空状态。
+- action 显示明确的 not-in-client-view 错误，不创建 pane。
+- startup 安全关闭已确认属于插件的残留 pane，并删除旧 remembered 记录；下次重启不再出现。
 - 不扫描或猜测其他 client。
 - 不崩溃，不执行写命令。
 
@@ -688,7 +690,7 @@ Submit 仅对 owned、current-client、numbered pending CL 启用。以下对象
 
 期望：
 
-- 成功手动打开才 upsert workspace；失败打开不写状态。
+- client-view 预检通过且手动打开成功才 upsert workspace；unmapped 打开不创建 pane，并移除同 workspace 的旧状态；查询错误不覆盖旧状态。
 - 同一 cwd 大小写差异和 Windows `\\?\` 前缀不会产生重复记录。
 - 状态最多 128 个 workspace/64 KiB，只包含 cwd 和短期 Herdr id hint。
 - 损坏、超限、相对路径或未知版本失败关闭，原文件不被空状态覆盖。

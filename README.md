@@ -61,15 +61,16 @@ herdr plugin action invoke open --plugin herdr.perforce
 
 ### Panel 加载与自动恢复
 
-`herdr plugin link` 持久注册插件，但不会让 terminal pane 永久驻留。首次仍需在目标 workspace 手动执行一次 **Open Perforce review**；打开成功后，插件把该 workspace 记录到 Herdr 提供的 `HERDR_PLUGIN_STATE_DIR`。
+`herdr plugin link` 持久注册插件，但不会让 terminal pane 永久驻留。首次仍需在目标 workspace 手动执行一次 **Open Perforce review**；action 先用当前 cwd 执行一次有界、只读的 client-view 映射检查。只有映射成立且 pane 打开成功，插件才把该 workspace 记录到 Herdr 提供的 `HERDR_PLUGIN_STATE_DIR`。不在当前 client view 的目录不会创建 pane，并会撤销同 workspace 的旧 remembered 记录。
 
 之后 Herdr server 启动并恢复 session 时，manifest 的 startup hook 会：
 
-1. 读取已记住的 workspace，不扫描其他目录，也不在启动阶段运行 `p4`。
-2. 只处理本次 session 中仍存在且 cwd 匹配的 Herdr workspace。
-3. 对已有 `Perforce` pane 调用 `pane process-info`；前台是 `herdr-p4 ... pane`，或 Windows 上由 PowerShell 包装启动的同一命令，都视为健康并保持现状。同一 Herdr workspace 只保留一个导航 pane，多出来的重复 pane 会关掉。
-4. 标题是 `Perforce` 但里面只是 `PS ...>` 或其他默认 shell 的 pane 是 corpse：先关掉空壳和残留 Content pane，再从剩余 pane 打开真正的插件进程。Content 本来由普通 split 创建，重启后 token 可能丢失；只有标题匹配、前台仍是 viewer 或默认 shell、并且与已确认的导航候选水平相邻时才允许按 plugin-first、plain-fallback 路径清理。不能把同名 Agent 当成 Content，也不能把空壳当成已经恢复。新 pane 使用 `--no-focus`。
-5. 导航比例、Explorer/Review 视图以及最后打开的 File/Diff/CL 请求按 workspace 恢复；有 Content 时重新建立 `Agent | Content | Navigation`，且不抢焦点。
+1. 读取已记住的 workspace，不扫描其他目录；只对每条旧记录的原 cwd 执行一次有界、只读的 `p4 where` 映射检查。
+2. 已不在当前 client view 的记录会先安全关闭该 workspace 中已确认属于插件的 Navigation/Content pane，再从 remembered state 移除；连接、认证或查询错误不会被误判成“非 P4”并删除记录。
+3. 只恢复本次 session 中仍存在且 cwd 匹配的 Herdr workspace。
+4. 对已有 `Perforce` pane 调用 `pane process-info`；前台是 `herdr-p4 ... pane`，或 Windows 上由 PowerShell 包装启动的同一命令，都视为健康并保持现状。同一 Herdr workspace 只保留一个导航 pane，多出来的重复 pane 会关掉。
+5. 标题是 `Perforce` 但里面只是 `PS ...>` 或其他默认 shell 的 pane 是 corpse：先关掉空壳和残留 Content pane，再从剩余 pane 打开真正的插件进程。Content 本来由普通 split 创建，重启后 token 可能丢失；只有标题匹配、前台仍是 viewer 或默认 shell、并且与已确认的导航候选水平相邻时才允许按 plugin-first、plain-fallback 路径清理。不能把同名 Agent 当成 Content，也不能把空壳当成已经恢复。新 pane 使用 `--no-focus`。
+6. 导航比例、Explorer/Review 视图以及最后打开的 File/Diff/CL 请求按 workspace 恢复；有 Content 时重新建立 `Agent | Content | Navigation`，且不抢焦点。
 
 关闭并重新打开一个连接到同一 Herdr server 的客户端，不会重复运行 startup hook；要验证恢复行为，需要真正重启 Herdr server。仅关闭当前 Perforce pane 不会删除 workspace 记录，因此下次 server 启动仍会恢复它。
 
