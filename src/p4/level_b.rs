@@ -349,8 +349,9 @@ mod tests {
             command_names,
             ["info", "changes", "describe", "opened", "where"]
         );
-        assert_eq!(requests[1].args[3], "-m");
-        assert_eq!(requests[1].args[4].to_string_lossy(), "8");
+        assert_eq!(requests[1].args[3], "-l");
+        assert_eq!(requests[1].args[4], "-m");
+        assert_eq!(requests[1].args[5].to_string_lossy(), "8");
         assert_eq!(
             requests[4].args[3],
             Path::new("C:/Secret Workspace").join("...").as_os_str()

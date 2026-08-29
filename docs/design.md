@@ -249,7 +249,7 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 
 所有键位最终都应可配置。鼠标应支持节点选择、展开、滚动和宿主 split 分隔线拖动。
 
-按键路由优先级为 Herdr 宿主保留键、当前 overlay/文本输入、获得焦点的 P4 pane。Description 编辑器获得焦点后，普通字符、粘贴、方向键、`Enter` 和删除键都归编辑器；`Ctrl+Enter` 只进入 freshness review。Description Apply 确认和 Submit overlay 都默认 Cancel，最终写入只能通过显式选中对应 Apply/Submit 动作；背景列表输入、单独 `Enter`、失焦或关闭都不构成授权。
+按键路由优先级为 Herdr 宿主保留键、当前 overlay/文本输入、获得焦点的 P4 pane。Description 编辑器获得焦点后，普通字符、粘贴、方向键、`Enter` 和删除键都归编辑器；`Ctrl+Enter` 或点击 **Apply Description** 是 Description 修改的一次显式授权，并在后台完成 freshness 校验、写入和回读验证。Submit overlay 仍默认 Cancel，Submit 只能通过显式选中 Submit 动作；背景列表输入、单独 `Enter`、失焦或关闭都不构成授权。
 
 ## 8. Agent 审阅反馈
 
@@ -354,9 +354,9 @@ prompt = """
 
 ### 9.4 预览与应用
 
-- Review pane 的 Description 区是实际可聚焦的多行编辑器，而不是只读字符预览；支持键盘输入、UTF-8、括号粘贴和可见光标。光标定位、上下移动和三行视口都基于视觉折行；Preview/Confirm/Apply 继续使用编辑光标作为只读视口锚点。
-- 生成结果复用同一编辑缓冲区；`Ctrl+Enter` 或 **Review Description** 先产生 freshness preview，确认默认 Cancel。
-- 用户选择 Apply 后，再次确认目标 CL 仍为同一个 pending CL。
+- Review pane 的 Description 区是实际可聚焦的多行编辑器，而不是只读字符预览；列表使用完整描述查询，聚焦编辑器时再读取完整 change form，避免摘要截断。编辑器支持键盘输入、UTF-8、括号粘贴和可见光标。光标定位、上下移动和三行视口都基于视觉折行；Apply 使用编辑光标作为只读视口锚点。
+- 生成结果复用同一编辑缓冲区；`Ctrl+Enter` 或 **Apply Description** 一次显式确认本次修改。
+- 后台 Apply 在写前再次确认目标 CL 仍为同一个 pending CL 且 freshness token 未变化。
 - 使用 `p4 change -o` 读取完整 spec，仅替换 Description，再通过 `p4 change -i` 写回。
 - 其他 spec 字段必须逐字保留，除 P4 自己的规范化外不得改变。
 - 生成成功不等于 Apply 成功；两者分别显示结果。

@@ -363,7 +363,7 @@ mod tests {
         let requests = fake.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].cwd, PathBuf::from("C:/Example Workspace"));
-        assert_eq!(requests[0].args[6], "Example User");
+        assert_eq!(requests[0].args[7], "Example User");
         assert!(requests[0].stdin.is_empty());
         assert!(requests[0].environment.is_empty());
         assert!(

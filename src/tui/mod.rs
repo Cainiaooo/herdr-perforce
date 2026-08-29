@@ -42,9 +42,8 @@ use crate::{
         WorkspaceIdentity,
     },
     p4::{
-        AuthorizedDescriptionApply, DescriptionApplyError, DescriptionApplyIntent,
-        DescriptionApplyPreview, DescriptionApplyResult, DomainMappingError, ExplorerError,
-        LoadedDirectory, P4Client, P4Error, P4Query, P4Transport, P4WriteService,
+        DescriptionApplyError, DescriptionApplyIntent, DescriptionApplyResult, DomainMappingError,
+        ExplorerError, LoadedDirectory, P4Client, P4Error, P4Query, P4Transport, P4WriteService,
         StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview, SubmitReconciliationResult,
         SubmitResult, WorkspaceCwdError, cwd_is_in_client_view, load_explorer_directory,
         pending_changelists_from_changes, workspace_owning_cwd,
@@ -280,10 +279,10 @@ enum PaneMessage {
         request_id: u64,
         result: Result<SubmitReconciliationResult, SubmitError>,
     },
-    DescriptionPreview {
+    DescriptionLoaded {
         change: u64,
         request_id: u64,
-        result: Result<DescriptionApplyPreview, DescriptionApplyError>,
+        result: Result<String, DescriptionApplyError>,
     },
     DescriptionApplied {
         change: u64,
@@ -544,12 +543,18 @@ impl PaneModel {
         Ok((change_id, change.description.clone()))
     }
 
-    fn begin_description_edit(&mut self) {
+    fn begin_description_edit<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
         match self.selected_editable_description() {
-            Ok((change, description)) => {
-                self.description_editor.begin(change, &description);
-                self.status =
-                    format!("Editing CL {change} description · Ctrl+Enter reviews · Esc cancels");
+            Ok((change, _)) => {
+                self.description_request_id = self.description_request_id.wrapping_add(1);
+                let request_id = self.description_request_id;
+                self.description_editor = DescriptionEditor::Loading { change, request_id };
+                self.status = format!("Loading full CL {change} description...");
+                dispatch_description_load(Arc::clone(service), sender.clone(), change, request_id);
             }
             Err(message) => self.status = message,
         }
@@ -563,10 +568,11 @@ impl PaneModel {
         }
     }
 
-    fn start_description_preview<T: P4Transport + 'static>(
+    fn start_description_apply<T: P4Transport + 'static>(
         &mut self,
         service: &Arc<P4WriteService<T>>,
         sender: &mpsc::Sender<PaneMessage>,
+        intent: DescriptionApplyIntent,
     ) {
         let state = std::mem::take(&mut self.description_editor);
         let DescriptionEditor::Editing {
@@ -589,46 +595,9 @@ impl PaneModel {
         }
         self.description_request_id = self.description_request_id.wrapping_add(1);
         let request_id = self.description_request_id;
-        self.description_editor = DescriptionEditor::Previewing {
-            change,
-            input: input.clone(),
-            cursor,
-            request_id,
-        };
-        self.status = format!("Reviewing CL {change} description freshness...");
-        dispatch_description_preview(
-            Arc::clone(service),
-            sender.clone(),
-            change,
-            input,
-            request_id,
-        );
-    }
-
-    fn start_description_apply<T: P4Transport + 'static>(
-        &mut self,
-        service: &Arc<P4WriteService<T>>,
-        sender: &mpsc::Sender<PaneMessage>,
-    ) {
-        let state = std::mem::take(&mut self.description_editor);
-        let DescriptionEditor::Confirming {
-            preview, cursor, ..
-        } = state
-        else {
-            self.description_editor = state;
-            return;
-        };
-        let change = preview.change;
-        let input = preview.proposed_description.clone();
-        let Some(authorization) = preview.authorize(DescriptionApplyIntent::ApplyButton) else {
-            self.description_editor = DescriptionEditor::Idle;
-            return;
-        };
-        self.description_request_id = self.description_request_id.wrapping_add(1);
-        let request_id = self.description_request_id;
         self.description_editor = DescriptionEditor::Applying {
             change,
-            input,
+            input: input.clone(),
             cursor,
             request_id,
         };
@@ -637,22 +606,21 @@ impl PaneModel {
             Arc::clone(service),
             sender.clone(),
             change,
-            authorization,
+            input,
             request_id,
+            intent,
         );
     }
 
-    fn complete_description_preview(
+    fn complete_description_load(
         &mut self,
         change: u64,
         request_id: u64,
-        result: Result<DescriptionApplyPreview, DescriptionApplyError>,
+        result: Result<String, DescriptionApplyError>,
     ) {
         let state = std::mem::take(&mut self.description_editor);
-        let DescriptionEditor::Previewing {
+        let DescriptionEditor::Loading {
             change: expected_change,
-            input,
-            cursor,
             request_id: expected_request,
         } = state
         else {
@@ -660,29 +628,20 @@ impl PaneModel {
             return;
         };
         if change != expected_change || request_id != expected_request {
-            self.description_editor = DescriptionEditor::Previewing {
+            self.description_editor = DescriptionEditor::Loading {
                 change: expected_change,
-                input,
-                cursor,
                 request_id: expected_request,
             };
             return;
         }
         match result {
-            Ok(preview) => {
-                self.description_editor = DescriptionEditor::Confirming {
-                    preview,
-                    cursor,
-                    apply_selected: false,
-                };
-                self.status = "Description reviewed · confirm Apply or Cancel".to_owned();
+            Ok(description) => {
+                self.description_editor.begin(change, &description);
+                self.status =
+                    format!("Editing CL {change} description · Ctrl+Enter applies · Esc cancels");
             }
             Err(error) => {
-                self.description_editor = DescriptionEditor::Editing {
-                    change,
-                    input,
-                    cursor,
-                };
+                self.description_editor = DescriptionEditor::Idle;
                 self.status = error.to_string();
             }
         }
@@ -766,32 +725,20 @@ impl PaneModel {
             self.status = "Description Apply is running; wait for verification".to_owned();
             return;
         }
-        if matches!(
-            self.description_editor,
-            DescriptionEditor::Previewing { .. }
-        ) {
+        if matches!(self.description_editor, DescriptionEditor::Loading { .. }) {
             if key.code == KeyCode::Esc {
                 self.cancel_description_edit();
-            }
-            return;
-        }
-        if let DescriptionEditor::Confirming { apply_selected, .. } = &mut self.description_editor {
-            match key.code {
-                KeyCode::Esc => self.cancel_description_edit(),
-                KeyCode::Left | KeyCode::BackTab => *apply_selected = false,
-                KeyCode::Right | KeyCode::Tab => *apply_selected = true,
-                KeyCode::Enter if *apply_selected => {
-                    self.start_description_apply(service, sender);
-                }
-                KeyCode::Enter => self.cancel_description_edit(),
-                _ => {}
             }
             return;
         }
         match key.code {
             KeyCode::Esc => self.cancel_description_edit(),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_description_preview(service, sender);
+                self.start_description_apply(
+                    service,
+                    sender,
+                    DescriptionApplyIntent::ApplyShortcut,
+                );
             }
             KeyCode::Enter => {
                 self.insert_description_text("\n", "Description reached its input limit");
@@ -905,12 +852,12 @@ impl PaneModel {
                     MessageEffect::None
                 }
             }
-            PaneMessage::DescriptionPreview {
+            PaneMessage::DescriptionLoaded {
                 change,
                 request_id,
                 result,
             } => {
-                self.complete_description_preview(change, request_id, result);
+                self.complete_description_load(change, request_id, result);
                 MessageEffect::None
             }
             PaneMessage::DescriptionApplied {
@@ -1111,7 +1058,7 @@ impl PaneModel {
                 false
             }
             KeyCode::Char('e') | KeyCode::Char('E') if self.view == PaneView::Review => {
-                self.begin_description_edit();
+                self.begin_description_edit(service, sender);
                 false
             }
             _ if self.view == PaneView::Explorer => self.handle_explorer_key(key, sender),
@@ -1319,7 +1266,7 @@ impl PaneModel {
             .description_review
             .is_some_and(|target| target.contains(mouse.column, mouse.row))
         {
-            self.start_description_preview(service, sender);
+            self.start_description_apply(service, sender, DescriptionApplyIntent::ApplyButton);
             self.drag = None;
             return true;
         }
@@ -1335,12 +1282,7 @@ impl PaneModel {
             .description_apply
             .is_some_and(|target| target.contains(mouse.column, mouse.row))
         {
-            if let DescriptionEditor::Confirming { apply_selected, .. } =
-                &mut self.description_editor
-            {
-                *apply_selected = true;
-            }
-            self.start_description_apply(service, sender);
+            self.start_description_apply(service, sender, DescriptionApplyIntent::ApplyButton);
             self.drag = None;
             return true;
         }
@@ -1350,7 +1292,7 @@ impl PaneModel {
         {
             let was_active = self.description_editor.is_active();
             if !was_active {
-                self.begin_description_edit();
+                self.begin_description_edit(service, sender);
             }
             if matches!(self.description_editor, DescriptionEditor::Editing { .. })
                 && (REVIEW_DESCRIPTION_FIRST_ROW as u16
@@ -2292,16 +2234,15 @@ fn dispatch_overlay<T: P4Transport + 'static>(
     }
 }
 
-fn dispatch_description_preview<T: P4Transport + 'static>(
+fn dispatch_description_load<T: P4Transport + 'static>(
     service: Arc<P4WriteService<T>>,
     sender: mpsc::Sender<PaneMessage>,
     change: u64,
-    description: String,
     request_id: u64,
 ) {
     thread::spawn(move || {
-        let result = service.preview_description_apply(change, description);
-        let _ = sender.send(PaneMessage::DescriptionPreview {
+        let result = service.load_description_for_edit(change);
+        let _ = sender.send(PaneMessage::DescriptionLoaded {
             change,
             request_id,
             result,
@@ -2313,11 +2254,19 @@ fn dispatch_description_apply<T: P4Transport + 'static>(
     service: Arc<P4WriteService<T>>,
     sender: mpsc::Sender<PaneMessage>,
     change: u64,
-    authorization: AuthorizedDescriptionApply,
+    description: String,
     request_id: u64,
+    intent: DescriptionApplyIntent,
 ) {
     thread::spawn(move || {
-        let result = service.apply_description(authorization);
+        let result = service
+            .preview_description_apply(change, description)
+            .and_then(|preview| {
+                let authorization = preview
+                    .authorize(intent)
+                    .expect("Description Apply dispatch requires explicit write intent");
+                service.apply_description(authorization)
+            });
         let _ = sender.send(PaneMessage::DescriptionApplied {
             change,
             request_id,
@@ -2571,16 +2520,11 @@ fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: us
         ChangelistId::Default => None,
     };
     let editor_label = match (&pane.description_editor, numbered_change) {
+        (DescriptionEditor::Loading { change, .. }, Some(selected)) if *change == selected => {
+            " · LOADING FULL TEXT"
+        }
         (DescriptionEditor::Editing { change, .. }, Some(selected)) if *change == selected => {
             " · EDITING"
-        }
-        (DescriptionEditor::Previewing { change, .. }, Some(selected)) if *change == selected => {
-            " · REVIEWING"
-        }
-        (DescriptionEditor::Confirming { preview, .. }, Some(selected))
-            if preview.change == selected =>
-        {
-            " · CONFIRM APPLY"
         }
         (DescriptionEditor::Applying { change, .. }, Some(selected)) if *change == selected => {
             " · APPLYING"
@@ -2706,41 +2650,16 @@ fn render_description_actions(
             put_display(&mut frame.lines, 23, row, "click or e");
         }
         (DescriptionEditor::Editing { change, .. }, Some(selected)) if *change == selected => {
-            let (review, next) =
-                put_description_button(frame, row, 2, "[Review Description]", width);
-            frame.hits.description_review = Some(review);
+            let (apply, next) = put_description_button(frame, row, 2, "[Apply Description]", width);
+            frame.hits.description_review = Some(apply);
             let (cancel, _) =
                 put_description_button(frame, row, next.saturating_add(2), "[Cancel]", width);
             frame.hits.description_cancel = Some(cancel);
         }
-        (DescriptionEditor::Previewing { change, .. }, Some(selected)) if *change == selected => {
-            put_display(&mut frame.lines, 2, row, "Checking freshness...");
+        (DescriptionEditor::Loading { change, .. }, Some(selected)) if *change == selected => {
+            put_display(&mut frame.lines, 2, row, "Loading full description...");
             let (cancel, _) = put_description_button(frame, row, 24, "[Cancel]", width);
             frame.hits.description_cancel = Some(cancel);
-        }
-        (
-            DescriptionEditor::Confirming {
-                preview,
-                apply_selected,
-                ..
-            },
-            Some(selected),
-        ) if preview.change == selected => {
-            let cancel = if *apply_selected {
-                "  [Cancel]"
-            } else {
-                "> [Cancel]"
-            };
-            let apply = if *apply_selected {
-                "> [Apply Description]"
-            } else {
-                "  [Apply Description]"
-            };
-            let (cancel_rect, next) = put_description_button(frame, row, 2, cancel, width);
-            frame.hits.description_cancel = Some(cancel_rect);
-            let (apply_rect, _) =
-                put_description_button(frame, row, next.saturating_add(2), apply, width);
-            frame.hits.description_apply = Some(apply_rect);
         }
         (DescriptionEditor::Applying { change, .. }, Some(selected)) if *change == selected => {
             put_display(
@@ -2826,10 +2745,9 @@ fn explorer_legend() -> &'static str {
 fn review_help(pane: &PaneModel) -> &'static str {
     match &pane.description_editor {
         DescriptionEditor::Editing { .. } => {
-            "type/paste edit  Enter newline  Ctrl+Enter review  Esc cancel"
+            "type/paste edit  Enter newline  Ctrl+Enter apply  Esc cancel"
         }
-        DescriptionEditor::Confirming { .. } => "←/→ choose  Enter confirm  Esc cancel",
-        DescriptionEditor::Previewing { .. } => "checking description freshness  Esc cancel",
+        DescriptionEditor::Loading { .. } => "loading full description  Esc cancel",
         DescriptionEditor::Applying { .. } => "applying description; input is locked",
         DescriptionEditor::Idle => "e/click edit  ↑↓ select  Enter files  s review  r refresh",
     }
@@ -3505,8 +3423,14 @@ mod tests {
         );
         assert!(matches!(
             pane.description_editor,
-            DescriptionEditor::Editing { change: 1, .. }
+            DescriptionEditor::Loading { change: 1, .. }
         ));
+        let request_id = pane.description_request_id;
+        pane.handle_message(PaneMessage::DescriptionLoaded {
+            change: 1,
+            request_id,
+            result: Ok("Change 1".into()),
+        });
 
         dispatch_key(
             &mut pane,
@@ -3545,7 +3469,7 @@ mod tests {
             panic!("ready overview");
         };
         overview.changes[0].description.clear();
-        pane.begin_description_edit();
+        pane.description_editor.begin(42, "");
 
         let frame = render_frame(&pane, 80, 24);
         let description_rows = &frame.lines
@@ -3566,7 +3490,7 @@ mod tests {
     fn active_description_editor_blocks_context_menu_selection_and_submit() {
         let mut pane = pane_with_numbered_changes(2);
         pane.view = PaneView::Review;
-        pane.begin_description_edit();
+        pane.description_editor.begin(1, "Change 1");
 
         dispatch_mouse(
             &mut pane,
@@ -3595,7 +3519,7 @@ mod tests {
     }
 
     #[test]
-    fn description_review_states_keep_the_editing_viewport() {
+    fn description_apply_state_keeps_the_editing_viewport() {
         let mut pane = pane_with_changes();
         pane.view = PaneView::Review;
         let input = format!(
@@ -3607,44 +3531,17 @@ mod tests {
         );
         let cursor = input.len();
 
-        pane.description_editor = DescriptionEditor::Previewing {
+        pane.description_editor = DescriptionEditor::Applying {
             change: 42,
             input: input.clone(),
             cursor,
             request_id: 7,
         };
-        let preview_rows = render_frame(&pane, 20, 24).lines
-            [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS]
-            .to_vec();
-        assert!(preview_rows.join("\n").contains("3333"));
-        assert!(!preview_rows.join("\n").contains("0000"));
-
-        pane.description_editor = DescriptionEditor::Confirming {
-            preview: DescriptionApplyPreview {
-                change: 42,
-                current_description: "Fix submit overlay".into(),
-                proposed_description: input.clone(),
-                file_count: 0,
-                spec_token: crate::domain::SpecToken::from_bytes_for_test([1; 32]),
-            },
-            cursor,
-            apply_selected: false,
-        };
-        let confirm_rows = render_frame(&pane, 20, 24).lines
-            [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS]
-            .to_vec();
-        assert_eq!(confirm_rows, preview_rows);
-
-        pane.description_editor = DescriptionEditor::Applying {
-            change: 42,
-            input,
-            cursor,
-            request_id: 8,
-        };
         let applying_rows = render_frame(&pane, 20, 24).lines
             [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS]
             .to_vec();
-        assert_eq!(applying_rows, preview_rows);
+        assert!(applying_rows.join("\n").contains("3333"));
+        assert!(!applying_rows.join("\n").contains("0000"));
     }
 
     #[test]
@@ -3665,46 +3562,38 @@ mod tests {
     }
 
     #[test]
-    fn description_confirmation_defaults_to_cancel() {
+    fn ctrl_enter_starts_apply_without_a_second_confirmation() {
         let mut pane = pane_with_changes();
         pane.view = PaneView::Review;
-        pane.description_editor = DescriptionEditor::Confirming {
-            preview: DescriptionApplyPreview {
-                change: 42,
-                current_description: "Fix submit overlay".into(),
-                proposed_description: "Updated description".into(),
-                file_count: 0,
-                spec_token: crate::domain::SpecToken::from_bytes_for_test([1; 32]),
-            },
-            cursor: "Updated description".len(),
-            apply_selected: false,
-        };
-
-        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
-        assert!(rendered.contains("> [Cancel]"));
-        assert!(rendered.contains("  [Apply Description]"));
-
-        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(pane.description_editor, DescriptionEditor::Idle));
-        assert_eq!(
-            pane.selected_changelist()
-                .map(|change| change.description.as_str()),
-            Some("Fix submit overlay")
-        );
-    }
-
-    #[test]
-    fn stale_description_preview_message_cannot_replace_the_active_request() {
-        let mut pane = pane_with_changes();
-        pane.description_editor = DescriptionEditor::Previewing {
+        pane.description_editor = DescriptionEditor::Editing {
             change: 42,
             input: "Updated description".into(),
             cursor: "Updated description".len(),
+        };
+
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("[Apply Description]"));
+
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            pane.description_editor,
+            DescriptionEditor::Applying { request_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn stale_description_load_message_cannot_replace_the_active_request() {
+        let mut pane = pane_with_changes();
+        pane.description_editor = DescriptionEditor::Loading {
+            change: 42,
             request_id: 7,
         };
 
         assert_eq!(
-            pane.handle_message(PaneMessage::DescriptionPreview {
+            pane.handle_message(PaneMessage::DescriptionLoaded {
                 change: 42,
                 request_id: 6,
                 result: Err(DescriptionApplyError::Stale),
@@ -3713,7 +3602,7 @@ mod tests {
         );
         assert!(matches!(
             pane.description_editor,
-            DescriptionEditor::Previewing { request_id: 7, .. }
+            DescriptionEditor::Loading { request_id: 7, .. }
         ));
     }
 

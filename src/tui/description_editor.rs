@@ -1,4 +1,4 @@
-use crate::p4::{DescriptionApplyPreview, MAX_DESCRIPTION_BYTES};
+use crate::p4::MAX_DESCRIPTION_BYTES;
 
 use super::display::char_width;
 
@@ -6,21 +6,14 @@ use super::display::char_width;
 pub(super) enum DescriptionEditor {
     #[default]
     Idle,
+    Loading {
+        change: u64,
+        request_id: u64,
+    },
     Editing {
         change: u64,
         input: String,
         cursor: usize,
-    },
-    Previewing {
-        change: u64,
-        input: String,
-        cursor: usize,
-        request_id: u64,
-    },
-    Confirming {
-        preview: DescriptionApplyPreview,
-        cursor: usize,
-        apply_selected: bool,
     },
     Applying {
         change: u64,
@@ -150,21 +143,16 @@ impl DescriptionEditor {
                 input,
                 cursor,
             } if *editor_change == change => (input, Some(*cursor), Some(*cursor)),
-            Self::Previewing {
-                change: editor_change,
-                input,
-                cursor,
-                ..
-            }
-            | Self::Applying {
+            Self::Applying {
                 change: editor_change,
                 input,
                 cursor,
                 ..
             } if *editor_change == change => (input, None, Some(*cursor)),
-            Self::Confirming {
-                preview, cursor, ..
-            } if preview.change == change => (&preview.proposed_description, None, Some(*cursor)),
+            Self::Loading {
+                change: editor_change,
+                ..
+            } if *editor_change == change => ("Loading full description...", None, None),
             _ => (fallback, None, None),
         }
     }

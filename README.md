@@ -106,7 +106,7 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 | 滚轮 / 拖动 | 树与 CL 列表纵向滚动；横向拖动查看被截断的名称及 Explorer 状态图例 |
 | `d` | Explorer 中为 opened file 打开 Diff |
 | `o` | 使用系统默认应用打开 Explorer 选中路径 |
-| `e` / 点击描述框 | Review 中编辑当前 owned numbered pending CL 的 Description |
+| `e` / 点击描述框 | 读取完整 change form 后，编辑当前 owned numbered pending CL 的 Description |
 | `s` / 点击 **Review & Submit** | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
 | `r` | Explorer 中重新读取磁盘目录与已展开 folder 的 P4 状态；Review 中刷新 workspace/CL |
 | `q` | 在没有阻塞 overlay 时关闭插件 pane |
@@ -118,11 +118,10 @@ Description 编辑器：
 | 普通输入 / 粘贴 | 在 pane 内直接修改多行 Description；显示真实终端光标 |
 | `Enter` / `Tab` | 插入换行 / 缩进 |
 | 方向键、`Home` / `End`、`Backspace` / `Delete` | 移动光标或编辑文本 |
-| `Ctrl+Enter` / 点击 **Review Description** | 重新读取服务器状态并进入 Apply 确认；不会直接写入 |
+| `Ctrl+Enter` / 点击 **Apply Description** | 显式确认本次修改；重新校验 freshness 后写入并回读验证 |
 | `Esc` / 点击 **Cancel** | 丢弃本次编辑；不写入 P4 |
-| 确认时 `Left` / `Right` / `Tab` 后 `Enter` | 在 Cancel（默认）与 Apply Description 之间选择并确认 |
 
-编辑、freshness 检查和 Apply 进行中，背景 CL 列表不会响应选择或 Submit 快捷键。只有显式选中 **Apply Description** 才会创建写授权；Apply 会重新校验 freshness、只替换 Description，并在写后重新读取验证。
+列表使用 `p4 changes -l` 读取完整描述，进入编辑时还会从完整 change form 再次读取，避免长 Description 被摘要截断。加载、编辑、freshness 检查和 Apply 进行中，背景 CL 列表不会响应选择或 Submit 快捷键。`Ctrl+Enter` 或显式点击 **Apply Description** 会创建一次写授权；Apply 会重新校验 freshness、只替换 Description，并在写后重新读取验证，不需要第二次确认。
 
 Submit overlay：
 

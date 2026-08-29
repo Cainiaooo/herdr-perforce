@@ -49,6 +49,7 @@ impl P4Query {
             Self::PendingChanges { user, client } => {
                 args.extend([
                     OsString::from("changes"),
+                    OsString::from("-l"),
                     OsString::from("-s"),
                     OsString::from("pending"),
                     OsString::from("-u"),
@@ -64,6 +65,7 @@ impl P4Query {
             } => {
                 args.extend([
                     OsString::from("changes"),
+                    OsString::from("-l"),
                     OsString::from("-m"),
                     OsString::from(max_results.to_string()),
                     OsString::from("-s"),
@@ -167,9 +169,9 @@ mod tests {
         }
         .args();
 
-        assert_eq!(args[6], "Example User; submit");
-        assert_eq!(args[8], "Example Client & more");
-        assert_eq!(args.len(), 9);
+        assert_eq!(args[7], "Example User; submit");
+        assert_eq!(args[9], "Example Client & more");
+        assert_eq!(args.len(), 10);
     }
 
     #[test]
@@ -187,6 +189,7 @@ mod tests {
                 "-ztag",
                 "-Mj",
                 "changes",
+                "-l",
                 "-m",
                 "8",
                 "-s",

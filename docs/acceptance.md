@@ -365,7 +365,7 @@ fixture 覆盖：clean tracked、untracked、depot head 已 delete 且无 have r
 
 ### ACC-EXPLORER-005（P0）Review pane 的 IDE 式层级
 
-期望：Review 上方固定显示当前 CL 描述框和 Review & Submit 入口；点击入口只打开既有 preflight/确认 overlay，不直接运行 submit。owned numbered pending CL 的描述框可以通过点击或 `e` 获得焦点，显示真实光标，并支持 UTF-8、多行输入和粘贴；折行边界的光标和上下移动按三行框中的视觉行计算，空编辑缓冲区不得绘制 `<no description>` 占位文本。编辑时包括右键菜单、滚轮、CL 选择和 Submit 在内的背景鼠标/键盘输入都被锁定。`Ctrl+Enter` 或 **Review Description** 只进入 freshness 检查与确认，Preview/Confirm/Apply 保持最后编辑位置附近的视口，确认默认选择 Cancel；只有显式选择 **Apply Description** 才能写入，成功后必须刷新并显示服务器验证后的描述。输入达到上限时所有插入键都显示错误，不得静默丢弃。default、非 pending、其他 owner/client 的描述不可编辑。下方 `CHANGELISTS`、`FILE HISTORY`、`WORKSPACE HISTORY` 是同级 section，后两项明确为未实现占位；CL 选择变化会刷新上方描述。
+期望：Review 上方固定显示当前 CL 描述框和 Review & Submit 入口；点击入口只打开既有 preflight/确认 overlay，不直接运行 submit。CL 列表必须请求完整描述，owned numbered pending CL 的描述框通过点击或 `e` 获得焦点时还必须读取完整 change form，不得用可能截断的列表摘要初始化编辑器。编辑器显示真实光标，并支持 UTF-8、多行输入和粘贴；折行边界的光标和上下移动按三行框中的视觉行计算，空编辑缓冲区不得绘制 `<no description>` 占位文本。编辑时包括右键菜单、滚轮、CL 选择和 Submit 在内的背景鼠标/键盘输入都被锁定。`Ctrl+Enter` 或显式点击 **Apply Description** 一次即确认本次修改，随后自动完成 freshness 检查、写入和回读验证，不再要求第二次确认；Apply 期间保持最后编辑位置附近的只读视口。输入达到上限时所有插入键都显示错误，不得静默丢弃。default、非 pending、其他 owner/client 的描述不可编辑。下方 `CHANGELISTS`、`FILE HISTORY`、`WORKSPACE HISTORY` 是同级 section，后两项明确为未实现占位；CL 选择变化会刷新上方描述。
 
 ## 8. Diff
 
@@ -523,7 +523,7 @@ Agent CLI 返回有效文本。
 
 - 仅 owned numbered pending CL 可用。
 - Review pane 内联编辑器支持普通输入、UTF-8、多行和粘贴；Esc/Cancel 不写入。
-- Review Description 只生成带 freshness token 的确认，默认操作为 Cancel；Enter 本身不授权 Apply。
+- 进入编辑时从完整 change form 加载 Description；`Ctrl+Enter` 或点击 Apply Description 是一次显式写授权，普通 Enter 本身不授权 Apply。
 - Apply 前重新检查目标。
 - 仅 Description 发生预期变化。
 - Files、Jobs、Type、Client、User 等其他 spec 字段保持。

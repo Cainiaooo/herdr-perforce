@@ -256,7 +256,7 @@ Submit 测试还应覆盖：
 - 默认保持 `Agent CLI | 最右导航`，导航约占 20%；打开内容后保持 `Agent CLI | Content | 最右导航`，前两栏近似等宽。
 - File/Diff/CL 复用同一个 Content pane；关闭 Content 后 split 正常折叠，不替换或关闭 Agent pane。
 - 验证 Content 按 pane 宽度自动换行、文件续行保留空白行号 gutter 并与正文对齐、换行后完整纵向滚动、语法高亮、CL 文件鼠标单击选择→Enter 打开 Diff→返回，以及长行不会改变导航树宽度。
-- Explorer fixture 分目录验证 `A/M/D/R/U/↓/⊘/?`、head-deleted 同路径本地重建为 `U`、delete/move-delete 虚拟行、手动刷新和查询失败无装饰；用 fake transport 断言未展开目录不会产生 `where/fstat/opened` 请求。窄 pane 验证完整图例能横向平移。Review 验证内嵌 Description 可以点击或按 `e` 聚焦，支持 UTF-8、多行和括号粘贴并显示真实光标；覆盖折行前的光标归属、按视觉行上下移动、空 buffer 不显示占位符、输入上限错误可见、Preview/Confirm/Apply 视口保持。编辑期间右键菜单、背景选择和 Submit 均被锁定，过期 preview/apply 消息不能串线，确认默认 Cancel，成功 Apply 更新描述并触发刷新。Review & Submit 只进入 preflight，并显示 Changelists / File History / Workspace History 同级 section。
+- Explorer fixture 分目录验证 `A/M/D/R/U/↓/⊘/?`、head-deleted 同路径本地重建为 `U`、delete/move-delete 虚拟行、手动刷新和查询失败无装饰；用 fake transport 断言未展开目录不会产生 `where/fstat/opened` 请求。窄 pane 验证完整图例能横向平移。Review 验证 CL 列表带 `changes -l`、进入编辑时读取完整 change form，内嵌 Description 可以点击或按 `e` 聚焦，支持 UTF-8、多行和括号粘贴并显示真实光标；覆盖折行前的光标归属、按视觉行上下移动、空 buffer 不显示占位符、输入上限错误可见和 Apply 视口保持。编辑期间右键菜单、背景选择和 Submit 均被锁定，过期 load/apply 消息不能串线；`Ctrl+Enter` 或点击 Apply 一次即进入校验与写入，成功后更新描述并触发刷新。Review & Submit 只进入 preflight，并显示 Changelists / File History / Workspace History 同级 section。
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。

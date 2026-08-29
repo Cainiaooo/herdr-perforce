@@ -25,6 +25,7 @@ pub enum DescriptionApplyIntent {
     Close,
     LoseFocus,
     Enter,
+    ApplyShortcut,
     ApplyButton,
 }
 
@@ -129,7 +130,11 @@ impl DescriptionApplyPreview {
 
     #[must_use]
     pub fn authorize(self, intent: DescriptionApplyIntent) -> Option<AuthorizedDescriptionApply> {
-        (intent == DescriptionApplyIntent::ApplyButton).then_some(AuthorizedDescriptionApply {
+        matches!(
+            intent,
+            DescriptionApplyIntent::ApplyShortcut | DescriptionApplyIntent::ApplyButton
+        )
+        .then_some(AuthorizedDescriptionApply {
             change: self.change,
             proposed_description: self.proposed_description,
             expected_spec_token: self.spec_token,
@@ -186,6 +191,12 @@ impl<T: P4Transport> P4WriteService<T> {
             file_count: snapshot.changelist.files.len(),
             spec_token: snapshot.spec_token,
         })
+    }
+
+    pub fn load_description_for_edit(&self, change: u64) -> Result<String, DescriptionApplyError> {
+        let snapshot = self.load_snapshot(change)?;
+        validate_eligibility(&snapshot.workspace, &snapshot.changelist)?;
+        Ok(snapshot.changelist.description)
     }
 
     pub fn apply_description(
@@ -454,6 +465,39 @@ mod tests {
             };
             assert!(preview.authorize(intent).is_none());
         }
+        for intent in [
+            DescriptionApplyIntent::ApplyShortcut,
+            DescriptionApplyIntent::ApplyButton,
+        ] {
+            let preview = DescriptionApplyPreview {
+                change: 42,
+                current_description: "Old".into(),
+                proposed_description: "New".into(),
+                file_count: 1,
+                spec_token: SpecToken::from_bytes_for_test([1; 32]),
+            };
+            assert!(preview.authorize(intent).is_some());
+        }
+    }
+
+    #[test]
+    fn edit_load_uses_the_complete_change_form_description() {
+        const DESCRIBE_LONG: &[u8] = br#"{"change":"42","status":"pending","user":"ExampleAuthor","client":"ExampleClientA","desc":"Summary line\nDetail line 1\nDetail line 2","depotFile0":"//SampleDepot/a.txt","action0":"edit","type0":"text","rev0":"1"}"#;
+        const FORM_LONG: &[u8] = b"Change:\t42\nClient:\tExampleClientA\nUser:\tExampleAuthor\nStatus:\tpending\nDescription:\n\tSummary line\n\tDetail line 1\n\tDetail line 2\n\nFiles:\n\t//SampleDepot/a.txt\n";
+        let fake = FakeP4Transport::default();
+        push_snapshot(&fake, DESCRIBE_LONG, FORM_LONG);
+        let service = service(fake.clone());
+
+        let description = service
+            .load_description_for_edit(42)
+            .expect("full description");
+
+        assert_eq!(description, "Summary line\nDetail line 1\nDetail line 2");
+        assert_eq!(fake.requests().len(), 3);
+        assert_eq!(
+            fake.requests()[2].args,
+            ["change", "-o", "42"].map(OsString::from)
+        );
     }
 
     #[test]
