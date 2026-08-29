@@ -130,6 +130,18 @@ impl ExplorerModel {
         self.identity = None;
     }
 
+    /// Starts a full workspace refresh before the new `p4 info` result exists.
+    /// Incrementing the generation here prevents an older directory request
+    /// from repainting stale rows while identity and client mapping reload.
+    pub fn begin_workspace_refresh(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.load = ExplorerLoadState::Checking;
+        self.restore_selected = self.selected.clone();
+        self.listings.clear();
+        self.jump = None;
+        self.pending_load = None;
+    }
+
     pub fn begin_workspace_load(&mut self, identity: WorkspaceIdentity) -> u64 {
         let keep_expanded = self.expanded.clone();
         let keep_selected = self.selected.clone();

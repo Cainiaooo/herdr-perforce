@@ -71,26 +71,29 @@
 | View | 布局 | 职责 |
 |---|---|---|
 | Explorer | 本地目录树 | 浏览 client 内未 opened 的文件；只读 P4 装饰；Enter 打开 File，`d` 打开 opened-file Diff |
-| Review | Description/Submit 区 + CL 列表 | 上方显示当前 CL 的内联多行描述编辑器和安全的 Review & Submit 入口；下方 Changelists 与 File History / Workspace History 同级，后两项暂作占位 |
+| Review | Description/Submit 区 + 行内 CL/File 树 | 上方显示当前 CL 的内联多行描述编辑器和安全的 Review & Submit 入口；下方 CL 直接展开目录/文件，Changelists 与 File History / Workspace History 同级，后两项暂作占位 |
 
 切换 view 不得重置当前 CL/文件选择，也不得重置 Explorer 的展开和滚动。`1` / `2` 只切换 Explorer 与 Review；Content pane 的滚动和返回栈独立于导航。
+
+两个 pane 共用同一套克制的暗色视觉语言：活动 view 和主操作使用蓝色强调，选择行使用中性背景，P4 状态与 Diff 增删使用一致的语义色。标题、路径、状态和正文保持明确层级；快捷键以 keycap + 弱化说明呈现，Content pane 在窄宽度下自动换成多行。Herdr 已提供 pane 外框，因此插件内部不再叠加第二层外框。
 
 ### 4.2 Content pane
 
 - File：显示行号和按扩展名/首行选择的语法高亮。
 - Diff：以当前文件为画布的内联叠加；增/删/行内修改用不同颜色和 gutter 符号；远距未改可折叠。
-- CL：显示描述和带颜色动作标记的文件列表；单击选择、Enter 下钻 Diff，`Esc` 返回。
-- File、Diff 和 CL 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动。
+- CL 文件不再创建独立 Content 文档；它们在 Review 的 CL 行下直接展开。文件行按 Enter 时，Diff 复用既有 Content pane。
+- File 和 Diff 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动。
 
 ## 5. Changelist/File 树
 
 ### 5.1 树结构
 
 ```text
-▾ 123456  pending
-  M Source/Foo.cpp
-  A Source/Bar.cpp
-  D Source/Old.cpp
+▾ CL 123456  pending  (3)
+  📂 Source
+    [ ] M 🔩 Foo.cpp
+    [x] A 🔩 Bar.cpp
+    [ ] D 🔩 Old.cpp
 
 ▸ 123450  shelved
 ▸ 123420  submitted
@@ -107,12 +110,13 @@
 
 ### 5.2 节点行为
 
-- 单击 CL：选择 CL，并在左侧显示紧凑概览。
-- 展开 CL：异步加载文件列表。
+- 单击或 Enter CL：选择并在同一导航树内展开/折叠；展开时异步加载文件列表。
 - 折叠 CL：不丢弃已加载数据；下次刷新发现版本变化时再失效。
-- 单击文件：在左侧显示该文件 diff。
+- 单击文件或 Space：切换 `[ ]` / `[x]` 移动选择；Enter 在 Content pane 显示该文件 Diff。
 - 刷新后尽量维持 CL、文件、hunk 和滚动位置。
 - 被删除、无权限或已经提交的选中 CL 应显示明确状态，并安全选择相邻节点。
+- `n` 创建 owned current-client numbered pending CL；删除只允许再次确认为空的 owned numbered pending CL。
+- 一次文件选择只绑定一个源 CL；`v` 选择另一个 owned current-client pending CL，写前重读源/目标及文件归属，`reopen` 后同时验证两侧。
 
 ### 5.3 文件状态
 
@@ -131,7 +135,7 @@
 
 ### 5.4 与工作区 Explorer 的区别
 
-本节的树是 **changelist → opened/described 文件**，数据来自 `p4 opened` / `describe`，不是磁盘目录。不能把 depot 路径拼成假文件夹来冒充 Explorer。工作区目录树见 §5.5。
+本节的树是 **changelist → opened/described 文件**，数据来自 `p4 opened` / `describe`，不是磁盘扫描。目录层级优先使用真实 client-relative path；缺少 client path 时才按真实 depot path components 分组，不能凭字符串相似度发明目录。工作区目录树见 §5.5。
 
 ### 5.5 Workspace File Explorer
 
@@ -230,7 +234,9 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 | `1` / `2` | 在最右导航 pane 切换 Explorer / Review view |
 | `j` / `k`、方向键 | 在当前 pane 移动选择或滚动 |
 | `Left` / `Right` | 折叠或展开节点 |
-| `Enter` | Explorer 打开 File；Review 打开 CL 文件列表；Content 的 CL 列表下钻 Diff |
+| `Enter` | Explorer 打开 File；Review 的 CL 行展开/折叠，文件行打开 Diff |
+| `Space` | Review 文件行切换移动选择 |
+| `n` / `v` | 新建 CL / 把已选文件移动到目标 CL |
 | `d` | 为 Explorer 中已 opened 的文件打开 Diff |
 | `[` / `]` | 上一个/下一个 hunk（与 Diff 工具栏 Prev/Next 相同） |
 | `e` | Review 中聚焦当前 CL 的 Description 编辑器；Diff 中展开或收起全部远距未改折叠 |
@@ -640,7 +646,7 @@ Submit UI 还必须附带结果确定性：
 
 - P4 Code Review/Swarm 评论、投票、review state。
 - P4V 的完整替代；depot 浏览器；从 Explorer 树上执行 write 命令。
-- sync、reconcile、edit、add、delete、reopen。工作区 File Explorer（只读树 + 独立内容预览）属于目标，见 §5.5。
+- sync、reconcile、文件 edit/add/delete 和通用 reopen。当前只支持删除已验证为空的 owned numbered CL，以及将已选 opened files 在 owned current-client pending CL 之间执行有界 `reopen -c`。工作区 File Explorer（只读树 + 独立内容预览）属于目标，见 §5.5。
 - shelve、unshelve、revert、resolve。
 - stream graph 或 integration 工作台。
 - default changelist submit。

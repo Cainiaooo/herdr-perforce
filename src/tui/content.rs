@@ -38,13 +38,13 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use serde_json::{Value, json};
 
 use super::{
     diff::{self, DiffToolbarAction, DiffViewState},
-    syntax, wrap,
+    syntax, theme, wrap,
 };
 
 pub const CONTROL_ENV: &str = "HERDR_P4_CONTENT_CONTROL";
@@ -267,11 +267,6 @@ impl ContentPaneClient {
             fold_context: diff_fold_context(),
         })?;
         Ok(format!("Opened CL {change} diff: {name}"))
-    }
-
-    pub fn show_changelist(&mut self, change: ChangelistId) -> Result<String, String> {
-        self.open(ContentRequest::Changelist { change })?;
-        Ok(format!("Showing CL {change} files in Content pane"))
     }
 
     #[cfg(test)]
@@ -1003,7 +998,7 @@ impl ViewerState {
             Document::Diff { view, .. } => view.body_lines(),
             Document::Failed { message, .. } => vec![Line::styled(
                 message.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::CONFLICT.tui()),
             )],
             Document::Changelist {
                 description,
@@ -1014,7 +1009,9 @@ impl ViewerState {
                 let mut lines = Vec::new();
                 lines.push(Line::styled(
                     "Description",
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::HEADER.tui())
+                        .add_modifier(Modifier::BOLD),
                 ));
                 if description.is_empty() {
                     lines.push(Line::styled("(no description)", Color::DarkGray));
@@ -1024,10 +1021,12 @@ impl ViewerState {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!("Files ({})", files.len()),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::HEADER.tui())
+                        .add_modifier(Modifier::BOLD),
                 ));
                 for (index, file) in files.iter().enumerate() {
-                    let marker = if index == *selected { ">" } else { " " };
+                    let marker = if index == *selected { "›" } else { " " };
                     let mut path = file
                         .client_path
                         .as_ref()
@@ -1040,7 +1039,7 @@ impl ViewerState {
                     }
                     let base = if index == *selected {
                         Style::default()
-                            .bg(Color::DarkGray)
+                            .bg(theme::SELECTION_BG.tui())
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
@@ -1334,10 +1333,10 @@ impl ViewerState {
 
 fn file_action_color(action: &FileAction) -> Color {
     match action {
-        FileAction::Add | FileAction::Branch => Color::LightGreen,
-        FileAction::Edit | FileAction::Integrate | FileAction::Import => Color::Yellow,
-        FileAction::Delete | FileAction::Purge | FileAction::Archive => Color::Red,
-        FileAction::MoveAdd | FileAction::MoveDelete => Color::LightCyan,
+        FileAction::Add | FileAction::Branch => theme::ADDED.tui(),
+        FileAction::Edit | FileAction::Integrate | FileAction::Import => theme::MODIFIED.tui(),
+        FileAction::Delete | FileAction::Purge | FileAction::Archive => theme::DELETED.tui(),
+        FileAction::MoveAdd | FileAction::MoveDelete => theme::RENAMED.tui(),
         FileAction::Unknown(_) => Color::Gray,
     }
 }
@@ -1398,7 +1397,7 @@ fn numbered_file_lines(
         .map(|(index, line)| {
             let mut spans = vec![Span::styled(
                 format!("{:>number_width$}  ", index + 1),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED.tui()),
             )];
             spans.extend(line.spans);
             Line::from(spans)
@@ -1421,7 +1420,7 @@ fn numbered_file_lines(
         };
         output.push(Line::from(vec![
             Span::styled(" ".repeat(gutter_width), Color::DarkGray),
-            Span::styled(message, Color::Yellow),
+            Span::styled(message, theme::MODIFIED.tui()),
         ]));
     }
     (output, gutter_width)
@@ -1438,7 +1437,9 @@ fn metadata_lines(preview: PreviewContent) -> Vec<Line<'static>> {
                     .unwrap_or_else(|| "directory".to_owned()),
             ),
         ],
-        PreviewContent::Failed { message } => vec![Line::styled(message, Color::Red)],
+        PreviewContent::Failed { message } => {
+            vec![Line::styled(message, theme::CONFLICT.tui())]
+        }
         PreviewContent::Binary {
             size,
             file_type,
@@ -1609,7 +1610,7 @@ fn load_changelist(cwd: &Path, change: ChangelistId) -> Result<Changelist, Strin
                 .map_err(|error| error.to_string())?;
             let mut changelist =
                 changelist_from_describe(&response.records).map_err(|error| error.to_string())?;
-            if let Ok(opened) = client.run(&P4Query::Opened { change })
+            if let Ok(opened) = client.run_records(&P4Query::Opened { change })
                 && let Ok(files) = changed_files_from_opened(&opened.records)
                 && !files.is_empty()
             {
@@ -1619,7 +1620,7 @@ fn load_changelist(cwd: &Path, change: ChangelistId) -> Result<Changelist, Strin
         }
         ChangelistId::Default => {
             let response = client
-                .run(&P4Query::Opened { change })
+                .run_records(&P4Query::Opened { change })
                 .map_err(|error| error.to_string())?;
             let files =
                 changed_files_from_opened(&response.records).map_err(|error| error.to_string())?;
@@ -1751,20 +1752,51 @@ fn viewer_loop(
 
 fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     let header_height = state.document.header_height();
+    let hints: &[(&str, &str)] = match &state.document {
+        Document::Changelist { .. } => &[("↑↓", "select"), ("⏎", "diff"), ("Esc", "close")],
+        Document::Diff { back: Some(_), .. } => &[
+            ("[/]", "hunks"),
+            ("e", "unfold"),
+            ("⏎", "expand"),
+            ("Esc", "back"),
+            ("q", "close"),
+        ],
+        Document::Diff { .. } => &[
+            ("[/]", "hunks"),
+            ("e", "unfold"),
+            ("⏎", "expand"),
+            ("q", "close"),
+        ],
+        Document::Text { back: Some(_), .. } => &[
+            ("↑↓", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("Esc", "back"),
+            ("q", "close"),
+        ],
+        _ => &[("↑↓", "scroll"), ("PgUp/Dn", "page"), ("q", "close")],
+    };
+    let footer_lines = theme::key_hint_lines(hints, frame.area().width);
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(footer_lines.len().max(1) as u16),
     ])
     .split(frame.area());
     let mut title_spans = vec![
+        Span::raw(" "),
         Span::styled(
             state.document.title().to_owned(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::HEADER.tui())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  [auto wrap]"),
+        Span::raw("  "),
+        Span::styled(
+            " AUTO WRAP ",
+            Style::default()
+                .fg(theme::KEYCAP_FG.tui())
+                .bg(theme::KEYCAP_BG.tui()),
+        ),
     ];
     if let Document::Diff { view, .. } = &state.document {
         title_spans.push(Span::raw("  "));
@@ -1772,7 +1804,12 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     }
     let mut header = vec![
         Line::from(title_spans),
-        Line::styled(state.document.context().to_owned(), Color::DarkGray),
+        Line::styled(
+            format!(" {}", state.document.context()),
+            Style::default()
+                .fg(theme::MUTED.tui())
+                .add_modifier(Modifier::DIM),
+        ),
     ];
     if let Document::Diff { view, .. } = &state.document {
         let (toolbar, hits) = diff::toolbar_line(view, chunks[0].width as usize);
@@ -1786,28 +1823,32 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     state.body_width = chunks[1].width as usize;
     state.body_height = chunks[1].height as usize;
     state.body_y = chunks[1].y;
+    let mut rows = state.render_rows();
+    if rows.len() > state.body_height && state.body_width > 1 {
+        state.body_width -= 1;
+        rows = state.render_rows();
+    }
     state.clamp_scroll();
-    let paragraph = Paragraph::new(state.render_rows())
-        .scroll((state.scroll_y.min(u16::MAX as usize) as u16, 0));
+    let total_rows = rows.len();
+    let paragraph = Paragraph::new(rows).scroll((state.scroll_y.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, chunks[1]);
+    if total_rows > state.body_height && chunks[1].width > 0 {
+        let mut scrollbar = ScrollbarState::new(total_rows.saturating_sub(state.body_height))
+            .position(state.scroll_y);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(Style::default().fg(theme::BORDER.tui()))
+                .thumb_style(Style::default().fg(theme::MUTED.tui())),
+            chunks[1],
+            &mut scrollbar,
+        );
+    }
 
-    let footer = match &state.document {
-        Document::Changelist { .. } => "click/↑↓/wheel: select   Enter: diff   q/Esc: close",
-        Document::Diff { back: Some(_), .. } => {
-            "[: prev change  ]: next change  e: unfold all  Enter/click ⋯: +20 lines  Esc: back  q: close"
-        }
-        Document::Diff { .. } => {
-            "[: prev change  ]: next change  e: unfold all  Enter/click ⋯: +20 lines  q: close"
-        }
-        Document::Text { back: Some(_), .. } => {
-            "↑↓/wheel: scroll   PgUp/PgDn: page   Esc: back   q: close"
-        }
-        _ => "↑↓/wheel: scroll   PgUp/PgDn: page   q/Esc: close",
-    };
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
-    );
+    frame.render_widget(Paragraph::new(footer_lines), chunks[2]);
 }
 
 fn report_identity(control: &Path) {
@@ -1863,6 +1904,55 @@ fn own_pane_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn content_viewer_uses_hierarchy_keycaps_and_a_real_scrollbar() {
+        let request = ContentRequest::File {
+            path: PathBuf::from(r"C:\Workspace\demo.rs"),
+        };
+        let lines = (1..=50)
+            .map(|line| Line::raw(format!("{line:>2}  let value = {line};")))
+            .collect();
+        let mut state = ViewerState {
+            cwd: PathBuf::from(r"C:\Workspace"),
+            request,
+            document: Document::Text {
+                title: "demo.rs".into(),
+                context: r"C:\Workspace\demo.rs".into(),
+                lines,
+                gutter_width: Some(4),
+                back: None,
+            },
+            scroll_y: 0,
+            body_width: 1,
+            body_height: 1,
+            body_y: 0,
+            toolbar_hits: Vec::new(),
+            last_fold_click: None,
+        };
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_viewer(frame, &mut state))
+            .expect("draw viewer");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("demo.rs"));
+        assert!(rendered.contains("AUTO WRAP"));
+        assert!(rendered.contains("PgUp/Dn"));
+        assert!(rendered.contains('┃'));
+        assert_eq!(buffer[(1, 0)].fg, theme::HEADER.tui());
+        assert_eq!(state.body_width, 39, "scrollbar owns the last column");
+    }
 
     #[test]
     fn content_requests_round_trip_without_shell_quoting() {
@@ -2215,7 +2305,7 @@ mod tests {
         let fold_row = view
             .body_lines()
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.contains("[▲20]")))
+            .position(|line| line.spans.iter().any(|span| span.content.contains("▲ 20")))
             .expect("leading fold row") as u16;
         let before = view
             .visible_items()

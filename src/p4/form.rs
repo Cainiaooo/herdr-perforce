@@ -158,6 +158,47 @@ impl ChangeForm {
         }
         Ok(updated.into_bytes())
     }
+
+    pub(crate) fn prepare_new_change(&self, description: &str) -> Result<Vec<u8>, ChangeFormError> {
+        let updated = self.replace_description(description)?;
+        let updated = String::from_utf8(updated).map_err(|_| ChangeFormError::InvalidUtf8)?;
+        Ok(clear_multiline_field(&updated, "Files").into_bytes())
+    }
+}
+
+fn clear_multiline_field(raw: &str, field: &str) -> String {
+    let lines = raw.split_inclusive('\n').collect::<Vec<_>>();
+    let Some(field_index) = lines.iter().position(|line| {
+        line_body(line)
+            .split_once(':')
+            .is_some_and(|(name, _)| name == field)
+    }) else {
+        return raw.to_owned();
+    };
+    let mut value_end = field_index + 1;
+    while value_end < lines.len() && line_body(lines[value_end]).starts_with('\t') {
+        value_end += 1;
+    }
+
+    let header = lines[field_index];
+    let newline = if header.ends_with("\r\n") {
+        "\r\n"
+    } else if header.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let mut updated = String::with_capacity(raw.len());
+    for line in &lines[..field_index] {
+        updated.push_str(line);
+    }
+    updated.push_str(field);
+    updated.push(':');
+    updated.push_str(newline);
+    for line in &lines[value_end..] {
+        updated.push_str(line);
+    }
+    updated
 }
 
 fn line_body(line: &str) -> &str {
@@ -210,6 +251,18 @@ mod tests {
         );
         assert!(form.preserved_fields().contains_key("Jobs"));
         assert!(!form.preserved_fields().contains_key("Date"));
+    }
+
+    #[test]
+    fn new_change_form_clears_default_changelist_files_and_preserves_other_fields() {
+        let form = ChangeForm::parse(FORM.as_bytes()).expect("form");
+        let updated = form.prepare_new_change("New work").expect("new form");
+        let updated = String::from_utf8(updated).expect("UTF-8");
+
+        assert!(updated.contains("Description:\r\n\tNew work\r\n"));
+        assert!(updated.contains("Jobs:\r\n\tJOB-1\r\n"));
+        assert!(updated.contains("Files:\r\n"));
+        assert!(!updated.contains("//SampleDepot/a.txt"));
     }
 
     #[test]

@@ -17,7 +17,7 @@
 - 不安装、不调用、不 fork 社区 File/Git 插件来提供这棵树。
 - Explorer 根默认为当前 Herdr workspace **cwd**（不是 Client root，也不是 depot 根）。列举不得走出 Client root / client view。
 - 首版 Explorer 只读：不从树上执行 `add` / `edit` / `delete` / `sync` / `revert`。选择文件可在内容 pane 查看 File；opened 文件还可查看 Diff。
-- Explorer 与 Review 共用最右侧窄导航 pane；File、Diff 和 CL 文件列表共用中间内容 pane。
+- Explorer 与 Review 共用最右侧窄导航 pane；File、Diff 共用中间内容 pane，CL 文件直接在 Review 的 CL 行下展开。
 - 树控件和预览可以借鉴 `herdr-sidebar` / `herdr-reviewr` 的交互，代码在本仓库重写，不抽跨插件 crate 作为首版完成条件。
 
 ## Rejected alternatives

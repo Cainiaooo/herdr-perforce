@@ -57,7 +57,7 @@ herdr plugin action invoke open-windows --plugin herdr.perforce
 herdr plugin action invoke open --plugin herdr.perforce
 ```
 
-也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。Review 上方内嵌当前 CL 的可编辑描述框与 **Review & Submit** 入口，下方是 Changelists，并预留与其同级的 File History / Workspace History。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
+也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。Review 上方内嵌当前 CL 的可编辑描述框与 **Review & Submit** 入口，下方是可直接展开的 Changelist/File 树，并预留与其同级的 File History / Workspace History。CL 文件留在最右导航树内；只有 File 预览或 Diff 才会在 Agent CLI 与最右导航之间按需创建内容 pane。
 
 ### Panel 加载与自动恢复
 
@@ -70,7 +70,7 @@ herdr plugin action invoke open --plugin herdr.perforce
 3. 只恢复本次 session 中仍存在且 cwd 匹配的 Herdr workspace。
 4. 对已有 `Perforce` pane 调用 `pane process-info`；前台是 `herdr-p4 ... pane`，或 Windows 上由 PowerShell 包装启动的同一命令，都视为健康并保持现状。同一 Herdr workspace 只保留一个导航 pane，多出来的重复 pane 会关掉。
 5. 标题是 `Perforce` 但里面只是 `PS ...>` 或其他默认 shell 的 pane 是 corpse：先关掉空壳和残留 Content pane，再从剩余 pane 打开真正的插件进程。Content 本来由普通 split 创建，重启后 token 可能丢失；只有标题匹配、前台仍是 viewer 或默认 shell、并且与已确认的导航候选水平相邻时才允许按 plugin-first、plain-fallback 路径清理。不能把同名 Agent 当成 Content，也不能把空壳当成已经恢复。新 pane 使用 `--no-focus`。
-6. 导航比例、Explorer/Review 视图以及最后打开的 File/Diff/CL 请求按 workspace 恢复；有 Content 时重新建立 `Agent | Content | Navigation`，且不抢焦点。
+6. 导航比例、Explorer/Review 视图以及最后打开的 File/Diff 请求按 workspace 恢复；有 Content 时重新建立 `Agent | Content | Navigation`，且不抢焦点。
 
 关闭并重新打开一个连接到同一 Herdr server 的客户端，不会重复运行 startup hook；要验证恢复行为，需要真正重启 Herdr server。仅关闭当前 Perforce pane 不会删除 workspace 记录，因此下次 server 启动仍会恢复它。
 
@@ -102,14 +102,17 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 |---|---|
 | `j` / `k`、方向键 | 选择目录、文件或 changelist |
 | `1` / `2` | 切换 Explorer / P4 Review 导航 |
-| `Enter` | Explorer 中打开 File；Review 中打开 CL 文件列表 |
-| `m` / 右键 | 打开当前行的上下文菜单（Rename、Copy Path、Reveal 等） |
+| `Enter` | Explorer 中打开 File；Review 的 CL 行展开/折叠文件树，文件行打开 Diff |
+| `Space` / 点击 CL 文件 | 选择或取消要移动的文件；一次选择只属于一个源 CL |
+| `n` | 在 Review 中输入描述并新建 numbered pending CL |
+| `v` | 把 Review 中已选择的文件移动到另一个 owned current-client pending CL |
+| `m` / 右键 | 打开当前行的上下文菜单（包括新建/删除 CL、选择/移动文件及 Explorer 操作） |
 | 滚轮 / 拖动 | 树与 CL 列表纵向滚动；横向拖动查看被截断的名称及 Explorer 状态图例 |
 | `d` | Explorer 中为 opened file 打开 Diff |
 | `o` | 使用系统默认应用打开 Explorer 选中路径 |
 | `e` / 点击描述框 | 读取完整 change form 后，编辑当前 owned numbered pending CL 的 Description |
 | `s` / 点击 **Review & Submit** | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
-| `r` | Explorer 中重新读取磁盘目录与已展开 folder 的 P4 状态；Review 中刷新 workspace/CL |
+| `r` | 先刷新 workspace/client 身份，再重读 Explorer 根目录、已展开 folder 与 Review CL/file 状态 |
 | `q` | 在没有阻塞 overlay 时关闭插件 pane |
 
 Description 编辑器：
@@ -136,7 +139,9 @@ Submit overlay：
 
 overlay 打开时，背景列表不会响应 Submit 或导航快捷键。SubmitRunning 期间无法从插件内取消、关闭或启动第二次提交。
 
-内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；CL 文件列表支持鼠标单击选择，`Enter` 打开 Diff，进入 Diff 后 `Esc` 返回列表。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 使用按文件类型区分的可爱图标，例如 `🦀` Rust、`🔩` C/C++、`📝` Markdown、`📷` 图片，目录仍使用 `📂` / `📁`。
+内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭。CL 文件列表已移入 Review 行内树；在文件行按 `Enter` 才会复用 Content pane 打开 Diff。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 和 CL 树使用按文件类型区分的图标，例如 `🦀` Rust、`🔩` C/C++、`📝` Markdown、`📷` 图片，目录使用 `📂` / `📁`。
+
+CL 管理操作都绑定当前 `p4 info` 的 user/client。新建 CL 使用服务器返回的 change form 并在写后回读验证；删除只允许 numbered、owned、pending 且再次检查为空的 CL；移动文件会在执行 `p4 reopen -c` 前确认所有选中文件仍属于同一个源 CL，并在写后同时回读源/目标 CL。连接、认证、权限、映射或验证失败不会显示为成功。单次移动最多 512 个文件。
 
 Explorer 的 P4 状态采用与 IDE Source Control 类似的颜色和短标记：
 
@@ -268,7 +273,7 @@ herdr plugin unlink herdr.perforce
 
 ## 当前限制
 
-- 当前版本已接入本地目录树、独立 File/Diff/CL 内容 pane、内联叠加 Diff（折叠/hunk 跳转/行内高亮）、滚动/高亮以及内联 Description Apply；review comment 与 Agent 描述生成 UI 尚未接完。
+- 当前版本已接入本地目录树、Review 行内 CL/File 树、独立 File/Diff 内容 pane、CL 新建/空 CL 删除/选中文件跨 CL 移动、内联叠加 Diff（折叠/hunk 跳转/行内高亮）、滚动/高亮以及内联 Description Apply；review comment 与 Agent 描述生成 UI 尚未接完。
 - 自动打开只覆盖成功手动打开过的 remembered workspaces；当前版本不会扫描全部 Herdr workspace 并运行 `p4 info` 自动判定。
 - 不支持 default changelist、部分文件、其他用户或其他 client 的 Submit。
 - 不支持自动 resolve、lock 修复或任何自主提交。

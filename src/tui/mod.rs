@@ -7,7 +7,9 @@ mod diff;
 mod display;
 mod explorer;
 mod icons;
+mod review_tree;
 mod syntax;
+mod theme;
 mod wrap;
 
 use std::{
@@ -38,24 +40,26 @@ use crossterm::{
 use crate::{
     app::{SubmitOutcomeCertainty, SubmitOverlay, SubmitOverlayRequest, SubmitOverlayState},
     domain::{
-        Changelist, ChangelistId, ChangelistStatus, ExplorerDecoration, FileAction,
+        ChangedFile, Changelist, ChangelistId, ChangelistStatus, ExplorerDecoration, FileAction,
         WorkspaceIdentity,
     },
     p4::{
+        ChangelistManagementError, CreateChangelistResult, DeleteChangelistResult,
         DescriptionApplyError, DescriptionApplyIntent, DescriptionApplyResult, DomainMappingError,
-        ExplorerError, LoadedDirectory, P4Client, P4Error, P4Query, P4Transport, P4WriteService,
-        StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview, SubmitReconciliationResult,
-        SubmitResult, WorkspaceCwdError, cwd_is_in_client_view, load_explorer_directory,
-        pending_changelists_from_changes, workspace_owning_cwd,
+        ExplorerError, LoadedDirectory, MoveFilesResult, P4Client, P4Error, P4Query, P4Transport,
+        P4WriteService, StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview,
+        SubmitReconciliationResult, SubmitResult, WorkspaceCwdError, cwd_is_in_client_view,
+        load_explorer_directory, load_pending_changelist, pending_changelists_from_changes,
+        workspace_owning_cwd,
     },
     panel_restore,
     submit_provider::{ExternalLaunchError, SubmitProvider},
 };
 
 use self::actions::{
-    ExplorerMenuTarget, MenuAction, MenuEntry, copy_to_clipboard, explorer_menu_entries,
-    first_action_index, is_same_path, menu_window, relative_path_text, review_menu_entries,
-    step_action_index, validate_name,
+    ExplorerMenuTarget, MenuAction, MenuEntry, ReviewMenuTarget, copy_to_clipboard,
+    explorer_menu_entries, first_action_index, is_same_path, menu_window, relative_path_text,
+    review_menu_entries, step_action_index, validate_name,
 };
 use self::content::{
     ContentPaneClient, apply_own_navigation_share, persist_navigator_share_from_host,
@@ -65,6 +69,7 @@ use self::display::{display_width, pad_display, slice_display, splice_display};
 use self::explorer::{
     ExplorerAction, ExplorerLoadState, ExplorerModel, connection_message, open_with_default_app,
 };
+use self::review_tree::{ReviewActivation, ReviewRowKind, ReviewTreeModel};
 
 pub use self::content::{
     navigation_resize_args_for_layout, navigation_resize_args_for_share,
@@ -188,7 +193,10 @@ impl TerminalGuard {
     }
 
     fn draw(&mut self, frame: &RenderedFrame) -> io::Result<()> {
-        queue!(self.stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+        // The cursor from the previous frame may still be visible. Hide it
+        // before the full redraw so the terminal does not briefly expose the
+        // intermediate MoveTo positions as a blinking block.
+        queue!(self.stdout, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         for (row, line) in frame.lines.iter().enumerate() {
             queue!(
                 self.stdout,
@@ -208,6 +216,31 @@ impl TerminalGuard {
                 }
             }
             queue!(self.stdout, Print(line))?;
+            for run in frame.runs.get(row).into_iter().flatten() {
+                queue!(
+                    self.stdout,
+                    MoveTo(run.x, row as u16),
+                    ResetColor,
+                    SetAttribute(Attribute::Reset)
+                )?;
+                let base = frame.row_styles.get(row).copied().unwrap_or_default();
+                if let Some(foreground) = run.style.foreground.or(base.foreground) {
+                    queue!(self.stdout, SetForegroundColor(foreground))?;
+                }
+                if let Some(background) = run.style.background.or(base.background) {
+                    queue!(self.stdout, SetBackgroundColor(background))?;
+                }
+                if run.style.bold || base.bold {
+                    queue!(self.stdout, SetAttribute(Attribute::Bold))?;
+                }
+                if run.style.dim || base.dim {
+                    queue!(self.stdout, SetAttribute(Attribute::Dim))?;
+                }
+                if run.style.italic || base.italic {
+                    queue!(self.stdout, SetAttribute(Attribute::Italic))?;
+                }
+                queue!(self.stdout, Print(&run.text))?;
+            }
         }
         queue!(self.stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         if let Some((column, row)) = frame.cursor {
@@ -298,6 +331,23 @@ enum PaneMessage {
         path: PathBuf,
         result: Result<LoadedDirectory, ExplorerError>,
     },
+    ChangelistFiles {
+        generation: u64,
+        change: ChangelistId,
+        result: Result<Vec<ChangedFile>, String>,
+    },
+    ChangelistCreated {
+        request_id: u64,
+        result: Result<CreateChangelistResult, ChangelistManagementError>,
+    },
+    ChangelistDeleted {
+        request_id: u64,
+        result: Result<DeleteChangelistResult, ChangelistManagementError>,
+    },
+    FilesMoved {
+        request_id: u64,
+        result: Result<MoveFilesResult, ChangelistManagementError>,
+    },
 }
 
 #[derive(Debug)]
@@ -328,7 +378,7 @@ const REVIEW_DESCRIPTION_ACTION_ROW: usize = 7;
 const REVIEW_SUBMIT_ROW: usize = 8;
 const REVIEW_SECTION_ROW: usize = 9;
 const REVIEW_LIST_TOP: usize = 10;
-const REVIEW_BOTTOM_ROWS: usize = 4;
+const REVIEW_BOTTOM_ROWS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragTarget {
@@ -352,6 +402,7 @@ enum PromptKind {
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename { path: PathBuf },
+    NewChangelist,
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +434,15 @@ enum NavOverlay {
         path: PathBuf,
         is_dir: bool,
     },
+    ConfirmDeleteChangelist {
+        change: u64,
+    },
+    MoveFiles {
+        source: ChangelistId,
+        files: Vec<String>,
+        targets: Vec<ChangelistId>,
+        selected: usize,
+    },
 }
 
 impl NavOverlay {
@@ -395,9 +455,9 @@ impl NavOverlay {
 enum MessageEffect {
     None,
     ReloadOverview,
-    LoadExplorerRoot,
     LoadExplorerExpanded,
     LoadExplorerDirectory,
+    LoadWorkspaceTrees,
 }
 
 #[derive(Debug)]
@@ -421,6 +481,7 @@ struct PaneModel {
     overview: OverviewState,
     overview_generation: u64,
     selected: usize,
+    review_tree: ReviewTreeModel,
     explorer: ExplorerModel,
     content: ContentPaneClient,
     overlay: SubmitOverlay,
@@ -436,6 +497,9 @@ struct PaneModel {
     review_follow: bool,
     description_editor: DescriptionEditor,
     description_request_id: u64,
+    operation_request_id: u64,
+    operation_in_flight: bool,
+    pending_review_selection: Option<ChangelistId>,
 }
 
 impl PaneModel {
@@ -455,6 +519,7 @@ impl PaneModel {
             overview: OverviewState::Loading,
             overview_generation: 1,
             selected: 0,
+            review_tree: ReviewTreeModel::new(),
             explorer: ExplorerModel::new(cwd.clone()),
             content: ContentPaneClient::new(cwd.clone()),
             overlay: SubmitOverlay::default(),
@@ -470,6 +535,9 @@ impl PaneModel {
             review_follow: true,
             description_editor: DescriptionEditor::Idle,
             description_request_id: 0,
+            operation_request_id: 0,
+            operation_in_flight: false,
+            pending_review_selection: None,
         }
     }
 
@@ -548,6 +616,10 @@ impl PaneModel {
         service: &Arc<P4WriteService<T>>,
         sender: &mpsc::Sender<PaneMessage>,
     ) {
+        if self.operation_in_flight {
+            self.status = "Wait for the active changelist operation to finish".to_owned();
+            return;
+        }
         match self.selected_editable_description() {
             Ok((change, _)) => {
                 self.description_request_id = self.description_request_id.wrapping_add(1);
@@ -783,14 +855,11 @@ impl PaneModel {
             self.status = "Refreshing current Perforce workspace...".to_owned();
             return MessageEffect::ReloadOverview;
         }
-        let OverviewState::Ready(overview) = &self.overview else {
-            self.status = "Explorer refresh is waiting for workspace information".to_owned();
-            return MessageEffect::None;
-        };
-        self.explorer
-            .begin_workspace_load(overview.identity.clone());
-        self.status = "Refreshing Explorer files and Perforce status...".to_owned();
-        MessageEffect::LoadExplorerRoot
+        self.explorer.begin_workspace_refresh();
+        self.overview = OverviewState::Loading;
+        self.status =
+            "Refreshing workspace identity, Explorer files, and Perforce status...".to_owned();
+        MessageEffect::ReloadOverview
     }
 
     fn handle_message(&mut self, message: PaneMessage) -> MessageEffect {
@@ -799,7 +868,7 @@ impl PaneModel {
                 if generation == self.overview_generation {
                     self.install_overview(result);
                     if matches!(self.overview, OverviewState::Ready(_)) {
-                        return MessageEffect::LoadExplorerRoot;
+                        return MessageEffect::LoadWorkspaceTrees;
                     }
                 }
                 MessageEffect::None
@@ -891,6 +960,76 @@ impl PaneModel {
                 self.explorer.install_directory(generation, path, result);
                 MessageEffect::None
             }
+            PaneMessage::ChangelistFiles {
+                generation,
+                change,
+                result,
+            } => {
+                if generation != self.review_tree.generation() {
+                    return MessageEffect::None;
+                }
+                let loaded = result.as_ref().map_or(0, Vec::len);
+                let failed = result.as_ref().err().cloned();
+                self.review_tree.install_files(generation, change, result);
+                self.status =
+                    failed.unwrap_or_else(|| format!("Loaded {loaded} file(s) in CL {change}"));
+                MessageEffect::None
+            }
+            PaneMessage::ChangelistCreated { request_id, result } => {
+                if request_id != self.operation_request_id {
+                    return MessageEffect::None;
+                }
+                self.operation_in_flight = false;
+                match result {
+                    Ok(created) => {
+                        self.pending_review_selection =
+                            Some(ChangelistId::Numbered(created.change));
+                        self.status = format!("Created CL {} and verified it", created.change);
+                        MessageEffect::ReloadOverview
+                    }
+                    Err(error) => {
+                        self.status = error.to_string();
+                        MessageEffect::None
+                    }
+                }
+            }
+            PaneMessage::ChangelistDeleted { request_id, result } => {
+                if request_id != self.operation_request_id {
+                    return MessageEffect::None;
+                }
+                self.operation_in_flight = false;
+                match result {
+                    Ok(deleted) => {
+                        self.status = format!("Deleted empty CL {}", deleted.change);
+                        MessageEffect::ReloadOverview
+                    }
+                    Err(error) => {
+                        self.status = error.to_string();
+                        MessageEffect::None
+                    }
+                }
+            }
+            PaneMessage::FilesMoved { request_id, result } => {
+                if request_id != self.operation_request_id {
+                    return MessageEffect::None;
+                }
+                self.operation_in_flight = false;
+                match result {
+                    Ok(moved) => {
+                        self.review_tree.clear_checked();
+                        self.pending_review_selection = Some(moved.target);
+                        self.status = format!(
+                            "Moved {} file(s) from CL {} to CL {} and verified both sides",
+                            moved.file_count, moved.source, moved.target
+                        );
+                        MessageEffect::ReloadOverview
+                    }
+                    Err(error) => {
+                        self.status = error.to_string();
+                        MessageEffect::None
+                    }
+                }
+            }
         }
     }
 
@@ -898,7 +1037,8 @@ impl PaneModel {
         let selected_id = self.selected_changelist().map(|change| change.id);
         match result {
             Ok(overview) => {
-                self.selected = selected_id
+                let preferred = self.pending_review_selection.take().or(selected_id);
+                self.selected = preferred
                     .and_then(|id| overview.changes.iter().position(|change| change.id == id))
                     .or_else(|| {
                         overview
@@ -907,6 +1047,10 @@ impl PaneModel {
                             .position(|change| matches!(change.id, ChangelistId::Numbered(_)))
                     })
                     .unwrap_or(0);
+                self.review_tree.refresh(
+                    &overview.changes,
+                    overview.changes.get(self.selected).map(|change| change.id),
+                );
                 self.status = format!("Loaded {} changelist(s)", overview.changes.len());
                 self.explorer
                     .begin_workspace_load(overview.identity.clone());
@@ -951,22 +1095,133 @@ impl PaneModel {
         }
     }
 
-    fn open_selected_changelist(&mut self) -> bool {
-        let Some(change) = self.selected_changelist().map(|change| change.id) else {
-            return false;
-        };
-        self.status = self
-            .content
-            .show_changelist(change)
-            .unwrap_or_else(|error| error);
-        true
-    }
-
     fn selected_changelist(&self) -> Option<&Changelist> {
         let OverviewState::Ready(overview) = &self.overview else {
             return None;
         };
         overview.changes.get(self.selected)
+    }
+
+    fn sync_selected_changelist_from_tree(&mut self) {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return;
+        };
+        if let Some(index) = self
+            .review_tree
+            .selected_change_index(&overview.changes, &overview.identity)
+        {
+            self.selected = index;
+        }
+    }
+
+    fn activate_selected_review(&mut self, sender: &mpsc::Sender<PaneMessage>) -> bool {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return false;
+        };
+        let activation = self
+            .review_tree
+            .activate_selected(&overview.changes, &overview.identity);
+        self.sync_selected_changelist_from_tree();
+        self.apply_review_activation(activation, sender)
+    }
+
+    fn activate_review_index(
+        &mut self,
+        index: usize,
+        mouse_click: bool,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) -> bool {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return false;
+        };
+        let activation = self.review_tree.activate_index(
+            index,
+            &overview.changes,
+            &overview.identity,
+            mouse_click,
+        );
+        self.sync_selected_changelist_from_tree();
+        if mouse_click && matches!(activation, ReviewActivation::None) {
+            self.show_checked_file_status();
+        }
+        self.apply_review_activation(activation, sender)
+    }
+
+    fn apply_review_activation(
+        &mut self,
+        activation: ReviewActivation,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) -> bool {
+        match activation {
+            ReviewActivation::None => false,
+            ReviewActivation::LoadFiles { generation, change } => {
+                let OverviewState::Ready(overview) = &self.overview else {
+                    return false;
+                };
+                self.status = format!("Loading files in CL {change}...");
+                request_changelist_files(
+                    self.cwd.clone(),
+                    overview.identity.clone(),
+                    generation,
+                    change,
+                    sender.clone(),
+                );
+                true
+            }
+            ReviewActivation::OpenFile => self.open_selected_review_file(),
+        }
+    }
+
+    fn open_selected_review_file(&mut self) -> bool {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return false;
+        };
+        let Some(file) = self
+            .review_tree
+            .selected_file(&overview.changes, &overview.identity)
+        else {
+            return false;
+        };
+        let Some(path) = file.client_path else {
+            self.status = "The selected depot file has no local client path".to_owned();
+            return false;
+        };
+        let change = overview
+            .changes
+            .get(self.selected)
+            .map(|change| change.id)
+            .unwrap_or(ChangelistId::Default);
+        self.status = self
+            .content
+            .show_diff(change, path, Some(file.action))
+            .unwrap_or_else(|error| error);
+        true
+    }
+
+    fn toggle_selected_review_file(&mut self) -> bool {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return false;
+        };
+        if self
+            .review_tree
+            .toggle_selected_file(&overview.changes, &overview.identity)
+            .is_none()
+        {
+            self.status = "Select a file row before marking files to move".to_owned();
+            return false;
+        }
+        self.show_checked_file_status();
+        true
+    }
+
+    fn show_checked_file_status(&mut self) {
+        self.status = match self.review_tree.checked_files() {
+            Some((source, files)) => format!(
+                "Selected {} file(s) from CL {source} · press v to move",
+                files.len()
+            ),
+            None => "No files selected for moving".to_owned(),
+        };
     }
 
     fn open_selected_submit<T: P4Transport + 'static>(
@@ -976,6 +1231,10 @@ impl PaneModel {
     ) {
         if self.view != PaneView::Review {
             self.status = "Switch to Review (2) to submit".to_owned();
+            return;
+        }
+        if self.operation_in_flight {
+            self.status = "Wait for the active changelist operation to finish".to_owned();
             return;
         }
         let Some(change) = self
@@ -1061,41 +1320,62 @@ impl PaneModel {
                 self.begin_description_edit(service, sender);
                 false
             }
+            KeyCode::Char('n') | KeyCode::Char('N') if self.view == PaneView::Review => {
+                self.nav_overlay = NavOverlay::Prompt {
+                    title: "New changelist description".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewChangelist,
+                };
+                false
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') if self.view == PaneView::Review => {
+                self.open_move_files_picker();
+                false
+            }
             _ if self.view == PaneView::Explorer => self.handle_explorer_key(key, sender),
             KeyCode::Enter => {
-                self.open_selected_changelist();
+                self.activate_selected_review(sender);
+                false
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_selected_review_file();
                 false
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
+                if let OverviewState::Ready(overview) = &self.overview {
+                    self.review_tree
+                        .move_selection(-1, &overview.changes, &overview.identity);
+                }
+                self.sync_selected_changelist_from_tree();
                 self.review_follow = true;
                 false
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let count = match &self.overview {
-                    OverviewState::Ready(overview) => overview.changes.len(),
-                    OverviewState::Loading | OverviewState::Failed(_) => 0,
-                };
-                self.selected = self.selected.saturating_add(1).min(count.saturating_sub(1));
+                if let OverviewState::Ready(overview) = &self.overview {
+                    self.review_tree
+                        .move_selection(1, &overview.changes, &overview.identity);
+                }
+                self.sync_selected_changelist_from_tree();
                 self.review_follow = true;
                 false
             }
             KeyCode::PageUp => {
-                self.selected = self
-                    .selected
-                    .saturating_sub(self.review_list_height().max(1));
+                let delta = -(self.review_list_height().max(1) as isize);
+                if let OverviewState::Ready(overview) = &self.overview {
+                    self.review_tree
+                        .move_selection(delta, &overview.changes, &overview.identity);
+                }
+                self.sync_selected_changelist_from_tree();
                 self.review_follow = true;
                 false
             }
             KeyCode::PageDown => {
-                let count = match &self.overview {
-                    OverviewState::Ready(overview) => overview.changes.len(),
-                    OverviewState::Loading | OverviewState::Failed(_) => 0,
-                };
-                self.selected = self
-                    .selected
-                    .saturating_add(self.review_list_height().max(1))
-                    .min(count.saturating_sub(1));
+                let delta = self.review_list_height().max(1) as isize;
+                if let OverviewState::Ready(overview) = &self.overview {
+                    self.review_tree
+                        .move_selection(delta, &overview.changes, &overview.identity);
+                }
+                self.sync_selected_changelist_from_tree();
                 self.review_follow = true;
                 false
             }
@@ -1369,7 +1649,11 @@ impl PaneModel {
             .position(|target| target.contains(mouse.column, mouse.row))
             .map(|index| hits.changelist_offset.saturating_add(index));
         if let Some(index) = pending {
-            self.selected = index;
+            if let OverviewState::Ready(overview) = &self.overview {
+                self.review_tree
+                    .select_index(index, &overview.changes, &overview.identity);
+            }
+            self.sync_selected_changelist_from_tree();
         }
         self.drag = Some(NavDrag {
             start_x: mouse.column,
@@ -1431,8 +1715,8 @@ impl PaneModel {
                 }
             }
             DragTarget::Review => {
-                if drag.pending_index.is_some() {
-                    self.open_selected_changelist();
+                if let Some(index) = drag.pending_index {
+                    self.activate_review_index(index, true, sender);
                 }
             }
         }
@@ -1475,7 +1759,10 @@ impl PaneModel {
 
     fn review_count(&self) -> usize {
         match &self.overview {
-            OverviewState::Ready(overview) => overview.changes.len(),
+            OverviewState::Ready(overview) => self
+                .review_tree
+                .rows(&overview.changes, &overview.identity)
+                .len(),
             OverviewState::Loading | OverviewState::Failed(_) => 0,
         }
     }
@@ -1488,7 +1775,13 @@ impl PaneModel {
         let height = visible_rows.min(count);
         let max_offset = count.saturating_sub(height);
         if self.review_follow {
-            self.selected
+            let selected = match &self.overview {
+                OverviewState::Ready(overview) => self
+                    .review_tree
+                    .selected_index_for(&overview.changes, &overview.identity),
+                OverviewState::Loading | OverviewState::Failed(_) => 0,
+            };
+            selected
                 .saturating_add(1)
                 .saturating_sub(height)
                 .min(max_offset)
@@ -1529,13 +1822,10 @@ impl PaneModel {
         let OverviewState::Ready(overview) = &self.overview else {
             return 0;
         };
-        overview
-            .changes
+        self.review_tree
+            .rows(&overview.changes, &overview.identity)
             .iter()
-            .enumerate()
-            .map(|(index, change)| {
-                display_width(&format_changelist_row(index == self.selected, change))
-            })
+            .map(|row| display_width(&format_review_row(row, false, &self.review_tree)))
             .max()
             .unwrap_or(0)
     }
@@ -1561,7 +1851,13 @@ impl PaneModel {
                     return;
                 }
                 let (x, y) = self.selection_anchor();
-                self.show_review_menu(x, y, self.selected);
+                let review_index = match &self.overview {
+                    OverviewState::Ready(overview) => self
+                        .review_tree
+                        .selected_index_for(&overview.changes, &overview.identity),
+                    OverviewState::Loading | OverviewState::Failed(_) => 0,
+                };
+                self.show_review_menu(x, y, review_index);
             }
         }
     }
@@ -1594,10 +1890,24 @@ impl PaneModel {
                     .iter()
                     .position(|target| target.contains(x, y))
                 {
-                    self.selected = hits.changelist_offset.saturating_add(index);
-                    self.show_review_menu(x, y, self.selected);
+                    let review_index = hits.changelist_offset.saturating_add(index);
+                    if let OverviewState::Ready(overview) = &self.overview {
+                        self.review_tree.select_index(
+                            review_index,
+                            &overview.changes,
+                            &overview.identity,
+                        );
+                    }
+                    self.sync_selected_changelist_from_tree();
+                    self.show_review_menu(x, y, review_index);
                 } else if self.review_count() > 0 {
-                    self.show_review_menu(x, y, self.selected);
+                    let review_index = match &self.overview {
+                        OverviewState::Ready(overview) => self
+                            .review_tree
+                            .selected_index_for(&overview.changes, &overview.identity),
+                        OverviewState::Loading | OverviewState::Failed(_) => 0,
+                    };
+                    self.show_review_menu(x, y, review_index);
                 }
             }
         }
@@ -1622,10 +1932,31 @@ impl PaneModel {
     }
 
     fn show_review_menu(&mut self, x: u16, y: u16, change_index: usize) {
+        let row_kind = match &self.overview {
+            OverviewState::Ready(overview) => self
+                .review_tree
+                .rows(&overview.changes, &overview.identity)
+                .get(change_index)
+                .map(|row| row.kind.clone()),
+            OverviewState::Loading | OverviewState::Failed(_) => None,
+        };
         let can_submit = self
             .selected_changelist()
             .is_some_and(|change| matches!(change.id, ChangelistId::Numbered(_)));
-        let entries = review_menu_entries(can_submit);
+        let target = ReviewMenuTarget {
+            is_changelist: matches!(row_kind, Some(ReviewRowKind::Changelist { .. })),
+            is_file: matches!(row_kind, Some(ReviewRowKind::File(_))),
+            expanded: matches!(
+                row_kind,
+                Some(ReviewRowKind::Changelist { expanded: true, .. })
+            ),
+            can_submit,
+            can_delete: self
+                .selected_changelist()
+                .is_some_and(|change| matches!(change.id, ChangelistId::Numbered(_))),
+            has_checked_files: self.review_tree.checked_files().is_some(),
+        };
+        let entries = review_menu_entries(target);
         self.nav_overlay = NavOverlay::Menu {
             x,
             y,
@@ -1674,7 +2005,7 @@ impl PaneModel {
         }
         if matches!(self.nav_overlay, NavOverlay::Prompt { .. }) {
             match key.code {
-                KeyCode::Enter => self.confirm_prompt(sender),
+                KeyCode::Enter => self.confirm_prompt(service, sender),
                 KeyCode::Backspace => {
                     if let NavOverlay::Prompt { input, .. } = &mut self.nav_overlay {
                         input.pop();
@@ -1683,6 +2014,57 @@ impl PaneModel {
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let NavOverlay::Prompt { input, .. } = &mut self.nav_overlay {
                         input.push(character);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+        if matches!(self.nav_overlay, NavOverlay::ConfirmDeleteChangelist { .. }) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let change = match self.nav_overlay {
+                        NavOverlay::ConfirmDeleteChangelist { change } => change,
+                        _ => return false,
+                    };
+                    self.nav_overlay = NavOverlay::Closed;
+                    self.start_delete_changelist(service, sender, change);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.nav_overlay = NavOverlay::Closed;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        if matches!(self.nav_overlay, NavOverlay::MoveFiles { .. }) {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let NavOverlay::MoveFiles { selected, .. } = &mut self.nav_overlay {
+                        *selected = selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let NavOverlay::MoveFiles {
+                        selected, targets, ..
+                    } = &mut self.nav_overlay
+                    {
+                        *selected = selected
+                            .saturating_add(1)
+                            .min(targets.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Enter => {
+                    let state = std::mem::replace(&mut self.nav_overlay, NavOverlay::Closed);
+                    if let NavOverlay::MoveFiles {
+                        source,
+                        files,
+                        targets,
+                        selected,
+                    } = state
+                        && let Some(target) = targets.get(selected).copied()
+                    {
+                        self.start_move_files(service, sender, source, target, files);
                     }
                 }
                 _ => {}
@@ -1781,7 +2163,14 @@ impl PaneModel {
                 self.apply_explorer_menu(action, target, sender);
             }
             MenuKind::Review { change_index } => {
-                self.selected = change_index;
+                if let OverviewState::Ready(overview) = &self.overview {
+                    self.review_tree.select_index(
+                        change_index,
+                        &overview.changes,
+                        &overview.identity,
+                    );
+                }
+                self.sync_selected_changelist_from_tree();
                 self.apply_review_menu(action, service, sender);
             }
         }
@@ -1874,7 +2263,14 @@ impl PaneModel {
                 actions::reveal(path);
                 self.status = format!("Revealed {}", path.display());
             }
-            MenuAction::OpenChangelist | MenuAction::CopyChangelist | MenuAction::SubmitReview => {}
+            MenuAction::OpenChangelist
+            | MenuAction::NewChangelist
+            | MenuAction::DeleteChangelist
+            | MenuAction::OpenReviewDiff
+            | MenuAction::ToggleFileSelection
+            | MenuAction::MoveSelectedFiles
+            | MenuAction::CopyChangelist
+            | MenuAction::SubmitReview => {}
         }
         let _ = sender;
     }
@@ -1887,7 +2283,36 @@ impl PaneModel {
     ) {
         match action {
             MenuAction::OpenChangelist => {
-                self.open_selected_changelist();
+                self.activate_selected_review(sender);
+            }
+            MenuAction::NewChangelist => {
+                self.nav_overlay = NavOverlay::Prompt {
+                    title: "New changelist description".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewChangelist,
+                };
+            }
+            MenuAction::DeleteChangelist => {
+                let Some(change) = self
+                    .selected_changelist()
+                    .and_then(|change| match change.id {
+                        ChangelistId::Numbered(change) => Some(change),
+                        ChangelistId::Default => None,
+                    })
+                else {
+                    self.status = "The default changelist cannot be deleted".to_owned();
+                    return;
+                };
+                self.nav_overlay = NavOverlay::ConfirmDeleteChangelist { change };
+            }
+            MenuAction::OpenReviewDiff => {
+                self.open_selected_review_file();
+            }
+            MenuAction::ToggleFileSelection => {
+                self.toggle_selected_review_file();
+            }
+            MenuAction::MoveSelectedFiles => {
+                self.open_move_files_picker();
             }
             MenuAction::CopyChangelist => {
                 if let Some(change) = self.selected_changelist() {
@@ -1899,30 +2324,26 @@ impl PaneModel {
                 self.status = format!("Revealed {}", self.cwd.display());
             }
             MenuAction::SubmitReview => {
-                let Some(change) = self
-                    .selected_changelist()
-                    .and_then(|change| match change.id {
-                        ChangelistId::Numbered(change) => Some(change),
-                        ChangelistId::Default => None,
-                    })
-                else {
-                    self.status = "Default changelist Submit is disabled".to_owned();
-                    return;
-                };
-                if let Some(request) = self.overlay.open(change) {
-                    self.issue_overlay_request(request, service, sender);
-                }
+                self.open_selected_submit(service, sender);
             }
             _ => {}
         }
     }
 
-    fn confirm_prompt(&mut self, sender: &mpsc::Sender<PaneMessage>) {
+    fn confirm_prompt<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
         let NavOverlay::Prompt { input, kind, .. } =
             std::mem::replace(&mut self.nav_overlay, NavOverlay::Closed)
         else {
             return;
         };
+        if matches!(kind, PromptKind::NewChangelist) {
+            self.start_create_changelist(service, sender, input);
+            return;
+        }
         let Some(name) = validate_name(&input).map(str::to_owned) else {
             self.status = "Enter a file name without path separators".to_owned();
             return;
@@ -1940,6 +2361,7 @@ impl PaneModel {
                 let parent = path.parent().unwrap_or(&self.cwd).to_path_buf();
                 actions::rename(&path, &name).map(|new_path| (parent, new_path))
             }
+            PromptKind::NewChangelist => unreachable!("handled before file-name validation"),
         };
         match result {
             Ok((parent, path)) => {
@@ -1967,6 +2389,100 @@ impl PaneModel {
         }
     }
 
+    fn open_move_files_picker(&mut self) {
+        let Some((source, files)) = self.review_tree.checked_files() else {
+            self.status = "Select files with Space or by clicking their checkbox first".to_owned();
+            return;
+        };
+        let OverviewState::Ready(overview) = &self.overview else {
+            self.status = "Changelists are still loading".to_owned();
+            return;
+        };
+        let targets = overview
+            .changes
+            .iter()
+            .map(|change| change.id)
+            .filter(|change| *change != source)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.status = "Create another changelist before moving files".to_owned();
+            return;
+        }
+        self.nav_overlay = NavOverlay::MoveFiles {
+            source,
+            files,
+            targets,
+            selected: 0,
+        };
+    }
+
+    fn start_create_changelist<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+        description: String,
+    ) {
+        let Some(request_id) = self.begin_changelist_operation() else {
+            return;
+        };
+        let service = Arc::clone(service);
+        let sender = sender.clone();
+        self.status = "Creating and verifying new changelist...".to_owned();
+        thread::spawn(move || {
+            let result = service.create_changelist(description);
+            let _ = sender.send(PaneMessage::ChangelistCreated { request_id, result });
+        });
+    }
+
+    fn start_delete_changelist<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+        change: u64,
+    ) {
+        let Some(request_id) = self.begin_changelist_operation() else {
+            return;
+        };
+        let service = Arc::clone(service);
+        let sender = sender.clone();
+        self.status = format!("Checking and deleting empty CL {change}...");
+        thread::spawn(move || {
+            let result = service.delete_changelist(ChangelistId::Numbered(change));
+            let _ = sender.send(PaneMessage::ChangelistDeleted { request_id, result });
+        });
+    }
+
+    fn start_move_files<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+        source: ChangelistId,
+        target: ChangelistId,
+        files: Vec<String>,
+    ) {
+        let Some(request_id) = self.begin_changelist_operation() else {
+            return;
+        };
+        let file_count = files.len();
+        let service = Arc::clone(service);
+        let sender = sender.clone();
+        self.status = format!("Moving {file_count} file(s) from CL {source} to CL {target}...");
+        thread::spawn(move || {
+            let result = service.move_files(source, target, files);
+            let _ = sender.send(PaneMessage::FilesMoved { request_id, result });
+        });
+    }
+
+    fn begin_changelist_operation(&mut self) -> Option<u64> {
+        if self.operation_in_flight {
+            self.status = "Wait for the active changelist operation to finish".to_owned();
+            return None;
+        }
+        self.operation_request_id = self.operation_request_id.wrapping_add(1);
+        self.operation_in_flight = true;
+        Some(self.operation_request_id)
+    }
+
     fn reload_explorer_directory(&mut self, path: PathBuf, sender: &mpsc::Sender<PaneMessage>) {
         self.explorer.invalidate_directory(path);
         self.apply_explorer_action(ExplorerAction::LoadDirectory, sender);
@@ -1980,19 +2496,29 @@ impl PaneModel {
     }
 }
 
-fn format_changelist_row(selected: bool, change: &Changelist) -> String {
-    let marker = if selected { ">" } else { " " };
-    let description = change
-        .description
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("<no description>")
-        .trim();
-    format!(
-        "{marker} CL {}  {}  {description}",
-        change.id,
-        change.status.canonical_name()
-    )
+fn format_review_row(
+    row: &review_tree::ReviewRow,
+    selected: bool,
+    tree: &ReviewTreeModel,
+) -> String {
+    let marker = if selected { "›" } else { " " };
+    let indent = "  ".repeat(row.depth);
+    let checkbox = match &row.kind {
+        ReviewRowKind::File(file) if tree.is_checked(file) => "[x] ",
+        ReviewRowKind::File(_) => "[ ] ",
+        _ => "",
+    };
+    format!("{marker}{indent}{checkbox}{}", row.label)
+}
+
+fn file_action_terminal_color(action: &FileAction) -> Color {
+    match action {
+        FileAction::Add | FileAction::Branch => theme::ADDED.terminal(),
+        FileAction::Edit | FileAction::Integrate | FileAction::Import => theme::MODIFIED.terminal(),
+        FileAction::Delete | FileAction::Purge | FileAction::Archive => theme::DELETED.terminal(),
+        FileAction::MoveAdd | FileAction::MoveDelete => theme::RENAMED.terminal(),
+        FileAction::Unknown(_) => Color::Grey,
+    }
 }
 
 fn menu_popup_rect(x: u16, y: u16, entries: &[MenuEntry], width: u16, height: u16) -> Rect {
@@ -2030,7 +2556,6 @@ fn apply_message_effect(
     match effect {
         MessageEffect::None => {}
         MessageEffect::ReloadOverview => pane.reload_overview(sender),
-        MessageEffect::LoadExplorerRoot => request_explorer_root(pane, sender),
         MessageEffect::LoadExplorerExpanded => {
             let generation = pane.explorer.generation();
             let identity = match &pane.overview {
@@ -2057,6 +2582,22 @@ fn apply_message_effect(
                     overview.identity.clone(),
                     pane.explorer.generation(),
                     path,
+                    sender.clone(),
+                );
+            }
+        }
+        MessageEffect::LoadWorkspaceTrees => {
+            request_explorer_root(pane, sender);
+            let identity = match &pane.overview {
+                OverviewState::Ready(overview) => overview.identity.clone(),
+                OverviewState::Loading | OverviewState::Failed(_) => return,
+            };
+            for (generation, change) in pane.review_tree.begin_expanded_reloads() {
+                request_changelist_files(
+                    pane.cwd.clone(),
+                    identity.clone(),
+                    generation,
+                    change,
                     sender.clone(),
                 );
             }
@@ -2119,6 +2660,26 @@ fn request_explorer_directory(
         let _ = sender.send(PaneMessage::ExplorerDirectory {
             generation,
             path,
+            result,
+        });
+    });
+}
+
+fn request_changelist_files(
+    cwd: PathBuf,
+    identity: WorkspaceIdentity,
+    generation: u64,
+    change: ChangelistId,
+    sender: mpsc::Sender<PaneMessage>,
+) {
+    thread::spawn(move || {
+        let client = P4Client::new(StdProcessTransport, "p4", &cwd);
+        let result = load_pending_changelist(&client, &identity, change)
+            .map(|changelist| changelist.files)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(PaneMessage::ChangelistFiles {
+            generation,
+            change,
             result,
         });
     });
@@ -2334,6 +2895,7 @@ struct RenderedFrame {
     lines: Vec<String>,
     hits: HitTargets,
     row_styles: Vec<RowStyle>,
+    runs: Vec<Vec<StyledRun>>,
     cursor: Option<(u16, u16)>,
 }
 
@@ -2342,6 +2904,15 @@ struct RowStyle {
     foreground: Option<Color>,
     background: Option<Color>,
     bold: bool,
+    dim: bool,
+    italic: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StyledRun {
+    x: u16,
+    text: String,
+    style: RowStyle,
 }
 
 fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
@@ -2351,6 +2922,7 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         lines: vec![" ".repeat(width); height],
         hits: HitTargets::default(),
         row_styles: vec![RowStyle::default(); height],
+        runs: vec![Vec::new(); height],
         cursor: None,
     };
     render_view_tabs(&mut frame, pane.view, width);
@@ -2360,9 +2932,7 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         PaneView::Explorer => render_explorer(&mut frame, pane, width, height),
         PaneView::Review => render_review(&mut frame, pane, width, height),
     }
-    if height >= 1 {
-        put_display(&mut frame.lines, 0, height - 1, &pane.status);
-    }
+    render_status(&mut frame, &pane.status, width, height);
 
     render_nav_overlay(&mut frame, pane, width, height);
 
@@ -2379,6 +2949,7 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         // Overlays are rendered after the underlying rows. Row-wide Explorer
         // and selection colors must not bleed through a menu or confirmation.
         frame.row_styles.fill(RowStyle::default());
+        frame.runs.iter_mut().for_each(Vec::clear);
         frame.cursor = None;
     }
     for line in &mut frame.lines {
@@ -2388,17 +2959,9 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
 }
 
 fn render_view_tabs(frame: &mut RenderedFrame, view: PaneView, _width: usize) {
-    let explorer = if view == PaneView::Explorer {
-        "▸ [📁 Explorer]"
-    } else {
-        "  📁 Explorer "
-    };
-    let review = if view == PaneView::Review {
-        "▸ [P4 Review]"
-    } else {
-        "  P4 Review "
-    };
-    let gap = "  ";
+    let explorer = "  📁 Explorer  ";
+    let review = "  ⎇ P4 Review  ";
+    let gap = " ";
     put_display(&mut frame.lines, 0, 0, &format!("{explorer}{gap}{review}"));
     let explorer_width = display_width(explorer) as u16;
     frame.hits.view_explorer = Some(Rect::row(0, 0, explorer_width));
@@ -2407,6 +2970,39 @@ fn render_view_tabs(frame: &mut RenderedFrame, view: PaneView, _width: usize) {
         0,
         display_width(review) as u16,
     ));
+    let active = RowStyle {
+        foreground: Some(Color::White),
+        background: Some(theme::SELECTION_BG.terminal()),
+        bold: true,
+        ..RowStyle::default()
+    };
+    let inactive = RowStyle {
+        foreground: Some(theme::MUTED.terminal()),
+        dim: true,
+        ..RowStyle::default()
+    };
+    put_styled(
+        frame,
+        0,
+        0,
+        explorer,
+        if view == PaneView::Explorer {
+            active
+        } else {
+            inactive
+        },
+    );
+    put_styled(
+        frame,
+        explorer_width as usize + display_width(gap),
+        0,
+        review,
+        if view == PaneView::Review {
+            active
+        } else {
+            inactive
+        },
+    );
 }
 
 fn render_header(frame: &mut RenderedFrame, pane: &PaneModel, _width: usize) {
@@ -2426,12 +3022,22 @@ fn render_header(frame: &mut RenderedFrame, pane: &PaneModel, _width: usize) {
             OverviewState::Failed(_) => "Workspace unavailable".to_owned(),
         },
     };
-    put_display(&mut frame.lines, 1, 1, &header);
+    put_styled(
+        frame,
+        1,
+        1,
+        &header,
+        RowStyle {
+            foreground: Some(theme::HEADER.terminal()),
+            bold: true,
+            ..RowStyle::default()
+        },
+    );
 }
 
 fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
     if height >= 2 {
-        put_display(&mut frame.lines, 0, height - 2, review_help(pane));
+        render_key_hints(frame, height - 2, width, review_help(pane));
     }
     match &pane.overview {
         OverviewState::Loading => put_display(&mut frame.lines, 0, 2, "Loading changelists..."),
@@ -2441,56 +3047,42 @@ fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, heig
         }
         OverviewState::Ready(overview) => {
             render_review_composer(frame, pane, width);
-            if height >= REVIEW_LIST_TOP + REVIEW_BOTTOM_ROWS {
-                let file_history_row = height - 4;
-                let workspace_history_row = height - 3;
-                put_display(
-                    &mut frame.lines,
-                    0,
-                    file_history_row,
-                    "▸ FILE HISTORY  (coming soon)",
-                );
-                put_display(
-                    &mut frame.lines,
-                    0,
-                    workspace_history_row,
-                    "▸ WORKSPACE HISTORY  (coming soon)",
-                );
-                for row in [file_history_row, workspace_history_row] {
-                    if let Some(style) = frame.row_styles.get_mut(row) {
-                        style.foreground = Some(Color::DarkGrey);
-                    }
-                }
-            }
-
             let body_top = REVIEW_LIST_TOP;
             let body_height = height.saturating_sub(REVIEW_LIST_TOP + REVIEW_BOTTOM_ROWS);
             if body_height == 0 {
                 return;
             }
+            let rows = pane.review_tree.rows(&overview.changes, &overview.identity);
             let offset = pane.review_offset(body_height);
-            let visible = body_height.min(overview.changes.len().saturating_sub(offset));
+            let visible = body_height.min(rows.len().saturating_sub(offset));
             frame.hits.changelist_offset = offset;
             let text_width = width.saturating_sub(1);
             let max_scroll_x = pane.review_content_width().saturating_sub(text_width);
             let scroll_x = pane.review_scroll_x.min(max_scroll_x);
-            for (visible_index, change) in overview
-                .changes
-                .iter()
-                .skip(offset)
-                .take(visible)
-                .enumerate()
-            {
-                let index = offset + visible_index;
+            for (visible_index, review_row) in rows.iter().skip(offset).take(visible).enumerate() {
                 let row = body_top + visible_index;
-                let line = format_changelist_row(index == pane.selected, change);
+                let selected = pane.review_tree.selected_key() == Some(&review_row.key);
+                let line = format_review_row(review_row, selected, &pane.review_tree);
                 let shown = slice_display(&line, scroll_x, text_width);
                 put_display(&mut frame.lines, 0, row, &shown);
-                if index == pane.selected
-                    && let Some(style) = frame.row_styles.get_mut(row)
-                {
-                    style.background = Some(Color::DarkGrey);
-                    style.bold = true;
+                if let Some(style) = frame.row_styles.get_mut(row) {
+                    if selected {
+                        style.background = Some(theme::SELECTION_BG.terminal());
+                        style.bold = true;
+                    }
+                    match &review_row.kind {
+                        ReviewRowKind::File(file) => {
+                            style.foreground = Some(file_action_terminal_color(&file.action));
+                        }
+                        ReviewRowKind::Directory => {
+                            style.foreground = Some(theme::HEADER.terminal());
+                        }
+                        ReviewRowKind::Status => {
+                            style.foreground = Some(theme::MUTED.terminal());
+                            style.dim = true;
+                        }
+                        ReviewRowKind::Changelist { .. } => {}
+                    }
                 }
                 frame
                     .hits
@@ -2502,10 +3094,24 @@ fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, heig
                 width.saturating_sub(1),
                 body_top,
                 body_height,
-                overview.changes.len(),
+                rows.len(),
                 body_height,
                 offset,
             );
+            if overview.changes.is_empty() {
+                put_styled(
+                    frame,
+                    2,
+                    body_top,
+                    "No pending changelists",
+                    RowStyle {
+                        foreground: Some(theme::MUTED.terminal()),
+                        dim: true,
+                        italic: true,
+                        ..RowStyle::default()
+                    },
+                );
+            }
         }
     }
 }
@@ -2542,6 +3148,30 @@ fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: us
             pane.description_editor
                 .text_for_change(id, &change.description)
         });
+    let border = if cursor.is_some() {
+        theme::ACCENT_FOCUS.terminal()
+    } else {
+        theme::BORDER.terminal()
+    };
+    if let Some(style) = frame.row_styles.get_mut(2) {
+        style.foreground = Some(border);
+    }
+    put_styled(
+        frame,
+        1,
+        2,
+        &title,
+        RowStyle {
+            foreground: Some(if cursor.is_some() {
+                theme::MODIFIED.terminal()
+            } else {
+                theme::HEADER.terminal()
+            }),
+            bold: true,
+            ..RowStyle::default()
+        },
+    );
+
     let description = if description.is_empty() && cursor.is_none() {
         "<no description>"
     } else {
@@ -2567,6 +3197,28 @@ fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: us
             REVIEW_DESCRIPTION_FIRST_ROW + visible_line,
             &format!("│ {content} │"),
         );
+        put_styled(
+            frame,
+            0,
+            REVIEW_DESCRIPTION_FIRST_ROW + visible_line,
+            "│",
+            RowStyle {
+                foreground: Some(border),
+                ..RowStyle::default()
+            },
+        );
+        if width > 1 {
+            put_styled(
+                frame,
+                width - 1,
+                REVIEW_DESCRIPTION_FIRST_ROW + visible_line,
+                "│",
+                RowStyle {
+                    foreground: Some(border),
+                    ..RowStyle::default()
+                },
+            );
+        }
     }
     put_display(
         &mut frame.lines,
@@ -2574,14 +3226,11 @@ fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: us
         REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS,
         &format!("└{}┘", "─".repeat(inner_width)),
     );
-    for row in 2..=REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS {
-        if let Some(style) = frame.row_styles.get_mut(row) {
-            style.foreground = Some(if cursor.is_some() {
-                Color::Yellow
-            } else {
-                Color::Cyan
-            });
-        }
+    if let Some(style) = frame
+        .row_styles
+        .get_mut(REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS)
+    {
+        style.foreground = Some(border);
     }
     if cursor.is_some()
         && cursor_line >= first_visual_line
@@ -2617,14 +3266,17 @@ fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: us
         frame.hits.review_submit = Some(Rect::row(0, REVIEW_SUBMIT_ROW as u16, width as u16));
         if let Some(style) = frame.row_styles.get_mut(REVIEW_SUBMIT_ROW) {
             style.foreground = Some(Color::White);
-            style.background = Some(Color::Blue);
+            style.background = Some(theme::ACCENT.terminal());
             style.bold = true;
         }
     } else if let Some(style) = frame.row_styles.get_mut(REVIEW_SUBMIT_ROW) {
         style.foreground = Some(Color::DarkGrey);
     }
 
-    let count = pane.review_count();
+    let count = match &pane.overview {
+        OverviewState::Ready(overview) => overview.changes.len(),
+        OverviewState::Loading | OverviewState::Failed(_) => 0,
+    };
     put_display(
         &mut frame.lines,
         0,
@@ -2632,6 +3284,7 @@ fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: us
         &format!("▾ CHANGELISTS ({count})"),
     );
     if let Some(style) = frame.row_styles.get_mut(REVIEW_SECTION_ROW) {
+        style.foreground = Some(theme::HEADER.terminal());
         style.bold = true;
     }
 }
@@ -2646,31 +3299,60 @@ fn render_description_actions(
     let row = REVIEW_DESCRIPTION_ACTION_ROW;
     match (&pane.description_editor, selected_change) {
         (DescriptionEditor::Idle, _) if editable => {
-            put_display(&mut frame.lines, 2, row, "[Edit Description]");
-            put_display(&mut frame.lines, 23, row, "click or e");
+            let _ = put_description_button(frame, row, 2, " Edit description ", width, false);
         }
         (DescriptionEditor::Editing { change, .. }, Some(selected)) if *change == selected => {
-            let (apply, next) = put_description_button(frame, row, 2, "[Apply Description]", width);
+            let (apply, next) =
+                put_description_button(frame, row, 2, " Apply description ", width, true);
             frame.hits.description_review = Some(apply);
-            let (cancel, _) =
-                put_description_button(frame, row, next.saturating_add(2), "[Cancel]", width);
+            let (cancel, _) = put_description_button(
+                frame,
+                row,
+                next.saturating_add(2),
+                " Cancel ",
+                width,
+                false,
+            );
             frame.hits.description_cancel = Some(cancel);
         }
         (DescriptionEditor::Loading { change, .. }, Some(selected)) if *change == selected => {
-            put_display(&mut frame.lines, 2, row, "Loading full description...");
-            let (cancel, _) = put_description_button(frame, row, 24, "[Cancel]", width);
+            put_styled(
+                frame,
+                2,
+                row,
+                "Loading full description…",
+                RowStyle {
+                    foreground: Some(theme::INFO.terminal()),
+                    ..RowStyle::default()
+                },
+            );
+            let (cancel, _) = put_description_button(frame, row, 29, " Cancel ", width, false);
             frame.hits.description_cancel = Some(cancel);
         }
         (DescriptionEditor::Applying { change, .. }, Some(selected)) if *change == selected => {
-            put_display(
-                &mut frame.lines,
+            put_styled(
+                frame,
                 2,
                 row,
-                "Applying and verifying description...",
+                "Applying and verifying description…",
+                RowStyle {
+                    foreground: Some(theme::INFO.terminal()),
+                    ..RowStyle::default()
+                },
             );
         }
         _ if !editable => {
-            put_display(&mut frame.lines, 2, row, "Description editing unavailable");
+            put_styled(
+                frame,
+                2,
+                row,
+                "Description editing unavailable",
+                RowStyle {
+                    foreground: Some(theme::MUTED.terminal()),
+                    dim: true,
+                    ..RowStyle::default()
+                },
+            );
         }
         _ => {}
     }
@@ -2682,9 +3364,29 @@ fn put_description_button(
     x: usize,
     label: &str,
     width: usize,
+    primary: bool,
 ) -> (Rect, usize) {
     let shown = slice_display(label, 0, width.saturating_sub(x));
-    put_display(&mut frame.lines, x, row, &shown);
+    put_styled(
+        frame,
+        x,
+        row,
+        &shown,
+        RowStyle {
+            foreground: Some(if primary {
+                Color::White
+            } else {
+                theme::KEYCAP_FG.terminal()
+            }),
+            background: Some(if primary {
+                theme::ACCENT.terminal()
+            } else {
+                theme::KEYCAP_BG.terminal()
+            }),
+            bold: primary,
+            ..RowStyle::default()
+        },
+    );
     let shown_width = display_width(&shown);
     (
         Rect::row(x as u16, row as u16, shown_width as u16),
@@ -2701,10 +3403,20 @@ fn render_explorer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, he
             .scroll_x()
             .min(display_width(legend).saturating_sub(text_width));
         let shown = slice_display(legend, scroll_x, text_width);
-        put_display(&mut frame.lines, 0, height - 3, &shown);
+        put_styled(
+            frame,
+            1,
+            height - 3,
+            &shown,
+            RowStyle {
+                foreground: Some(theme::MUTED.terminal()),
+                dim: true,
+                ..RowStyle::default()
+            },
+        );
     }
     if height >= 2 {
-        put_display(&mut frame.lines, 0, height - 2, explorer_help(pane));
+        render_key_hints(frame, height - 2, width, explorer_help(pane));
     }
     match pane.explorer.load_state() {
         ExplorerLoadState::Idle | ExplorerLoadState::Checking => {
@@ -2734,22 +3446,38 @@ fn render_explorer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, he
     }
 }
 
-fn explorer_help(_pane: &PaneModel) -> &'static str {
-    "Enter open  d diff  m menu  r refresh  1/2 views  q close"
+fn explorer_help(_pane: &PaneModel) -> &'static [(&'static str, &'static str)] {
+    &[
+        ("↑↓", "move"),
+        ("⏎", "open"),
+        ("d", "diff"),
+        ("m", "menu"),
+        ("r", "refresh"),
+        ("1/2", "views"),
+    ]
 }
 
 fn explorer_legend() -> &'static str {
-    "A add  M edit  D delete  R move  U untracked  ↓ behind  ⊘ not-in-view  ? unmapped"
+    "P4  A add · M edit · D delete · R move · U untracked · ↓ behind · ⊘ not in view · ? unmapped"
 }
 
-fn review_help(pane: &PaneModel) -> &'static str {
+fn review_help(pane: &PaneModel) -> &'static [(&'static str, &'static str)] {
     match &pane.description_editor {
         DescriptionEditor::Editing { .. } => {
-            "type/paste edit  Enter newline  Ctrl+Enter apply  Esc cancel"
+            &[("⏎", "newline"), ("Ctrl+⏎", "apply"), ("Esc", "cancel")]
         }
-        DescriptionEditor::Loading { .. } => "loading full description  Esc cancel",
-        DescriptionEditor::Applying { .. } => "applying description; input is locked",
-        DescriptionEditor::Idle => "e/click edit  ↑↓ select  Enter files  s review  r refresh",
+        DescriptionEditor::Loading { .. } => &[("Esc", "cancel loading")],
+        DescriptionEditor::Applying { .. } => &[("…", "applying description")],
+        DescriptionEditor::Idle => &[
+            ("↑↓", "select"),
+            ("⏎", "expand/diff"),
+            ("Space", "mark"),
+            ("n", "new CL"),
+            ("v", "move"),
+            ("e", "edit"),
+            ("s", "review"),
+            ("r", "refresh"),
+        ],
     }
 }
 
@@ -2782,6 +3510,20 @@ fn render_tree_column(
         .explorer
         .scroll_x()
         .min(content_width.saturating_sub(text_width));
+    if rows.is_empty() {
+        put_styled(
+            frame,
+            x.saturating_add(2),
+            y,
+            "No files to show",
+            RowStyle {
+                foreground: Some(theme::MUTED.terminal()),
+                dim: true,
+                italic: true,
+                ..RowStyle::default()
+            },
+        );
+    }
     for (visible_index, row) in rows.iter().skip(offset).take(visible).enumerate() {
         let screen_row = y + visible_index;
         let is_selected = selected.is_some_and(|path| path == row.path);
@@ -2809,42 +3551,29 @@ fn render_tree_column(
 
 fn explorer_row_style(decoration: Option<&ExplorerDecoration>, selected: bool) -> RowStyle {
     let foreground = match decoration {
-        Some(ExplorerDecoration::Untracked) => Some(Color::Rgb {
-            r: 0x73,
-            g: 0xc9,
-            b: 0x91,
-        }),
+        Some(ExplorerDecoration::Untracked) => Some(theme::UNTRACKED.terminal()),
         Some(ExplorerDecoration::Opened { action, .. }) => match action {
-            FileAction::Add | FileAction::Branch => Some(Color::Rgb {
-                r: 0x81,
-                g: 0xb8,
-                b: 0x8b,
-            }),
-            FileAction::Edit | FileAction::Integrate | FileAction::Import => Some(Color::Rgb {
-                r: 0xe2,
-                g: 0xc0,
-                b: 0x8d,
-            }),
-            FileAction::Delete | FileAction::Purge | FileAction::Archive => Some(Color::Rgb {
-                r: 0xc7,
-                g: 0x4e,
-                b: 0x39,
-            }),
-            FileAction::MoveAdd | FileAction::MoveDelete => Some(Color::Rgb {
-                r: 0x73,
-                g: 0xc9,
-                b: 0x91,
-            }),
+            FileAction::Add | FileAction::Branch => Some(theme::ADDED.terminal()),
+            FileAction::Edit | FileAction::Integrate | FileAction::Import => {
+                Some(theme::MODIFIED.terminal())
+            }
+            FileAction::Delete | FileAction::Purge | FileAction::Archive => {
+                Some(theme::DELETED.terminal())
+            }
+            FileAction::MoveAdd | FileAction::MoveDelete => Some(theme::RENAMED.terminal()),
             FileAction::Unknown(_) => Some(Color::Grey),
         },
-        Some(ExplorerDecoration::OutOfDate) => Some(Color::Cyan),
-        Some(ExplorerDecoration::NotInView | ExplorerDecoration::Unmapped) => Some(Color::DarkGrey),
+        Some(ExplorerDecoration::OutOfDate) => Some(theme::INFO.terminal()),
+        Some(ExplorerDecoration::NotInView | ExplorerDecoration::Unmapped) => {
+            Some(theme::MUTED.terminal())
+        }
         Some(ExplorerDecoration::Unopened) | None => None,
     };
     RowStyle {
         foreground,
-        background: selected.then_some(Color::DarkGrey),
+        background: selected.then_some(theme::SELECTION_BG.terminal()),
         bold: selected,
+        ..RowStyle::default()
     }
 }
 
@@ -2945,6 +3674,74 @@ fn render_nav_overlay(frame: &mut RenderedFrame, pane: &PaneModel, width: usize,
                 0,
                 height.saturating_sub(2),
                 &format!(" Delete '{name}' permanently? (y/N)"),
+            );
+        }
+        NavOverlay::ConfirmDeleteChangelist { change } => {
+            put_display(
+                &mut frame.lines,
+                0,
+                height.saturating_sub(2),
+                &format!(" Delete empty CL {change}? Files are rechecked first. (y/N)"),
+            );
+        }
+        NavOverlay::MoveFiles {
+            source,
+            files,
+            targets,
+            selected,
+        } => {
+            let popup_height = targets.len().saturating_add(4).min(height).max(4);
+            let top = height.saturating_sub(popup_height) / 2;
+            let popup_width = width.saturating_sub(4).clamp(24, 54).min(width);
+            let left = width.saturating_sub(popup_width) / 2;
+            let inner = popup_width.saturating_sub(2);
+            put_display(
+                &mut frame.lines,
+                left,
+                top,
+                &format!("┌{}┐", "─".repeat(inner)),
+            );
+            put_display(
+                &mut frame.lines,
+                left,
+                top.saturating_add(1),
+                &format!(
+                    "│{}│",
+                    pad_display(
+                        &format!(" Move {} file(s) from CL {source}", files.len()),
+                        inner
+                    )
+                ),
+            );
+            let visible = popup_height.saturating_sub(3);
+            let offset = selected
+                .saturating_add(1)
+                .saturating_sub(visible)
+                .min(targets.len().saturating_sub(visible));
+            for (visible_index, (index, target)) in targets
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(visible)
+                .enumerate()
+            {
+                let marker = if index == *selected { "›" } else { " " };
+                put_display(
+                    &mut frame.lines,
+                    left,
+                    top.saturating_add(2 + visible_index),
+                    &format!(
+                        "│{}│",
+                        pad_display(&format!(" {marker} CL {target}"), inner)
+                    ),
+                );
+            }
+            let bottom = top.saturating_add(popup_height.saturating_sub(1));
+            put_display(
+                &mut frame.lines,
+                left,
+                bottom,
+                &format!("└{}┘", "─".repeat(inner)),
             );
         }
     }
@@ -3246,6 +4043,139 @@ fn put_display(lines: &mut [String], column: usize, row: usize, value: &str) {
     *line = splice_display(line, column, value);
 }
 
+fn put_styled(frame: &mut RenderedFrame, column: usize, row: usize, value: &str, style: RowStyle) {
+    let Some(line) = frame.lines.get(row) else {
+        return;
+    };
+    let available = display_width(line).saturating_sub(column);
+    if available == 0 {
+        return;
+    }
+    let shown = slice_display(value, 0, available);
+    if shown.is_empty() {
+        return;
+    }
+    put_display(&mut frame.lines, column, row, &shown);
+    if let Some(runs) = frame.runs.get_mut(row) {
+        runs.push(StyledRun {
+            x: column.min(u16::MAX as usize) as u16,
+            text: shown,
+            style,
+        });
+    }
+}
+
+fn render_key_hints(frame: &mut RenderedFrame, row: usize, width: usize, hints: &[(&str, &str)]) {
+    let mut x = 1usize;
+    for (key, label) in hints {
+        let keycap = format!(" {key} ");
+        let label = format!(" {label}");
+        let needed = display_width(&keycap)
+            .saturating_add(display_width(&label))
+            .saturating_add(2);
+        if x.saturating_add(needed) > width {
+            put_styled(
+                frame,
+                x,
+                row,
+                " …",
+                RowStyle {
+                    foreground: Some(theme::MUTED.terminal()),
+                    dim: true,
+                    ..RowStyle::default()
+                },
+            );
+            break;
+        }
+        put_styled(
+            frame,
+            x,
+            row,
+            &keycap,
+            RowStyle {
+                foreground: Some(theme::KEYCAP_FG.terminal()),
+                background: Some(theme::KEYCAP_BG.terminal()),
+                ..RowStyle::default()
+            },
+        );
+        x = x.saturating_add(display_width(&keycap));
+        put_styled(
+            frame,
+            x,
+            row,
+            &label,
+            RowStyle {
+                foreground: Some(theme::MUTED.terminal()),
+                dim: true,
+                ..RowStyle::default()
+            },
+        );
+        x = x.saturating_add(display_width(&label)).saturating_add(2);
+    }
+}
+
+fn render_status(frame: &mut RenderedFrame, status: &str, width: usize, height: usize) {
+    if height == 0 || status.is_empty() {
+        return;
+    }
+    let lower = status.to_ascii_lowercase();
+    let (mark, color) = if [
+        "failed",
+        "error",
+        "cannot",
+        "invalid",
+        "unavailable",
+        "not in",
+        "denied",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        ("!", theme::CONFLICT)
+    } else if ["loading", "refreshing", "applying", "running", "waiting"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        ("●", theme::INFO)
+    } else if [
+        "loaded", "opened", "updated", "copied", "deleted", "revealed", "verified",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        ("✓", theme::UNTRACKED)
+    } else {
+        ("·", theme::MUTED)
+    };
+    let row = height - 1;
+    put_styled(
+        frame,
+        1,
+        row,
+        mark,
+        RowStyle {
+            foreground: Some(color.terminal()),
+            bold: mark != "·",
+            ..RowStyle::default()
+        },
+    );
+    put_styled(
+        frame,
+        3,
+        row,
+        &slice_display(status, 0, width.saturating_sub(3)),
+        RowStyle {
+            foreground: Some(if mark == "·" {
+                theme::MUTED.terminal()
+            } else {
+                color.terminal()
+            }),
+            dim: mark == "·",
+            ..RowStyle::default()
+        },
+    );
+}
+
 fn put(lines: &mut [String], column: usize, row: usize, value: &str) {
     let Some(line) = lines.get_mut(row) else {
         return;
@@ -3339,10 +4269,14 @@ mod tests {
         assert_eq!(pane.view, PaneView::Explorer);
         let rendered = render_frame(&pane, 80, 24).lines.join("\n");
         assert!(rendered.contains("Explorer"));
-        assert!(rendered.contains("▸ [📁 Explorer]"));
-        assert!(rendered.contains("Enter open  d diff  m menu  r refresh"));
-        assert!(rendered.contains("A add  M edit  D delete"));
+        assert!(rendered.contains("📁 Explorer"));
+        assert!(rendered.contains("⏎  open"));
+        assert!(rendered.contains("P4  A add · M edit · D delete"));
         assert!(!rendered.contains("CL 42  pending"));
+        let frame = render_frame(&pane, 80, 24);
+        assert!(frame.runs[0].iter().any(|run| {
+            run.style.background == Some(theme::SELECTION_BG.terminal()) && run.style.bold
+        }));
     }
 
     #[test]
@@ -3350,7 +4284,7 @@ mod tests {
         let mut pane = pane_with_changes();
         pane.set_nav_size(24, 16);
         let initial = render_frame(&pane, 24, 16);
-        assert!(initial.lines[13].contains("A add"));
+        assert!(initial.lines[13].contains("P4  A add"));
         assert!(!initial.lines[13].contains("A+"));
 
         pane.explorer
@@ -3380,17 +4314,18 @@ mod tests {
         pane.explorer.select_index(1);
         let previous_generation = pane.explorer.generation();
 
-        assert_eq!(pane.begin_active_refresh(), MessageEffect::LoadExplorerRoot);
+        assert_eq!(pane.begin_active_refresh(), MessageEffect::ReloadOverview);
         assert_eq!(pane.explorer.load_state(), &ExplorerLoadState::Checking);
         assert_ne!(pane.explorer.generation(), previous_generation);
-        assert_eq!(pane.explorer.pending_directory(), Some(root.as_path()));
+        assert_eq!(pane.explorer.pending_directory(), None);
+        assert!(matches!(pane.overview, OverviewState::Loading));
         assert!(
             pane.explorer
                 .visible_rows()
                 .iter()
                 .all(|row| row.name != "deleted-externally.txt")
         );
-        assert!(pane.status.contains("Refreshing Explorer"));
+        assert!(pane.status.contains("Refreshing workspace identity"));
     }
 
     #[test]
@@ -3402,10 +4337,123 @@ mod tests {
         assert!(rendered.contains("Submit"));
         assert!(rendered.contains("CL 42 DESCRIPTION"));
         assert!(rendered.contains("CL 42  pending  Fix submit overlay"));
-        assert!(rendered.contains("FILE HISTORY  (coming soon)"));
-        assert!(rendered.contains("WORKSPACE HISTORY  (coming soon)"));
+        assert!(!rendered.contains("coming soon"));
         assert!(frame.hits.review_submit.is_some());
         assert!(!rendered.contains("p4 submit -c"));
+    }
+
+    #[test]
+    fn review_expands_changelist_files_as_an_inline_tree_and_marks_a_subset() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
+        let activation = match &pane.overview {
+            OverviewState::Ready(overview) => pane
+                .review_tree
+                .activate_selected(&overview.changes, &overview.identity),
+            _ => panic!("overview should be ready"),
+        };
+        let ReviewActivation::LoadFiles { generation, change } = activation else {
+            panic!("collapsed CL should request its files");
+        };
+        pane.handle_message(PaneMessage::ChangelistFiles {
+            generation,
+            change,
+            result: Ok(vec![ChangedFile {
+                depot_path: "//depot/src/ui.rs".into(),
+                client_path: Some(PathBuf::from("C:/Example Workspace/src/ui.rs")),
+                action: FileAction::Edit,
+                file_type: crate::domain::FileType::new("text"),
+                base_revision: Some(1),
+                moved_from: None,
+                moved_to: None,
+            }]),
+        });
+
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("▾ CL 42"));
+        assert!(rendered.contains("📂 src"));
+        assert!(rendered.contains("[ ] M"));
+        assert!(rendered.contains("ui.rs"));
+
+        if let OverviewState::Ready(overview) = &pane.overview {
+            pane.review_tree
+                .select_index(2, &overview.changes, &overview.identity);
+        }
+        assert!(pane.toggle_selected_review_file());
+        let marked = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(marked.contains("[x] M"));
+        assert!(pane.status.contains("press v to move"));
+    }
+
+    #[test]
+    fn review_shortcuts_open_new_change_prompt_and_move_target_picker() {
+        let mut pane = pane_with_numbered_changes(2);
+        pane.view = PaneView::Review;
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            pane.nav_overlay,
+            NavOverlay::Prompt {
+                kind: PromptKind::NewChangelist,
+                ..
+            }
+        ));
+        pane.nav_overlay = NavOverlay::Closed;
+
+        let activation = match &pane.overview {
+            OverviewState::Ready(overview) => pane
+                .review_tree
+                .activate_selected(&overview.changes, &overview.identity),
+            _ => panic!("overview should be ready"),
+        };
+        let ReviewActivation::LoadFiles { generation, change } = activation else {
+            panic!("collapsed CL should request its files");
+        };
+        pane.review_tree.install_files(
+            generation,
+            change,
+            Ok(vec![ChangedFile {
+                depot_path: "//depot/a.txt".into(),
+                client_path: Some(PathBuf::from("C:/Example Workspace/a.txt")),
+                action: FileAction::Edit,
+                file_type: crate::domain::FileType::new("text"),
+                base_revision: Some(1),
+                moved_from: None,
+                moved_to: None,
+            }]),
+        );
+        if let OverviewState::Ready(overview) = &pane.overview {
+            pane.review_tree
+                .select_index(1, &overview.changes, &overview.identity);
+        }
+        assert!(pane.toggle_selected_review_file());
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            pane.nav_overlay,
+            NavOverlay::MoveFiles {
+                source: ChangelistId::Numbered(1),
+                ref targets,
+                ..
+            } if targets == &[ChangelistId::Numbered(2)]
+        ));
+    }
+
+    #[test]
+    fn idle_description_action_does_not_render_a_duplicate_shortcut_button() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
+
+        let frame = render_frame(&pane, 80, 24);
+
+        assert_eq!(
+            frame.lines[REVIEW_DESCRIPTION_ACTION_ROW].trim(),
+            "Edit description"
+        );
     }
 
     #[test]
@@ -3572,7 +4620,7 @@ mod tests {
         };
 
         let rendered = render_frame(&pane, 80, 24).lines.join("\n");
-        assert!(rendered.contains("[Apply Description]"));
+        assert!(rendered.contains("Apply description"));
 
         dispatch_key(
             &mut pane,
@@ -3735,13 +4783,18 @@ mod tests {
     fn selected_changelist_stays_in_the_visible_window() {
         let mut pane = pane_with_numbered_changes(40);
         pane.view = PaneView::Review;
-        pane.selected = 39;
+        if let OverviewState::Ready(overview) = &pane.overview {
+            pane.review_tree
+                .select_index(39, &overview.changes, &overview.identity);
+        }
+        pane.sync_selected_changelist_from_tree();
         let frame = render_frame(&pane, 80, 24);
         let rendered = frame.lines.join("\n");
-        assert!(rendered.contains("> CL 40"));
+        assert!(rendered.contains("›▸ CL 40"));
         assert!(!rendered.contains("CL 1  pending"));
-        assert_eq!(frame.hits.changelist_offset, 30);
-        assert_eq!(frame.hits.changelists.len(), 10);
+        let visible = 24 - REVIEW_LIST_TOP - REVIEW_BOTTOM_ROWS;
+        assert_eq!(frame.hits.changelist_offset, 40 - visible);
+        assert_eq!(frame.hits.changelists.len(), visible);
     }
 
     #[test]
@@ -4127,10 +5180,14 @@ mod tests {
     fn review_wheel_keeps_the_visible_offset() {
         let mut pane = pane_with_numbered_changes(40);
         pane.view = PaneView::Review;
-        pane.selected = 25;
+        if let OverviewState::Ready(overview) = &pane.overview {
+            pane.review_tree
+                .select_index(25, &overview.changes, &overview.identity);
+        }
+        pane.sync_selected_changelist_from_tree();
         pane.set_nav_size(80, 24);
         let before = render_frame(&pane, 80, 24).hits.changelist_offset;
-        assert_eq!(before, 16);
+        assert_eq!(before, 14);
         dispatch_mouse(&mut pane, mouse(MouseEventKind::ScrollDown, 2, 8));
         let after = render_frame(&pane, 80, 24).hits.changelist_offset;
         assert_eq!(after, before + 3);

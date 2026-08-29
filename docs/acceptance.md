@@ -167,12 +167,12 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 
 ### ACC-UI-002（P0）标准宿主布局
 
-步骤：打开 P4 导航，再依次打开 File、Diff 和 CL 文件列表。
+步骤：打开 P4 导航，依次打开 File、Diff，并在 Review 行内展开 CL 文件树。
 期望：
 
 - 无内容时是 `Agent CLI 80% | Navigation 20%`。
 - 有内容时是 `Agent CLI 40% | Content 40% | Navigation 20%`，Navigation 始终在最右。
-- File、Diff 和 CL 原地复用同一 Content pane，不连续产生新 pane。
+- File、Diff 原地复用同一 Content pane，不连续产生新 pane；展开 CL 不改变 pane 布局。
 - 各 pane 无重叠、越界和裁切 chrome；footer 始终可见。
 
 ### ACC-UI-003（P0）Content 生命周期
@@ -190,8 +190,8 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 期望：
 
 - `↑`/`↓`、PageUp/PageDown 和鼠标滚轮可到达加载预算内的全部行。
-- File、Diff 和 CL 长行按 Content pane 的当前宽度自动换成多行，并且所有换行后的显示行均可纵向滚动到达；文件续行不重复行号，但保留等宽空白 gutter，正文起点与首行一致。
-- CL 文件列表可用鼠标单击切换高亮选择，`Enter` 从该选择打开 Diff；鼠标选择长路径的任一换行也命中同一文件。
+- File、Diff 长行按 Content pane 的当前宽度自动换成多行，并且所有换行后的显示行均可纵向滚动到达；文件续行不重复行号，但保留等宽空白 gutter，正文起点与首行一致。
+- CL 文件树在 Navigation 保持单行并可横向平移；鼠标单击或 Space 切换 `[ ]/[x]`，`Enter` 从该文件打开 Diff。
 - 文件按类型高亮；Diff 的新增（绿 `+`）、删除（红 `-`）和行内修改可区分，折叠行可展开。
 - 长行和滚动不改变最右 Navigation 的宽度或树对齐。
 
@@ -232,7 +232,7 @@ Distribution Gate 未通过时，可以发布内部 dogfood build，但不得宣
 - 明确 unmapped 的旧记录先安全关闭已确认属于插件的 Navigation/Content pane，再从 state 移除；连接、认证、权限或查询错误不得删除记录或继续创建重复 pane。
 - 已有匹配且 process-info 确认运行 `herdr-p4 ... pane`（含 Windows PowerShell 包装）的健康 pane 时不重复打开；同一 workspace 只保留一个导航 pane。
 - 标题是 `Perforce` 但前台只剩默认 shell 的 pane 视为 corpse：必须先关掉空壳和残留 Content pane，再打开真正的插件 pane。带完整 Content token 的 pane 可正常清理；重启后 token 丢失但标题匹配的候选还必须确认前台是 viewer/默认 shell 且与导航候选水平相邻，之后按 plugin-first、plain-fallback 清理。不得把同名 Agent 当成插件 pane。任一检查或清理关闭失败不得再 split，也不得静默忽略。
-- 用户拖动过的导航宽度按 workspace 写入插件 state；不同 workspace 的比例不得互相覆盖。重启后恢复 Explorer/Review 视图和最后 File/Diff/CL 内容，并保持 `Agent | Content | Navigation`；没有 Content 时保持 `Agent | Navigation`。不得被默认 50/50 覆盖。
+- 用户拖动过的导航宽度按 workspace 写入插件 state；不同 workspace 的比例不得互相覆盖。重启后恢复 Explorer/Review 视图和最后 File/Diff 内容，并保持 `Agent | Content | Navigation`；CL files 只在 Review 行内树恢复。有无 Content 时分别保持三栏/两栏，不得被默认 50/50 覆盖。
 - 缺失 workspace 计为 unavailable 并安全跳过。
 - 新恢复 pane 不抢焦点，且不会替换或关闭 Agent pane。
 - 连接到同一 server 的新客户端、配置 reload、link/enable 不被误记为 server startup。
@@ -337,6 +337,20 @@ fixture 至少包含：
 
 期望：图标、标签、统计和排序稳定；未知动作以 unknown 显示，不当成 edit。
 
+### ACC-TREE-006（P0）Review 行内 CL/File 树
+
+步骤：单击或 Enter 一个 CL，再选择其中一个嵌套目录下的文件。
+期望：文件在该 CL 行下直接以真实 client-relative（缺失时 depot）目录层级展开，不创建 CL Content pane；文件显示动作/类型图标和 `[ ]`。单击或 Space 切换 `[x]`，Enter 才在复用的 Content pane 打开 Diff。旧 generation 的异步文件结果不得覆盖刷新后的树。
+
+### ACC-TREE-007（P0）新建与删除 CL
+
+期望：`n`/菜单使用服务器 new change form 创建 owned current-client numbered pending CL，写后回读描述且确认为空。删除入口不出现在 default CL；确认后必须重新校验 owner/client/pending 和空文件集才运行 `change -d`。认证、权限、超时、状态变化或非空均不得显示成功。
+
+### ACC-TREE-008（P0）选中文件跨 CL 移动
+
+步骤：在一个源 CL 中选择部分文件，按 `v` 选择另一个 pending CL。
+期望：选择不得跨源 CL；单次最多 512 个文件。写前重读 workspace、源/目标 CL 和文件归属；argv 保持特殊字符为单一安全参数；`reopen -c` 后确认文件已从源消失并出现在目标。目标不能等于源，失败不得清空仍可重试的选择。
+
 ## 7.1 Workspace File Explorer
 
 Explorer 是 Dogfood Gate 能力（ADR-0005）。不替代 ACC-TREE；CL 树与目录树必须分开验收。
@@ -362,12 +376,12 @@ fixture 覆盖：clean tracked、untracked、depot head 已 delete 且无 have r
 
 ### ACC-EXPLORER-004（P0）与 Review view 切换
 
-步骤：在 Explorer 选中已 opened 文件并打开 Diff，切到 Review（`2`），打开 CL 文件列表，再切回 Explorer（`1`）。
-期望：两边选择不丢；File/Diff/CL 复用 Content pane。Submit overlay 只存在于 Review。
+步骤：在 Explorer 选中已 opened 文件并打开 Diff，切到 Review（`2`），行内展开 CL 文件树，再切回 Explorer（`1`）。
+期望：两边选择不丢；CL 文件留在 Review 导航树，File/Diff 复用 Content pane。Submit overlay 只存在于 Review。
 
 ### ACC-EXPLORER-005（P0）Review pane 的 IDE 式层级
 
-期望：Review 上方固定显示当前 CL 描述框和 Review & Submit 入口；点击入口只打开既有 preflight/确认 overlay，不直接运行 submit。CL 列表必须请求完整描述，owned numbered pending CL 的描述框通过点击或 `e` 获得焦点时还必须读取完整 change form，不得用可能截断的列表摘要初始化编辑器。编辑器显示真实光标，并支持 UTF-8、多行输入和粘贴；折行边界的光标和上下移动按三行框中的视觉行计算，空编辑缓冲区不得绘制 `<no description>` 占位文本。编辑时包括右键菜单、滚轮、CL 选择和 Submit 在内的背景鼠标/键盘输入都被锁定。`Ctrl+Enter` 或显式点击 **Apply Description** 一次即确认本次修改，随后自动完成 freshness 检查、写入和回读验证，不再要求第二次确认；Apply 期间保持最后编辑位置附近的只读视口。输入达到上限时所有插入键都显示错误，不得静默丢弃。default、非 pending、其他 owner/client 的描述不可编辑。下方 `CHANGELISTS`、`FILE HISTORY`、`WORKSPACE HISTORY` 是同级 section，后两项明确为未实现占位；CL 选择变化会刷新上方描述。
+期望：Review 上方固定显示当前 CL 描述框和 Review & Submit 入口；点击入口只打开既有 preflight/确认 overlay，不直接运行 submit。CL 列表必须请求完整描述；CL 行在同一树内展开 files。owned numbered pending CL 的描述框通过点击或 `e` 获得焦点时还必须读取完整 change form，不得用可能截断的列表摘要初始化编辑器。编辑器显示真实光标，并支持 UTF-8、多行输入和粘贴；折行边界的光标和上下移动按三行框中的视觉行计算，空编辑缓冲区不得绘制 `<no description>` 占位文本。编辑时包括右键菜单、滚轮、CL/file 选择和 Submit 在内的背景鼠标/键盘输入都被锁定。`Ctrl+Enter` 或显式点击 **Apply Description** 一次即确认本次修改，随后自动完成 freshness 检查、写入和回读验证，不再要求第二次确认；Apply 期间保持最后编辑位置附近的只读视口。输入达到上限时所有插入键都显示错误，不得静默丢弃。default、非 pending、其他 owner/client 的描述不可编辑。下方 `CHANGELISTS`、`FILE HISTORY`、`WORKSPACE HISTORY` 是同级 section，后两项明确为未实现占位；任意 CL 子树行的选择变化会刷新上方描述。
 
 ## 8. Diff
 

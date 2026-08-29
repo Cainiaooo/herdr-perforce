@@ -16,18 +16,19 @@ use crate::domain::{
     EXPAND_CHUNK, FileDiff, FoldRange, IntraSpan, MIN_FOLD_HIDDEN, OverlayKind, OverlayLine,
 };
 
-use super::{syntax, wrap};
+use super::{syntax, theme, wrap};
 
-const ADD_LINE_BG: Color = Color::Rgb(33, 58, 43);
-const DEL_LINE_BG: Color = Color::Rgb(110, 32, 38);
-const ADD_WORD_BG: Color = Color::Rgb(46, 104, 64);
-const DEL_WORD_BG: Color = Color::Rgb(182, 48, 52);
-const DEL_FG: Color = Color::Rgb(255, 168, 168);
-const FOLD_FG: Color = Color::Rgb(125, 174, 199);
-const FOLD_ROW_BG: Color = Color::Rgb(28, 36, 48);
+const ADD_LINE_BG: Color = theme::ADD_LINE_BG.tui();
+const DEL_LINE_BG: Color = theme::DEL_LINE_BG.tui();
+const ADD_WORD_BG: Color = theme::ADD_WORD_BG.tui();
+const DEL_WORD_BG: Color = theme::DEL_WORD_BG.tui();
+const ADD_FG: Color = theme::ADD_MARK.tui();
+const DEL_FG: Color = theme::DEL_MARK.tui();
+const FOLD_FG: Color = theme::INFO.tui();
+const FOLD_ROW_BG: Color = theme::FOLD_ROW_BG.tui();
 const ELLIPSIS: &str = "⋯";
-const BTN_DOWN: &str = "[▼20]";
-const BTN_UP: &str = "[▲20]";
+const BTN_DOWN: &str = "▼ 20";
+const BTN_UP: &str = "▲ 20";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffToolbarAction {
@@ -444,15 +445,9 @@ fn fold_click(edge: FoldEdge) -> Option<FoldClick> {
 
 pub(crate) fn stats_spans(diff: &FileDiff) -> Vec<Span<'static>> {
     vec![
-        Span::styled(
-            format!("+{}", diff.added),
-            Style::default().fg(Color::Green),
-        ),
+        Span::styled(format!("+{}", diff.added), Style::default().fg(ADD_FG)),
         Span::raw(" "),
-        Span::styled(
-            format!("-{}", diff.removed),
-            Style::default().fg(Color::Red),
-        ),
+        Span::styled(format!("-{}", diff.removed), Style::default().fg(DEL_FG)),
     ]
 }
 
@@ -492,11 +487,13 @@ pub(crate) fn toolbar_line(
         });
         let style = if enabled {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Gray)
+                .fg(theme::KEYCAP_FG.tui())
+                .bg(theme::KEYCAP_BG.tui())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray).bg(Color::Indexed(236))
+            Style::default()
+                .fg(theme::MUTED.tui())
+                .bg(theme::FOLD_ROW_BG.tui())
         };
         spans.push(Span::styled(text, style));
         *x += width;
@@ -584,7 +581,7 @@ fn paint_overlay_line(
     syntax_line: Option<Line<'static>>,
 ) -> Line<'static> {
     let (old_no, new_no, mark, line_bg, mark_fg) = match line.kind {
-        OverlayKind::Insert => (None, line.new_no, '+', Some(ADD_LINE_BG), Color::Green),
+        OverlayKind::Insert => (None, line.new_no, '+', Some(ADD_LINE_BG), ADD_FG),
         OverlayKind::Delete => (line.old_no, None, '-', Some(DEL_LINE_BG), DEL_FG),
         OverlayKind::Context | OverlayKind::Skipped => {
             (line.old_no, line.new_no, ' ', None, Color::DarkGray)
@@ -630,7 +627,7 @@ fn paint_body(line: &OverlayLine, syntax_line: Option<Line<'static>>) -> Vec<Spa
         None => vec![Span::styled(
             line.text.clone(),
             match line.kind {
-                OverlayKind::Insert => Style::default().fg(Color::Green),
+                OverlayKind::Insert => Style::default().fg(ADD_FG),
                 OverlayKind::Delete => Style::default().fg(DEL_FG),
                 OverlayKind::Context | OverlayKind::Skipped => Style::default(),
             },
@@ -951,7 +948,7 @@ mod tests {
         assert!(body.iter().any(|line| texts(line).contains("▼")));
         let leading_row = body
             .iter()
-            .position(|line| texts(line).contains("[▲20]"))
+            .position(|line| texts(line).contains("▲ 20"))
             .expect("leading fold row");
         let click = click_view
             .fold_hit_at(leading_row, 0, 80)
@@ -1038,7 +1035,7 @@ mod tests {
             .iter()
             .find(|line| line.contains(ELLIPSIS))
             .expect("fold");
-        assert!(fold_row.contains("[▼20]") && fold_row.contains("[▲20]"));
+        assert!(fold_row.contains("▼ 20") && fold_row.contains("▲ 20"));
         assert!(view.expand_visible(0, 80, 80));
         let expanded: Vec<String> = view.body_lines().iter().map(texts).collect();
         assert!(

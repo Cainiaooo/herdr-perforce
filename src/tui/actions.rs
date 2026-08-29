@@ -20,6 +20,11 @@ pub enum MenuAction {
     OpenDiff,
     Reveal,
     OpenChangelist,
+    NewChangelist,
+    DeleteChangelist,
+    OpenReviewDiff,
+    ToggleFileSelection,
+    MoveSelectedFiles,
     CopyChangelist,
     SubmitReview,
 }
@@ -35,6 +40,16 @@ pub struct ExplorerMenuTarget {
     pub is_dir: bool,
     pub opened: bool,
     pub is_root: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ReviewMenuTarget {
+    pub is_changelist: bool,
+    pub is_file: bool,
+    pub expanded: bool,
+    pub can_submit: bool,
+    pub can_delete: bool,
+    pub has_checked_files: bool,
 }
 
 /// VS Code-style context menu for a tree row. `target` is `None` when the
@@ -76,19 +91,54 @@ pub fn explorer_menu_entries(target: Option<ExplorerMenuTarget>) -> Vec<MenuEntr
 }
 
 #[must_use]
-pub fn review_menu_entries(can_submit: bool) -> Vec<MenuEntry> {
-    let mut entries = vec![
-        MenuEntry::Action(MenuAction::OpenChangelist, "Open Files"),
-        MenuEntry::Action(MenuAction::CopyChangelist, "Copy Changelist Number"),
-        MenuEntry::Separator,
-        MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
-    ];
-    if can_submit {
+pub fn review_menu_entries(target: ReviewMenuTarget) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Action(
+        MenuAction::NewChangelist,
+        "New Changelist…",
+    )];
+    if target.is_changelist {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::Action(
+                MenuAction::OpenChangelist,
+                if target.expanded {
+                    "Collapse Files"
+                } else {
+                    "Expand Files"
+                },
+            ),
+            MenuEntry::Action(MenuAction::CopyChangelist, "Copy Changelist Number"),
+        ]);
+        if target.can_delete {
+            entries.push(MenuEntry::Action(
+                MenuAction::DeleteChangelist,
+                "Delete Empty Changelist…",
+            ));
+        }
+    }
+    if target.is_file {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::Action(MenuAction::OpenReviewDiff, "Open Diff"),
+            MenuEntry::Action(MenuAction::ToggleFileSelection, "Toggle File Selection"),
+        ]);
+    }
+    if target.has_checked_files {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::Action(MenuAction::MoveSelectedFiles, "Move Selected Files…"),
+        ]);
+    }
+    if target.can_submit {
         entries.extend([
             MenuEntry::Separator,
             MenuEntry::Action(MenuAction::SubmitReview, "Submit Review…"),
         ]);
     }
+    entries.extend([
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
+    ]);
     entries
 }
 
@@ -401,12 +451,27 @@ mod tests {
     }
 
     #[test]
-    fn review_menu_offers_submit_only_for_numbered_pending() {
-        let pending = review_menu_entries(true);
+    fn review_menu_exposes_inline_tree_and_management_actions_by_row_kind() {
+        let pending = review_menu_entries(ReviewMenuTarget {
+            is_changelist: true,
+            can_submit: true,
+            can_delete: true,
+            ..ReviewMenuTarget::default()
+        });
+        assert!(has(&pending, MenuAction::NewChangelist));
         assert!(has(&pending, MenuAction::OpenChangelist));
+        assert!(has(&pending, MenuAction::DeleteChangelist));
         assert!(has(&pending, MenuAction::SubmitReview));
-        let other = review_menu_entries(false);
-        assert!(!has(&other, MenuAction::SubmitReview));
+
+        let file = review_menu_entries(ReviewMenuTarget {
+            is_file: true,
+            has_checked_files: true,
+            ..ReviewMenuTarget::default()
+        });
+        assert!(has(&file, MenuAction::OpenReviewDiff));
+        assert!(has(&file, MenuAction::ToggleFileSelection));
+        assert!(has(&file, MenuAction::MoveSelectedFiles));
+        assert!(!has(&file, MenuAction::SubmitReview));
     }
 
     #[test]
