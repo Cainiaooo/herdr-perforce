@@ -57,7 +57,7 @@ herdr plugin action invoke open-windows --plugin herdr.perforce
 herdr plugin action invoke open --plugin herdr.perforce
 ```
 
-也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。Review 上方内嵌当前 CL 的描述与 **Review & Submit** 入口，下方是 Changelists，并预留与其同级的 File History / Workspace History。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
+也可以从 Herdr 的 plugin action 列表中选择 **Open Perforce review**。该 action 会在当前 pane 右侧打开约 20% 宽的导航 pane，并把打开前的 workspace/pane context 交给插件。导航 pane 默认打开 **File Explorer**；按 `2` 或点击 **P4 Review** 查看 changelist。Review 上方内嵌当前 CL 的可编辑描述框与 **Review & Submit** 入口，下方是 Changelists，并预留与其同级的 File History / Workspace History。首次查看 File、Diff 或 CL 文件列表时，会在 Agent CLI 与最右导航之间按需创建内容 pane。
 
 ### Panel 加载与自动恢复
 
@@ -103,12 +103,26 @@ Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 | `1` / `2` | 切换 Explorer / P4 Review 导航 |
 | `Enter` | Explorer 中打开 File；Review 中打开 CL 文件列表 |
 | `m` / 右键 | 打开当前行的上下文菜单（Rename、Copy Path、Reveal 等） |
-| 滚轮 / 拖动 | 树与 CL 列表纵向滚动；横向拖动查看被截断的单行名称 |
+| 滚轮 / 拖动 | 树与 CL 列表纵向滚动；横向拖动查看被截断的名称及 Explorer 状态图例 |
 | `d` | Explorer 中为 opened file 打开 Diff |
 | `o` | 使用系统默认应用打开 Explorer 选中路径 |
+| `e` / 点击描述框 | Review 中编辑当前 owned numbered pending CL 的 Description |
 | `s` / 点击 **Review & Submit** | 为当前 numbered pending CL 打开 Submit review；不会直接提交 |
-| `r` | 重新执行只读 workspace/CL 刷新 |
+| `r` | Explorer 中重新读取磁盘目录与已展开 folder 的 P4 状态；Review 中刷新 workspace/CL |
 | `q` | 在没有阻塞 overlay 时关闭插件 pane |
+
+Description 编辑器：
+
+| 输入 | 行为 |
+|---|---|
+| 普通输入 / 粘贴 | 在 pane 内直接修改多行 Description；显示真实终端光标 |
+| `Enter` / `Tab` | 插入换行 / 缩进 |
+| 方向键、`Home` / `End`、`Backspace` / `Delete` | 移动光标或编辑文本 |
+| `Ctrl+Enter` / 点击 **Review Description** | 重新读取服务器状态并进入 Apply 确认；不会直接写入 |
+| `Esc` / 点击 **Cancel** | 丢弃本次编辑；不写入 P4 |
+| 确认时 `Left` / `Right` / `Tab` 后 `Enter` | 在 Cancel（默认）与 Apply Description 之间选择并确认 |
+
+编辑、freshness 检查和 Apply 进行中，背景 CL 列表不会响应选择或 Submit 快捷键。只有显式选中 **Apply Description** 才会创建写授权；Apply 会重新校验 freshness、只替换 Description，并在写后重新读取验证。
 
 Submit overlay：
 
@@ -132,7 +146,7 @@ Explorer 的 P4 状态采用与 IDE Source Control 类似的颜色和短标记�
 | `M` | 已打开为修改、integrate 或 import |
 | `D` | 已打开为删除、purge 或 archive |
 | `R` | `move/add` 或 `move/delete` |
-| `U` | 本地存在但尚未被 Perforce 管理 |
+| `U` | 本地存在但当前 depot head 未管理；包括 depot 已删除后在同一路径重新创建的本地文件 |
 | `↓` | 已被 Perforce 管理，但 `haveRev < headRev`，工作区版本落后 |
 | `⊘` / `?` | 不在 client view / 无法建立映射 |
 
@@ -254,7 +268,7 @@ herdr plugin unlink herdr.perforce
 
 ## 当前限制
 
-- 当前版本已接入本地目录树、独立 File/Diff/CL 内容 pane、内联叠加 Diff（折叠/hunk 跳转/行内高亮）和滚动/高亮；review comment 与 Description Apply UI 尚未接完。
+- 当前版本已接入本地目录树、独立 File/Diff/CL 内容 pane、内联叠加 Diff（折叠/hunk 跳转/行内高亮）、滚动/高亮以及内联 Description Apply；review comment 与 Agent 描述生成 UI 尚未接完。
 - 自动打开只覆盖成功手动打开过的 remembered workspaces；当前版本不会扫描全部 Herdr workspace 并运行 `p4 info` 自动判定。
 - 不支持 default changelist、部分文件、其他用户或其他 client 的 Submit。
 - 不支持自动 resolve、lock 修复或任何自主提交。

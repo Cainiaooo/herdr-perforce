@@ -16,7 +16,7 @@ use super::{
     workspace_owning_cwd,
 };
 
-const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
+pub const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptionApplyIntent {

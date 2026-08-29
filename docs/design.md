@@ -71,7 +71,7 @@
 | View | 布局 | 职责 |
 |---|---|---|
 | Explorer | 本地目录树 | 浏览 client 内未 opened 的文件；只读 P4 装饰；Enter 打开 File，`d` 打开 opened-file Diff |
-| Review | Submit 区 + CL 列表 | 上方显示当前 CL 描述和安全的 Review & Submit 入口；下方 Changelists 与 File History / Workspace History 同级，后两项暂作占位 |
+| Review | Description/Submit 区 + CL 列表 | 上方显示当前 CL 的内联多行描述编辑器和安全的 Review & Submit 入口；下方 Changelists 与 File History / Workspace History 同级，后两项暂作占位 |
 
 切换 view 不得重置当前 CL/文件选择，也不得重置 Explorer 的展开和滚动。`1` / `2` 只切换 Explorer 与 Review；Content pane 的滚动和返回栈独立于导航。
 
@@ -146,7 +146,7 @@ Explorer 根：
 树行为：
 
 - 懒展开本地目录；初始只查询根目录直接条目，folder 真正展开时才对它的直接条目批量运行 `where` / `fstat` / scoped `opened`。不递归探测折叠目录，也不聚合或显示其潜在子孙状态。
-- 装饰只读：`A` add/branch、`M` edit/integrate/import、`D` delete/purge/archive、`R` move/add 或 move/delete、`U` 本地未受控、`↓` have revision 落后、`⊘` not in view、`?` unmapped。状态使用与 IDE Source Control 接近的颜色；查询失败时装饰为空，不假装是 Git。
+- 装饰只读：`A` add/branch、`M` edit/integrate/import、`D` delete/purge/archive、`R` move/add 或 move/delete、`U` 本地未受控（也包括 depot head 已 delete 且 workspace 无 have revision 后在同一路径重建的文件）、`↓` have revision 落后、`⊘` not in view、`?` unmapped。状态使用与 IDE Source Control 接近的颜色；查询失败时装饰为空，不假装是 Git。窄 pane 中图例保持完整文案并与树共用横向平移，不压缩成含义模糊的短串。
 - 当前已加载目录中的 delete / move-delete 文件即使已不在磁盘，也从该目录范围内的 `opened` 结果恢复成只读虚拟行；这不会触发对子目录的扫描。
 - 单击文件：在中间 Content pane 预览 **工作区当前内容**（文本 + 行号 + 语法高亮）。binary 用与 §6.3 同类的 metadata card，不解析资产内容。
 - 若该文件已 opened：提供在同一 Content pane 查看对应 Diff 的入口，不在 Explorer 里再画一份 submit UI。
@@ -233,7 +233,7 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 | `Enter` | Explorer 打开 File；Review 打开 CL 文件列表；Content 的 CL 列表下钻 Diff |
 | `d` | 为 Explorer 中已 opened 的文件打开 Diff |
 | `[` / `]` | 上一个/下一个 hunk（与 Diff 工具栏 Prev/Next 相同） |
-| `e` | Diff 中展开或收起全部远距未改折叠 |
+| `e` | Review 中聚焦当前 CL 的 Description 编辑器；Diff 中展开或收起全部远距未改折叠 |
 | `f` / `F` | 下一个/上一个文件 |
 | `v` | 开始或结束 diff 行选择 |
 | `c` | 为选中行或范围编写审阅备注 |
@@ -242,14 +242,14 @@ Binary 文件不伪装成文本 diff，也不能只显示一句“binary”。�
 | `s` | 打开当前 CL 的 Submit review overlay；不直接提交 |
 | `o` | 按编号打开 CL |
 | `/` | 搜索 CL 或文件 |
-| `r` | 刷新 |
+| `r` | Explorer 重新读取磁盘目录及已展开 folder 的只读 P4 状态；Review 刷新 workspace/CL |
 | `PageUp` / `PageDown` | Content pane 按当前可见高度翻页 |
 | `?` | 打开帮助 overlay |
 | `q` | 关闭 P4 pane，不退出 Herdr |
 
 所有键位最终都应可配置。鼠标应支持节点选择、展开、滚动和宿主 split 分隔线拖动。
 
-按键路由优先级为 Herdr 宿主保留键、当前 overlay/文本输入、获得焦点的 P4 pane。Submit overlay 默认 Cancel，最终提交只能通过明确点击 Submit 或 `Ctrl+Enter`；`Enter` 不构成最终提交授权。
+按键路由优先级为 Herdr 宿主保留键、当前 overlay/文本输入、获得焦点的 P4 pane。Description 编辑器获得焦点后，普通字符、粘贴、方向键、`Enter` 和删除键都归编辑器；`Ctrl+Enter` 只进入 freshness review。Description Apply 确认和 Submit overlay 都默认 Cancel，最终写入只能通过显式选中对应 Apply/Submit 动作；背景列表输入、单独 `Enter`、失焦或关闭都不构成授权。
 
 ## 8. Agent 审阅反馈
 
@@ -354,7 +354,8 @@ prompt = """
 
 ### 9.4 预览与应用
 
-- 生成结果在 overlay 中预览并可编辑。
+- Review pane 的 Description 区是实际可聚焦的多行编辑器，而不是只读字符预览；支持键盘输入、UTF-8、括号粘贴和可见光标。光标定位、上下移动和三行视口都基于视觉折行；Preview/Confirm/Apply 继续使用编辑光标作为只读视口锚点。
+- 生成结果复用同一编辑缓冲区；`Ctrl+Enter` 或 **Review Description** 先产生 freshness preview，确认默认 Cancel。
 - 用户选择 Apply 后，再次确认目标 CL 仍为同一个 pending CL。
 - 使用 `p4 change -o` 读取完整 spec，仅替换 Description，再通过 `p4 change -i` 写回。
 - 其他 spec 字段必须逐字保留，除 P4 自己的规范化外不得改变。

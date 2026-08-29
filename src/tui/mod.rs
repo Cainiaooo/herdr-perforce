@@ -2,6 +2,7 @@
 
 mod actions;
 mod content;
+mod description_editor;
 mod diff;
 mod display;
 mod explorer;
@@ -20,8 +21,9 @@ use std::{
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute, queue,
     style::{
@@ -35,12 +37,17 @@ use crossterm::{
 
 use crate::{
     app::{SubmitOutcomeCertainty, SubmitOverlay, SubmitOverlayRequest, SubmitOverlayState},
-    domain::{Changelist, ChangelistId, ExplorerDecoration, FileAction, WorkspaceIdentity},
+    domain::{
+        Changelist, ChangelistId, ChangelistStatus, ExplorerDecoration, FileAction,
+        WorkspaceIdentity,
+    },
     p4::{
-        DomainMappingError, ExplorerError, LoadedDirectory, P4Client, P4Error, P4Query,
-        P4Transport, P4WriteService, StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview,
-        SubmitReconciliationResult, SubmitResult, WorkspaceCwdError, cwd_is_in_client_view,
-        load_explorer_directory, pending_changelists_from_changes, workspace_owning_cwd,
+        AuthorizedDescriptionApply, DescriptionApplyError, DescriptionApplyIntent,
+        DescriptionApplyPreview, DescriptionApplyResult, DomainMappingError, ExplorerError,
+        LoadedDirectory, P4Client, P4Error, P4Query, P4Transport, P4WriteService,
+        StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview, SubmitReconciliationResult,
+        SubmitResult, WorkspaceCwdError, cwd_is_in_client_view, load_explorer_directory,
+        pending_changelists_from_changes, workspace_owning_cwd,
     },
     panel_restore,
     submit_provider::{ExternalLaunchError, SubmitProvider},
@@ -54,6 +61,7 @@ use self::actions::{
 use self::content::{
     ContentPaneClient, apply_own_navigation_share, persist_navigator_share_from_host,
 };
+use self::description_editor::{DescriptionEditor, DescriptionTextLayout, layout_description_text};
 use self::display::{display_width, pad_display, slice_display, splice_display};
 use self::explorer::{
     ExplorerAction, ExplorerLoadState, ExplorerModel, connection_message, open_with_default_app,
@@ -137,7 +145,8 @@ pub fn run_pane(cwd: PathBuf) -> Result<(), String> {
                 persist_layout_after = Some(Instant::now() + Duration::from_millis(400));
                 (false, true)
             }
-            Event::FocusGained | Event::FocusLost | Event::Paste(_) => (false, false),
+            Event::Paste(value) => (false, pane.handle_paste(&value)),
+            Event::FocusGained | Event::FocusLost => (false, false),
         };
         if should_close {
             if Instant::now() >= persist_armed_at {
@@ -162,9 +171,17 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableBracketedPaste,
             Hide,
             Clear(ClearType::All)
         ) {
+            let _ = execute!(
+                stdout,
+                Show,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -194,13 +211,24 @@ impl TerminalGuard {
             queue!(self.stdout, Print(line))?;
         }
         queue!(self.stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+        if let Some((column, row)) = frame.cursor {
+            queue!(self.stdout, MoveTo(column, row), Show)?;
+        } else {
+            queue!(self.stdout, Hide)?;
+        }
         self.stdout.flush()
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(self.stdout, Show, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            self.stdout,
+            Show,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -252,6 +280,16 @@ enum PaneMessage {
         request_id: u64,
         result: Result<SubmitReconciliationResult, SubmitError>,
     },
+    DescriptionPreview {
+        change: u64,
+        request_id: u64,
+        result: Result<DescriptionApplyPreview, DescriptionApplyError>,
+    },
+    DescriptionApplied {
+        change: u64,
+        request_id: u64,
+        result: Result<DescriptionApplyResult, DescriptionApplyError>,
+    },
     ExplorerRoot {
         generation: u64,
         result: Result<LoadedDirectory, ExplorerRootFailure>,
@@ -285,7 +323,12 @@ fn env_navigation_view(cwd: &Path) -> PaneView {
 
 const NAV_CHROME_ROWS: usize = 5;
 const WHEEL_SCROLL_STEP: isize = 3;
-const REVIEW_LIST_TOP: usize = 7;
+const REVIEW_DESCRIPTION_FIRST_ROW: usize = 3;
+const REVIEW_DESCRIPTION_ROWS: usize = 3;
+const REVIEW_DESCRIPTION_ACTION_ROW: usize = 7;
+const REVIEW_SUBMIT_ROW: usize = 8;
+const REVIEW_SECTION_ROW: usize = 9;
+const REVIEW_LIST_TOP: usize = 10;
 const REVIEW_BOTTOM_ROWS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +392,7 @@ impl NavOverlay {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageEffect {
     None,
     ReloadOverview,
@@ -391,6 +435,8 @@ struct PaneModel {
     review_scroll_y: usize,
     review_scroll_x: usize,
     review_follow: bool,
+    description_editor: DescriptionEditor,
+    description_request_id: u64,
 }
 
 impl PaneModel {
@@ -423,6 +469,8 @@ impl PaneModel {
             review_scroll_y: 0,
             review_scroll_x: 0,
             review_follow: true,
+            description_editor: DescriptionEditor::Idle,
+            description_request_id: 0,
         }
     }
 
@@ -474,9 +522,328 @@ impl PaneModel {
         dispatch_overlay(request, service, &self.cwd, sender);
     }
 
+    fn selected_editable_description(&self) -> Result<(u64, String), String> {
+        let OverviewState::Ready(overview) = &self.overview else {
+            return Err("Changelist details are still loading".to_owned());
+        };
+        let Some(change) = overview.changes.get(self.selected) else {
+            return Err("Select a numbered pending changelist first".to_owned());
+        };
+        let ChangelistId::Numbered(change_id) = change.id else {
+            return Err("The default changelist description cannot be edited here".to_owned());
+        };
+        if change.status != ChangelistStatus::Pending {
+            return Err("Only pending changelist descriptions can be edited".to_owned());
+        }
+        if change.owner != overview.identity.user {
+            return Err("This changelist belongs to another user".to_owned());
+        }
+        if change.client != overview.identity.client {
+            return Err("This changelist belongs to another client".to_owned());
+        }
+        Ok((change_id, change.description.clone()))
+    }
+
+    fn begin_description_edit(&mut self) {
+        match self.selected_editable_description() {
+            Ok((change, description)) => {
+                self.description_editor.begin(change, &description);
+                self.status =
+                    format!("Editing CL {change} description · Ctrl+Enter reviews · Esc cancels");
+            }
+            Err(message) => self.status = message,
+        }
+    }
+
+    fn cancel_description_edit(&mut self) {
+        if self.description_editor.cancel() {
+            self.status = "Description edit cancelled".to_owned();
+        } else {
+            self.status = "Description Apply is already running and cannot be cancelled".to_owned();
+        }
+    }
+
+    fn start_description_preview<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        let state = std::mem::take(&mut self.description_editor);
+        let DescriptionEditor::Editing {
+            change,
+            input,
+            cursor,
+        } = state
+        else {
+            self.description_editor = state;
+            return;
+        };
+        if input.trim().is_empty() || input.contains('\0') {
+            self.description_editor = DescriptionEditor::Editing {
+                change,
+                input,
+                cursor,
+            };
+            self.status = "Description must contain non-whitespace text".to_owned();
+            return;
+        }
+        self.description_request_id = self.description_request_id.wrapping_add(1);
+        let request_id = self.description_request_id;
+        self.description_editor = DescriptionEditor::Previewing {
+            change,
+            input: input.clone(),
+            cursor,
+            request_id,
+        };
+        self.status = format!("Reviewing CL {change} description freshness...");
+        dispatch_description_preview(
+            Arc::clone(service),
+            sender.clone(),
+            change,
+            input,
+            request_id,
+        );
+    }
+
+    fn start_description_apply<T: P4Transport + 'static>(
+        &mut self,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        let state = std::mem::take(&mut self.description_editor);
+        let DescriptionEditor::Confirming {
+            preview, cursor, ..
+        } = state
+        else {
+            self.description_editor = state;
+            return;
+        };
+        let change = preview.change;
+        let input = preview.proposed_description.clone();
+        let Some(authorization) = preview.authorize(DescriptionApplyIntent::ApplyButton) else {
+            self.description_editor = DescriptionEditor::Idle;
+            return;
+        };
+        self.description_request_id = self.description_request_id.wrapping_add(1);
+        let request_id = self.description_request_id;
+        self.description_editor = DescriptionEditor::Applying {
+            change,
+            input,
+            cursor,
+            request_id,
+        };
+        self.status = format!("Applying CL {change} description...");
+        dispatch_description_apply(
+            Arc::clone(service),
+            sender.clone(),
+            change,
+            authorization,
+            request_id,
+        );
+    }
+
+    fn complete_description_preview(
+        &mut self,
+        change: u64,
+        request_id: u64,
+        result: Result<DescriptionApplyPreview, DescriptionApplyError>,
+    ) {
+        let state = std::mem::take(&mut self.description_editor);
+        let DescriptionEditor::Previewing {
+            change: expected_change,
+            input,
+            cursor,
+            request_id: expected_request,
+        } = state
+        else {
+            self.description_editor = state;
+            return;
+        };
+        if change != expected_change || request_id != expected_request {
+            self.description_editor = DescriptionEditor::Previewing {
+                change: expected_change,
+                input,
+                cursor,
+                request_id: expected_request,
+            };
+            return;
+        }
+        match result {
+            Ok(preview) => {
+                self.description_editor = DescriptionEditor::Confirming {
+                    preview,
+                    cursor,
+                    apply_selected: false,
+                };
+                self.status = "Description reviewed · confirm Apply or Cancel".to_owned();
+            }
+            Err(error) => {
+                self.description_editor = DescriptionEditor::Editing {
+                    change,
+                    input,
+                    cursor,
+                };
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn complete_description_apply(
+        &mut self,
+        change: u64,
+        request_id: u64,
+        result: Result<DescriptionApplyResult, DescriptionApplyError>,
+    ) -> MessageEffect {
+        let state = std::mem::take(&mut self.description_editor);
+        let DescriptionEditor::Applying {
+            change: expected_change,
+            input,
+            cursor,
+            request_id: expected_request,
+        } = state
+        else {
+            self.description_editor = state;
+            return MessageEffect::None;
+        };
+        if change != expected_change || request_id != expected_request {
+            self.description_editor = DescriptionEditor::Applying {
+                change: expected_change,
+                input,
+                cursor,
+                request_id: expected_request,
+            };
+            return MessageEffect::None;
+        }
+        match result {
+            Ok(_) => {
+                if let OverviewState::Ready(overview) = &mut self.overview
+                    && let Some(changelist) = overview
+                        .changes
+                        .iter_mut()
+                        .find(|candidate| candidate.id == ChangelistId::Numbered(change))
+                {
+                    changelist.description = input;
+                }
+                self.status = format!("CL {change} description updated and verified");
+                MessageEffect::ReloadOverview
+            }
+            Err(error) => {
+                self.description_editor = DescriptionEditor::Editing {
+                    change,
+                    input,
+                    cursor,
+                };
+                self.status = error.to_string();
+                MessageEffect::None
+            }
+        }
+    }
+
+    fn handle_paste(&mut self, value: &str) -> bool {
+        if !matches!(self.description_editor, DescriptionEditor::Editing { .. }) {
+            return false;
+        }
+        self.insert_description_text(
+            value,
+            "Description paste was rejected by the size or text safety limit",
+        );
+        true
+    }
+
+    fn insert_description_text(&mut self, value: &str, error_message: &'static str) {
+        if self.description_editor.insert(value).is_err() {
+            self.status = error_message.to_owned();
+        }
+    }
+
+    fn handle_description_key<T: P4Transport + 'static>(
+        &mut self,
+        key: KeyEvent,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) {
+        if matches!(self.description_editor, DescriptionEditor::Applying { .. }) {
+            self.status = "Description Apply is running; wait for verification".to_owned();
+            return;
+        }
+        if matches!(
+            self.description_editor,
+            DescriptionEditor::Previewing { .. }
+        ) {
+            if key.code == KeyCode::Esc {
+                self.cancel_description_edit();
+            }
+            return;
+        }
+        if let DescriptionEditor::Confirming { apply_selected, .. } = &mut self.description_editor {
+            match key.code {
+                KeyCode::Esc => self.cancel_description_edit(),
+                KeyCode::Left | KeyCode::BackTab => *apply_selected = false,
+                KeyCode::Right | KeyCode::Tab => *apply_selected = true,
+                KeyCode::Enter if *apply_selected => {
+                    self.start_description_apply(service, sender);
+                }
+                KeyCode::Enter => self.cancel_description_edit(),
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.cancel_description_edit(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_description_preview(service, sender);
+            }
+            KeyCode::Enter => {
+                self.insert_description_text("\n", "Description reached its input limit");
+            }
+            KeyCode::Tab => {
+                self.insert_description_text("\t", "Description reached its input limit");
+            }
+            KeyCode::Backspace => self.description_editor.backspace(),
+            KeyCode::Delete => self.description_editor.delete(),
+            KeyCode::Left => self.description_editor.move_left(),
+            KeyCode::Right => self.description_editor.move_right(),
+            KeyCode::Up => self
+                .description_editor
+                .move_vertical(-1, (self.nav_width as usize).saturating_sub(4).max(1)),
+            KeyCode::Down => self
+                .description_editor
+                .move_vertical(1, (self.nav_width as usize).saturating_sub(4).max(1)),
+            KeyCode::Home => self.description_editor.move_home(),
+            KeyCode::End => self.description_editor.move_end(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert_description_text(
+                    &character.to_string(),
+                    "Description reached its input limit",
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn reload_overview(&mut self, sender: &mpsc::Sender<PaneMessage>) {
         self.overview_generation = self.overview_generation.wrapping_add(1);
         request_overview(self.cwd.clone(), self.overview_generation, sender.clone());
+    }
+
+    fn begin_active_refresh(&mut self) -> MessageEffect {
+        if self.view == PaneView::Review {
+            self.overview = OverviewState::Loading;
+            self.status = "Refreshing current Perforce workspace...".to_owned();
+            return MessageEffect::ReloadOverview;
+        }
+        let OverviewState::Ready(overview) = &self.overview else {
+            self.status = "Explorer refresh is waiting for workspace information".to_owned();
+            return MessageEffect::None;
+        };
+        self.explorer
+            .begin_workspace_load(overview.identity.clone());
+        self.status = "Refreshing Explorer files and Perforce status...".to_owned();
+        MessageEffect::LoadExplorerRoot
     }
 
     fn handle_message(&mut self, message: PaneMessage) -> MessageEffect {
@@ -538,6 +905,19 @@ impl PaneModel {
                     MessageEffect::None
                 }
             }
+            PaneMessage::DescriptionPreview {
+                change,
+                request_id,
+                result,
+            } => {
+                self.complete_description_preview(change, request_id, result);
+                MessageEffect::None
+            }
+            PaneMessage::DescriptionApplied {
+                change,
+                request_id,
+                result,
+            } => self.complete_description_apply(change, request_id, result),
             PaneMessage::ExplorerRoot { generation, result } => {
                 match result {
                     Ok(listing) => self.explorer.install_root(generation, Ok(listing)),
@@ -702,6 +1082,11 @@ impl PaneModel {
             return self.handle_nav_overlay_key(key, service, sender);
         }
 
+        if self.view == PaneView::Review && self.description_editor.is_active() {
+            self.handle_description_key(key, service, sender);
+            return false;
+        }
+
         match key.code {
             KeyCode::Char('q') => true,
             KeyCode::Char('1') => {
@@ -717,13 +1102,16 @@ impl PaneModel {
                 false
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.overview = OverviewState::Loading;
-                self.status = "Refreshing current Perforce workspace...".to_owned();
-                self.reload_overview(sender);
+                let effect = self.begin_active_refresh();
+                apply_message_effect(self, effect, sender);
                 false
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.open_selected_submit(service, sender);
+                false
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') if self.view == PaneView::Review => {
+                self.begin_description_edit();
                 false
             }
             _ if self.view == PaneView::Explorer => self.handle_explorer_key(key, sender),
@@ -878,6 +1266,10 @@ impl PaneModel {
             return self.handle_nav_overlay_mouse(mouse, hits, service, sender);
         }
 
+        if self.handle_description_mouse(mouse, hits, service, sender) {
+            return true;
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && hits
                 .review_submit
@@ -902,6 +1294,92 @@ impl PaneModel {
             MouseEventKind::Up(MouseButton::Left) => self.handle_left_up(sender),
             _ => false,
         }
+    }
+
+    fn handle_description_mouse<T: P4Transport + 'static>(
+        &mut self,
+        mouse: MouseEvent,
+        hits: &HitTargets,
+        service: &Arc<P4WriteService<T>>,
+        sender: &mpsc::Sender<PaneMessage>,
+    ) -> bool {
+        if self.view != PaneView::Review {
+            return false;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if self.description_editor.is_active() {
+                self.drag = None;
+                self.status =
+                    "Finish or cancel the description edit before using the CL list".to_owned();
+                return true;
+            }
+            return false;
+        }
+        if hits
+            .description_review
+            .is_some_and(|target| target.contains(mouse.column, mouse.row))
+        {
+            self.start_description_preview(service, sender);
+            self.drag = None;
+            return true;
+        }
+        if hits
+            .description_cancel
+            .is_some_and(|target| target.contains(mouse.column, mouse.row))
+        {
+            self.cancel_description_edit();
+            self.drag = None;
+            return true;
+        }
+        if hits
+            .description_apply
+            .is_some_and(|target| target.contains(mouse.column, mouse.row))
+        {
+            if let DescriptionEditor::Confirming { apply_selected, .. } =
+                &mut self.description_editor
+            {
+                *apply_selected = true;
+            }
+            self.start_description_apply(service, sender);
+            self.drag = None;
+            return true;
+        }
+        if hits
+            .description_edit
+            .is_some_and(|target| target.contains(mouse.column, mouse.row))
+        {
+            let was_active = self.description_editor.is_active();
+            if !was_active {
+                self.begin_description_edit();
+            }
+            if matches!(self.description_editor, DescriptionEditor::Editing { .. })
+                && (REVIEW_DESCRIPTION_FIRST_ROW as u16
+                    ..(REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS) as u16)
+                    .contains(&mouse.row)
+            {
+                let content_width = (self.nav_width as usize).saturating_sub(4).max(1);
+                let first_line = if was_active {
+                    self.description_editor
+                        .first_visible_line(content_width, REVIEW_DESCRIPTION_ROWS)
+                } else {
+                    0
+                };
+                self.description_editor.set_cursor_from_visual_position(
+                    first_line,
+                    mouse.row as usize - REVIEW_DESCRIPTION_FIRST_ROW,
+                    (mouse.column as usize).saturating_sub(2),
+                    content_width,
+                );
+            }
+            self.drag = None;
+            return true;
+        }
+        if self.description_editor.is_active() {
+            self.status =
+                "Finish or cancel the description edit before changing selection".to_owned();
+            return true;
+        }
+        false
     }
 
     fn handle_left_down(&mut self, mouse: MouseEvent, hits: &HitTargets) -> bool {
@@ -1090,7 +1568,8 @@ impl PaneModel {
 
     fn explorer_content_width(&self) -> usize {
         let selected = self.explorer.selected_path();
-        self.explorer
+        let tree_width = self
+            .explorer
             .visible_rows()
             .iter()
             .map(|row| {
@@ -1100,7 +1579,8 @@ impl PaneModel {
                 ))
             })
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        tree_width.max(display_width(explorer_legend()))
     }
 
     fn review_content_width(&self) -> usize {
@@ -1812,6 +2292,40 @@ fn dispatch_overlay<T: P4Transport + 'static>(
     }
 }
 
+fn dispatch_description_preview<T: P4Transport + 'static>(
+    service: Arc<P4WriteService<T>>,
+    sender: mpsc::Sender<PaneMessage>,
+    change: u64,
+    description: String,
+    request_id: u64,
+) {
+    thread::spawn(move || {
+        let result = service.preview_description_apply(change, description);
+        let _ = sender.send(PaneMessage::DescriptionPreview {
+            change,
+            request_id,
+            result,
+        });
+    });
+}
+
+fn dispatch_description_apply<T: P4Transport + 'static>(
+    service: Arc<P4WriteService<T>>,
+    sender: mpsc::Sender<PaneMessage>,
+    change: u64,
+    authorization: AuthorizedDescriptionApply,
+    request_id: u64,
+) {
+    thread::spawn(move || {
+        let result = service.apply_description(authorization);
+        let _ = sender.send(PaneMessage::DescriptionApplied {
+            change,
+            request_id,
+            result,
+        });
+    });
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Rect {
     x: u16,
@@ -1856,6 +2370,10 @@ struct HitTargets {
     changelists: Vec<Rect>,
     changelist_offset: usize,
     review_submit: Option<Rect>,
+    description_edit: Option<Rect>,
+    description_review: Option<Rect>,
+    description_cancel: Option<Rect>,
+    description_apply: Option<Rect>,
     view_explorer: Option<Rect>,
     view_review: Option<Rect>,
     explorer_rows: Vec<Rect>,
@@ -1867,6 +2385,7 @@ struct RenderedFrame {
     lines: Vec<String>,
     hits: HitTargets,
     row_styles: Vec<RowStyle>,
+    cursor: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1883,6 +2402,7 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         lines: vec![" ".repeat(width); height],
         hits: HitTargets::default(),
         row_styles: vec![RowStyle::default(); height],
+        cursor: None,
     };
     render_view_tabs(&mut frame, pane.view, width);
     render_header(&mut frame, pane, width);
@@ -1910,6 +2430,7 @@ fn render_frame(pane: &PaneModel, width: u16, height: u16) -> RenderedFrame {
         // Overlays are rendered after the underlying rows. Row-wide Explorer
         // and selection colors must not bleed through a menu or confirmation.
         frame.row_styles.fill(RowStyle::default());
+        frame.cursor = None;
     }
     for line in &mut frame.lines {
         *line = pad_display(line, width);
@@ -2042,65 +2563,226 @@ fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, heig
 
 fn render_review_composer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize) {
     let Some(change) = pane.selected_changelist() else {
-        put_display(&mut frame.lines, 0, 6, "▾ CHANGELISTS (0)");
+        put_display(&mut frame.lines, 0, REVIEW_SECTION_ROW, "▾ CHANGELISTS (0)");
         return;
     };
-    let title = format!(" CL {} DESCRIPTION ", change.id);
+    let numbered_change = match change.id {
+        ChangelistId::Numbered(change) => Some(change),
+        ChangelistId::Default => None,
+    };
+    let editor_label = match (&pane.description_editor, numbered_change) {
+        (DescriptionEditor::Editing { change, .. }, Some(selected)) if *change == selected => {
+            " · EDITING"
+        }
+        (DescriptionEditor::Previewing { change, .. }, Some(selected)) if *change == selected => {
+            " · REVIEWING"
+        }
+        (DescriptionEditor::Confirming { preview, .. }, Some(selected))
+            if preview.change == selected =>
+        {
+            " · CONFIRM APPLY"
+        }
+        (DescriptionEditor::Applying { change, .. }, Some(selected)) if *change == selected => {
+            " · APPLYING"
+        }
+        _ => "",
+    };
+    let title = format!(" CL {} DESCRIPTION{editor_label} ", change.id);
     let inner_width = width.saturating_sub(2);
     let title = slice_display(&title, 0, inner_width);
     let top_fill = "─".repeat(inner_width.saturating_sub(display_width(&title)));
     put_display(&mut frame.lines, 0, 2, &format!("┌{title}{top_fill}┐"));
 
-    let description = change
-        .description
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("<no description>")
-        .trim();
-    let description = pad_display(
-        &slice_display(description, 0, width.saturating_sub(4)),
-        width.saturating_sub(4),
-    );
-    put_display(&mut frame.lines, 0, 3, &format!("│ {description} │"));
+    let (description, cursor, viewport_cursor) =
+        numbered_change.map_or((change.description.as_str(), None, None), |id| {
+            pane.description_editor
+                .text_for_change(id, &change.description)
+        });
+    let description = if description.is_empty() && cursor.is_none() {
+        "<no description>"
+    } else {
+        description
+    };
+    let content_width = width.saturating_sub(4).max(1);
+    let DescriptionTextLayout {
+        lines,
+        cursor_line,
+        cursor_column,
+    } = layout_description_text(description, viewport_cursor.unwrap_or(0), content_width);
+    let first_visual_line = viewport_cursor.map_or(0, |_| {
+        cursor_line.saturating_sub(REVIEW_DESCRIPTION_ROWS.saturating_sub(1))
+    });
+    for visible_line in 0..REVIEW_DESCRIPTION_ROWS {
+        let content = lines
+            .get(first_visual_line + visible_line)
+            .map_or("", String::as_str);
+        let content = pad_display(content, content_width);
+        put_display(
+            &mut frame.lines,
+            0,
+            REVIEW_DESCRIPTION_FIRST_ROW + visible_line,
+            &format!("│ {content} │"),
+        );
+    }
     put_display(
         &mut frame.lines,
         0,
-        4,
+        REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS,
         &format!("└{}┘", "─".repeat(inner_width)),
     );
-    for row in 2..=4 {
+    for row in 2..=REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS {
         if let Some(style) = frame.row_styles.get_mut(row) {
-            style.foreground = Some(Color::Cyan);
+            style.foreground = Some(if cursor.is_some() {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            });
         }
     }
+    if cursor.is_some()
+        && cursor_line >= first_visual_line
+        && cursor_line < first_visual_line + REVIEW_DESCRIPTION_ROWS
+    {
+        let cursor_x = 2usize
+            .saturating_add(cursor_column)
+            .min(width.saturating_sub(2));
+        let cursor_y = REVIEW_DESCRIPTION_FIRST_ROW + cursor_line - first_visual_line;
+        if cursor_y < frame.lines.len() {
+            frame.cursor = Some((cursor_x as u16, cursor_y as u16));
+        }
+    }
+
+    let editable = pane.selected_editable_description().is_ok();
+    if editable {
+        frame.hits.description_edit = Some(Rect::area(
+            0,
+            2,
+            width as u16,
+            (REVIEW_DESCRIPTION_ROWS + 3) as u16,
+        ));
+    }
+    render_description_actions(frame, pane, numbered_change, editable, width);
 
     let submit_label = match change.id {
         ChangelistId::Numbered(change) => format!("  ✓ Review & Submit CL {change}  "),
         ChangelistId::Default => "  Submit unavailable for default CL  ".to_owned(),
     };
     let submit = slice_display(&submit_label, 0, width.saturating_sub(1));
-    put_display(&mut frame.lines, 0, 5, &submit);
+    put_display(&mut frame.lines, 0, REVIEW_SUBMIT_ROW, &submit);
     if matches!(change.id, ChangelistId::Numbered(_)) {
-        frame.hits.review_submit = Some(Rect::row(0, 5, width as u16));
-        if let Some(style) = frame.row_styles.get_mut(5) {
+        frame.hits.review_submit = Some(Rect::row(0, REVIEW_SUBMIT_ROW as u16, width as u16));
+        if let Some(style) = frame.row_styles.get_mut(REVIEW_SUBMIT_ROW) {
             style.foreground = Some(Color::White);
             style.background = Some(Color::Blue);
             style.bold = true;
         }
-    } else if let Some(style) = frame.row_styles.get_mut(5) {
+    } else if let Some(style) = frame.row_styles.get_mut(REVIEW_SUBMIT_ROW) {
         style.foreground = Some(Color::DarkGrey);
     }
 
     let count = pane.review_count();
-    put_display(&mut frame.lines, 0, 6, &format!("▾ CHANGELISTS ({count})"));
-    if let Some(style) = frame.row_styles.get_mut(6) {
+    put_display(
+        &mut frame.lines,
+        0,
+        REVIEW_SECTION_ROW,
+        &format!("▾ CHANGELISTS ({count})"),
+    );
+    if let Some(style) = frame.row_styles.get_mut(REVIEW_SECTION_ROW) {
         style.bold = true;
     }
 }
 
+fn render_description_actions(
+    frame: &mut RenderedFrame,
+    pane: &PaneModel,
+    selected_change: Option<u64>,
+    editable: bool,
+    width: usize,
+) {
+    let row = REVIEW_DESCRIPTION_ACTION_ROW;
+    match (&pane.description_editor, selected_change) {
+        (DescriptionEditor::Idle, _) if editable => {
+            put_display(&mut frame.lines, 2, row, "[Edit Description]");
+            put_display(&mut frame.lines, 23, row, "click or e");
+        }
+        (DescriptionEditor::Editing { change, .. }, Some(selected)) if *change == selected => {
+            let (review, next) =
+                put_description_button(frame, row, 2, "[Review Description]", width);
+            frame.hits.description_review = Some(review);
+            let (cancel, _) =
+                put_description_button(frame, row, next.saturating_add(2), "[Cancel]", width);
+            frame.hits.description_cancel = Some(cancel);
+        }
+        (DescriptionEditor::Previewing { change, .. }, Some(selected)) if *change == selected => {
+            put_display(&mut frame.lines, 2, row, "Checking freshness...");
+            let (cancel, _) = put_description_button(frame, row, 24, "[Cancel]", width);
+            frame.hits.description_cancel = Some(cancel);
+        }
+        (
+            DescriptionEditor::Confirming {
+                preview,
+                apply_selected,
+                ..
+            },
+            Some(selected),
+        ) if preview.change == selected => {
+            let cancel = if *apply_selected {
+                "  [Cancel]"
+            } else {
+                "> [Cancel]"
+            };
+            let apply = if *apply_selected {
+                "> [Apply Description]"
+            } else {
+                "  [Apply Description]"
+            };
+            let (cancel_rect, next) = put_description_button(frame, row, 2, cancel, width);
+            frame.hits.description_cancel = Some(cancel_rect);
+            let (apply_rect, _) =
+                put_description_button(frame, row, next.saturating_add(2), apply, width);
+            frame.hits.description_apply = Some(apply_rect);
+        }
+        (DescriptionEditor::Applying { change, .. }, Some(selected)) if *change == selected => {
+            put_display(
+                &mut frame.lines,
+                2,
+                row,
+                "Applying and verifying description...",
+            );
+        }
+        _ if !editable => {
+            put_display(&mut frame.lines, 2, row, "Description editing unavailable");
+        }
+        _ => {}
+    }
+}
+
+fn put_description_button(
+    frame: &mut RenderedFrame,
+    row: usize,
+    x: usize,
+    label: &str,
+    width: usize,
+) -> (Rect, usize) {
+    let shown = slice_display(label, 0, width.saturating_sub(x));
+    put_display(&mut frame.lines, x, row, &shown);
+    let shown_width = display_width(&shown);
+    (
+        Rect::row(x as u16, row as u16, shown_width as u16),
+        x.saturating_add(shown_width),
+    )
+}
+
 fn render_explorer(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, height: usize) {
     if height >= 3 {
-        put_display(&mut frame.lines, 0, height - 3, explorer_legend(width));
+        let text_width = width.saturating_sub(1);
+        let legend = explorer_legend();
+        let scroll_x = pane
+            .explorer
+            .scroll_x()
+            .min(display_width(legend).saturating_sub(text_width));
+        let shown = slice_display(legend, scroll_x, text_width);
+        put_display(&mut frame.lines, 0, height - 3, &shown);
     }
     if height >= 2 {
         put_display(&mut frame.lines, 0, height - 2, explorer_help(pane));
@@ -2137,16 +2819,20 @@ fn explorer_help(_pane: &PaneModel) -> &'static str {
     "Enter open  d diff  m menu  r refresh  1/2 views  q close"
 }
 
-fn explorer_legend(width: usize) -> &'static str {
-    if width >= 54 {
-        "A add M edit D del R move U local ↓ old ⊘ view ? map"
-    } else {
-        "A+ M~ D- R↔ U? ↓old ⊘view ?map"
-    }
+fn explorer_legend() -> &'static str {
+    "A add  M edit  D delete  R move  U untracked  ↓ behind  ⊘ not-in-view  ? unmapped"
 }
 
-fn review_help(_pane: &PaneModel) -> &'static str {
-    "click/↑↓ select  Enter files  s review  m menu  r refresh"
+fn review_help(pane: &PaneModel) -> &'static str {
+    match &pane.description_editor {
+        DescriptionEditor::Editing { .. } => {
+            "type/paste edit  Enter newline  Ctrl+Enter review  Esc cancel"
+        }
+        DescriptionEditor::Confirming { .. } => "←/→ choose  Enter confirm  Esc cancel",
+        DescriptionEditor::Previewing { .. } => "checking description freshness  Esc cancel",
+        DescriptionEditor::Applying { .. } => "applying description; input is locked",
+        DescriptionEditor::Idle => "e/click edit  ↑↓ select  Enter files  s review  r refresh",
+    }
 }
 
 fn render_tree_column(
@@ -2737,8 +3423,56 @@ mod tests {
         assert!(rendered.contains("Explorer"));
         assert!(rendered.contains("▸ [📁 Explorer]"));
         assert!(rendered.contains("Enter open  d diff  m menu  r refresh"));
-        assert!(rendered.contains("⊘ view ? map"));
+        assert!(rendered.contains("A add  M edit  D delete"));
         assert!(!rendered.contains("CL 42  pending"));
+    }
+
+    #[test]
+    fn narrow_explorer_legend_keeps_full_labels_and_pans() {
+        let mut pane = pane_with_changes();
+        pane.set_nav_size(24, 16);
+        let initial = render_frame(&pane, 24, 16);
+        assert!(initial.lines[13].contains("A add"));
+        assert!(!initial.lines[13].contains("A+"));
+
+        pane.explorer
+            .set_scroll_x(usize::MAX, pane.body_width(), pane.explorer_content_width());
+        let panned = render_frame(&pane, 24, 16);
+        assert!(panned.lines[13].contains("? unmapped"));
+    }
+
+    #[test]
+    fn manual_explorer_refresh_invalidates_cached_disk_rows() {
+        let mut pane = pane_with_changes();
+        let root = PathBuf::from("C:/Example Workspace");
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: root.clone(),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "deleted-externally.txt".into(),
+                    path: root.join("deleted-externally.txt"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: Some(crate::domain::ExplorerDecoration::Unopened),
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        pane.explorer.select_index(1);
+        let previous_generation = pane.explorer.generation();
+
+        assert_eq!(pane.begin_active_refresh(), MessageEffect::LoadExplorerRoot);
+        assert_eq!(pane.explorer.load_state(), &ExplorerLoadState::Checking);
+        assert_ne!(pane.explorer.generation(), previous_generation);
+        assert_eq!(pane.explorer.pending_directory(), Some(root.as_path()));
+        assert!(
+            pane.explorer
+                .visible_rows()
+                .iter()
+                .all(|row| row.name != "deleted-externally.txt")
+        );
+        assert!(pane.status.contains("Refreshing Explorer"));
     }
 
     #[test]
@@ -2754,6 +3488,263 @@ mod tests {
         assert!(rendered.contains("WORKSPACE HISTORY  (coming soon)"));
         assert!(frame.hits.review_submit.is_some());
         assert!(!rendered.contains("p4 submit -c"));
+    }
+
+    #[test]
+    fn review_description_is_a_focusable_multiline_editor() {
+        let mut pane = pane_with_numbered_changes(2);
+        pane.view = PaneView::Review;
+
+        dispatch_mouse(
+            &mut pane,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                10,
+                REVIEW_DESCRIPTION_FIRST_ROW as u16,
+            ),
+        );
+        assert!(matches!(
+            pane.description_editor,
+            DescriptionEditor::Editing { change: 1, .. }
+        ));
+
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(pane.handle_paste("粘贴\r\nsecond line"));
+        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        let DescriptionEditor::Editing {
+            change,
+            input,
+            cursor,
+        } = &pane.description_editor
+        else {
+            panic!("description editor lost focus");
+        };
+        assert_eq!(*change, 1);
+        assert_eq!(input, "Change 1!\n粘贴\nsecond line");
+        assert!(input.is_char_boundary(*cursor));
+        assert_eq!(pane.selected, 0, "editor input must not move the CL list");
+
+        let frame = render_frame(&pane, 80, 24);
+        let rendered = frame.lines.join("\n");
+        assert!(rendered.contains("EDITING"));
+        assert!(frame.cursor.is_some(), "focused editor needs a real cursor");
+        assert!(frame.hits.description_review.is_some());
+        assert!(frame.hits.description_cancel.is_some());
+    }
+
+    #[test]
+    fn empty_description_editor_does_not_render_placeholder_as_input() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
+        let OverviewState::Ready(overview) = &mut pane.overview else {
+            panic!("ready overview");
+        };
+        overview.changes[0].description.clear();
+        pane.begin_description_edit();
+
+        let frame = render_frame(&pane, 80, 24);
+        let description_rows = &frame.lines
+            [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS];
+        assert!(!description_rows.join("\n").contains("<no description>"));
+        assert_eq!(frame.cursor, Some((2, REVIEW_DESCRIPTION_FIRST_ROW as u16)));
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            &pane.description_editor,
+            DescriptionEditor::Editing { input, .. } if input == "x"
+        ));
+    }
+
+    #[test]
+    fn active_description_editor_blocks_context_menu_selection_and_submit() {
+        let mut pane = pane_with_numbered_changes(2);
+        pane.view = PaneView::Review;
+        pane.begin_description_edit();
+
+        dispatch_mouse(
+            &mut pane,
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                3,
+                (REVIEW_LIST_TOP + 1) as u16,
+            ),
+        );
+        assert_eq!(pane.selected, 0);
+        assert!(!pane.nav_overlay.is_open());
+        assert!(matches!(
+            pane.description_editor,
+            DescriptionEditor::Editing { change: 1, .. }
+        ));
+
+        dispatch_mouse(
+            &mut pane,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                REVIEW_SUBMIT_ROW as u16,
+            ),
+        );
+        assert!(matches!(pane.overlay.state(), SubmitOverlayState::Closed));
+    }
+
+    #[test]
+    fn description_review_states_keep_the_editing_viewport() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
+        let input = format!(
+            "{}{}{}{}",
+            "0".repeat(16),
+            "1".repeat(16),
+            "2".repeat(16),
+            "3333"
+        );
+        let cursor = input.len();
+
+        pane.description_editor = DescriptionEditor::Previewing {
+            change: 42,
+            input: input.clone(),
+            cursor,
+            request_id: 7,
+        };
+        let preview_rows = render_frame(&pane, 20, 24).lines
+            [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS]
+            .to_vec();
+        assert!(preview_rows.join("\n").contains("3333"));
+        assert!(!preview_rows.join("\n").contains("0000"));
+
+        pane.description_editor = DescriptionEditor::Confirming {
+            preview: DescriptionApplyPreview {
+                change: 42,
+                current_description: "Fix submit overlay".into(),
+                proposed_description: input.clone(),
+                file_count: 0,
+                spec_token: crate::domain::SpecToken::from_bytes_for_test([1; 32]),
+            },
+            cursor,
+            apply_selected: false,
+        };
+        let confirm_rows = render_frame(&pane, 20, 24).lines
+            [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS]
+            .to_vec();
+        assert_eq!(confirm_rows, preview_rows);
+
+        pane.description_editor = DescriptionEditor::Applying {
+            change: 42,
+            input,
+            cursor,
+            request_id: 8,
+        };
+        let applying_rows = render_frame(&pane, 20, 24).lines
+            [REVIEW_DESCRIPTION_FIRST_ROW..REVIEW_DESCRIPTION_FIRST_ROW + REVIEW_DESCRIPTION_ROWS]
+            .to_vec();
+        assert_eq!(applying_rows, preview_rows);
+    }
+
+    #[test]
+    fn newline_and_tab_report_description_input_limit_errors() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
+        pane.description_editor = DescriptionEditor::Editing {
+            change: 42,
+            input: "x".repeat(crate::p4::MAX_DESCRIPTION_BYTES),
+            cursor: crate::p4::MAX_DESCRIPTION_BYTES,
+        };
+
+        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(pane.status, "Description reached its input limit");
+        pane.status.clear();
+        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.status, "Description reached its input limit");
+    }
+
+    #[test]
+    fn description_confirmation_defaults_to_cancel() {
+        let mut pane = pane_with_changes();
+        pane.view = PaneView::Review;
+        pane.description_editor = DescriptionEditor::Confirming {
+            preview: DescriptionApplyPreview {
+                change: 42,
+                current_description: "Fix submit overlay".into(),
+                proposed_description: "Updated description".into(),
+                file_count: 0,
+                spec_token: crate::domain::SpecToken::from_bytes_for_test([1; 32]),
+            },
+            cursor: "Updated description".len(),
+            apply_selected: false,
+        };
+
+        let rendered = render_frame(&pane, 80, 24).lines.join("\n");
+        assert!(rendered.contains("> [Cancel]"));
+        assert!(rendered.contains("  [Apply Description]"));
+
+        dispatch_key(&mut pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(pane.description_editor, DescriptionEditor::Idle));
+        assert_eq!(
+            pane.selected_changelist()
+                .map(|change| change.description.as_str()),
+            Some("Fix submit overlay")
+        );
+    }
+
+    #[test]
+    fn stale_description_preview_message_cannot_replace_the_active_request() {
+        let mut pane = pane_with_changes();
+        pane.description_editor = DescriptionEditor::Previewing {
+            change: 42,
+            input: "Updated description".into(),
+            cursor: "Updated description".len(),
+            request_id: 7,
+        };
+
+        assert_eq!(
+            pane.handle_message(PaneMessage::DescriptionPreview {
+                change: 42,
+                request_id: 6,
+                result: Err(DescriptionApplyError::Stale),
+            }),
+            MessageEffect::None
+        );
+        assert!(matches!(
+            pane.description_editor,
+            DescriptionEditor::Previewing { request_id: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn successful_description_apply_updates_the_composer_and_reloads() {
+        let mut pane = pane_with_changes();
+        pane.description_editor = DescriptionEditor::Applying {
+            change: 42,
+            input: "Updated description".into(),
+            cursor: "Updated description".len(),
+            request_id: 9,
+        };
+
+        assert_eq!(
+            pane.handle_message(PaneMessage::DescriptionApplied {
+                change: 42,
+                request_id: 9,
+                result: Ok(DescriptionApplyResult {
+                    change: 42,
+                    spec_token: crate::domain::SpecToken::from_bytes_for_test([2; 32]),
+                }),
+            }),
+            MessageEffect::ReloadOverview
+        );
+        assert!(matches!(pane.description_editor, DescriptionEditor::Idle));
+        assert_eq!(
+            pane.selected_changelist()
+                .map(|change| change.description.as_str()),
+            Some("Updated description")
+        );
+        assert!(pane.status.contains("updated and verified"));
     }
 
     #[test]
@@ -2860,8 +3851,8 @@ mod tests {
         let rendered = frame.lines.join("\n");
         assert!(rendered.contains("> CL 40"));
         assert!(!rendered.contains("CL 1  pending"));
-        assert_eq!(frame.hits.changelist_offset, 27);
-        assert_eq!(frame.hits.changelists.len(), 13);
+        assert_eq!(frame.hits.changelist_offset, 30);
+        assert_eq!(frame.hits.changelists.len(), 10);
     }
 
     #[test]
@@ -3203,7 +4194,11 @@ mod tests {
         );
         dispatch_mouse(
             &mut pane,
-            mouse(MouseEventKind::Down(MouseButton::Left), 79, 5),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                79,
+                REVIEW_SUBMIT_ROW as u16,
+            ),
         );
         assert!(matches!(
             pane.overlay.state(),
@@ -3246,7 +4241,7 @@ mod tests {
         pane.selected = 25;
         pane.set_nav_size(80, 24);
         let before = render_frame(&pane, 80, 24).hits.changelist_offset;
-        assert_eq!(before, 13);
+        assert_eq!(before, 16);
         dispatch_mouse(&mut pane, mouse(MouseEventKind::ScrollDown, 2, 8));
         let after = render_frame(&pane, 80, 24).hits.changelist_offset;
         assert_eq!(after, before + 3);

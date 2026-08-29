@@ -407,6 +407,7 @@ enum WhereFact {
 struct FstatFact {
     mapped: bool,
     action: Option<FileAction>,
+    head_action: Option<FileAction>,
     change: Option<ChangelistId>,
     have_rev: Option<u64>,
     head_rev: Option<u64>,
@@ -428,6 +429,7 @@ fn facts_for_entry(
     query_failed: bool,
 ) -> FileP4Facts {
     let not_in_view = matches!(where_fact, Some(WhereFact::NotInView));
+    let query_failed = query_failed || matches!(where_fact, Some(WhereFact::QueryFailed));
     let mapped = match (where_fact, fstat) {
         (Some(WhereFact::NotInView | WhereFact::QueryFailed), _) => false,
         (_, Some(fstat)) => fstat.mapped,
@@ -441,16 +443,30 @@ fn facts_for_entry(
     } else {
         (None, None)
     };
+    let untracked = is_file
+        && mapped
+        && opened_action.is_none()
+        && !query_failed
+        && match fstat {
+            None => true,
+            Some(fstat) => {
+                fstat.have_rev.is_none()
+                    && matches!(
+                        fstat.head_action.as_ref(),
+                        Some(FileAction::Delete | FileAction::MoveDelete)
+                    )
+            }
+        };
     FileP4Facts {
         not_in_view,
         mapped,
-        untracked: is_file && mapped && fstat.is_none() && opened.is_none() && !query_failed,
+        untracked,
         opened_action,
         opened_change,
         have_rev: fstat.and_then(|fact| fact.have_rev),
         head_rev: fstat.and_then(|fact| fact.head_rev),
         file_type: fstat.and_then(|fact| fact.file_type.clone()),
-        query_failed: query_failed || matches!(where_fact, Some(WhereFact::QueryFailed)),
+        query_failed,
     }
 }
 
@@ -517,6 +533,9 @@ fn index_fstat_records(
                 mapped: record.field("isMapped").is_some(),
                 action: record
                     .string("action")
+                    .map(|value| FileAction::from_p4(&value)),
+                head_action: record
+                    .string("headAction")
                     .map(|value| FileAction::from_p4(&value)),
                 change: record
                     .string("change")
@@ -923,6 +942,70 @@ mod tests {
             &[],
         );
         assert_eq!(decorated[0].decoration, Some(ExplorerDecoration::Untracked));
+    }
+
+    #[test]
+    fn head_deleted_path_recreated_without_have_revision_is_untracked() {
+        let tree = TempTree::new("head-deleted-recreated");
+        let path = tree.write("GenerateProjectFiles.bat", b"local replacement");
+        let local =
+            list_local_directory(&tree.root, &tree.root, &CaseHandling::Insensitive).expect("list");
+        let where_records = parse(&format!(
+            "{}\n",
+            json_line(&format!(
+                r#""depotFile":"//d/GenerateProjectFiles.bat","path":{}"#,
+                json_path(&path)
+            ))
+        ));
+        let fstat_records = parse(&format!(
+            "{}\n",
+            json_line(&format!(
+                r#""depotFile":"//d/GenerateProjectFiles.bat","path":{},"isMapped":"","headAction":"delete","headRev":"4","headType":"unicode""#,
+                json_path(&path)
+            ))
+        ));
+
+        let decorated = decorate_entries(
+            local,
+            &identity_for(&tree.root),
+            &where_records,
+            &fstat_records,
+            &[],
+        );
+        assert_eq!(decorated[0].decoration, Some(ExplorerDecoration::Untracked));
+        assert_eq!(decorated[0].have_rev, None);
+        assert_eq!(decorated[0].head_rev, Some(4));
+    }
+
+    #[test]
+    fn head_deleted_path_with_have_revision_remains_out_of_date() {
+        let tree = TempTree::new("head-deleted-stale");
+        let path = tree.write("old.txt", b"old revision");
+        let local =
+            list_local_directory(&tree.root, &tree.root, &CaseHandling::Insensitive).expect("list");
+        let where_records = parse(&format!(
+            "{}\n",
+            json_line(&format!(
+                r#""depotFile":"//d/old.txt","path":{}"#,
+                json_path(&path)
+            ))
+        ));
+        let fstat_records = parse(&format!(
+            "{}\n",
+            json_line(&format!(
+                r#""depotFile":"//d/old.txt","path":{},"isMapped":"","headAction":"delete","haveRev":"3","headRev":"4","headType":"text""#,
+                json_path(&path)
+            ))
+        ));
+
+        let decorated = decorate_entries(
+            local,
+            &identity_for(&tree.root),
+            &where_records,
+            &fstat_records,
+            &[],
+        );
+        assert_eq!(decorated[0].decoration, Some(ExplorerDecoration::OutOfDate));
     }
 
     #[test]
