@@ -53,7 +53,7 @@ Herdr local link 不会自动执行 manifest 中的 build command，因此首次
 克隆或进入仓库后先构建：
 
 ```powershell
-cd D:\\Projects\\herdr-perforce
+cd D:\Projects\herdr-perforce
 cargo build --release
 herdr plugin link .
 ```
@@ -98,7 +98,7 @@ herdr plugin action invoke open --plugin herdr.perforce
 
 ```powershell
 $config = herdr plugin config-dir herdr.perforce
-Copy-Item .\\examples\\panel.manual.json (Join-Path $config 'panel.json')
+Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
 ```
 
 对应内容为：
@@ -217,7 +217,7 @@ herdr plugin config-dir herdr.perforce
 {
   "mode": "external",
   "label": "External submit tool",
-  "command": "C:\\\\absolute\\\\path\\\\to\\\\submit-tool.exe",
+  "command": "C:\\absolute\\path\\to\\submit-tool.exe",
   "args": ["--changelist", "{change}"]
 }
 ```
@@ -324,8 +324,8 @@ cargo run -- pane --cwd <mapped-workspace>
 真实写测试只能在仓库同级的隔离 harness 中运行，不能对生产 P4 Server 执行：
 
 ```powershell
-cd ..\\herdr-perforce-test-harness
-$env:HERDR_P4D_TEST_BIN = 'D:\\Perforce\\p4d.exe'
+cd ..\herdr-perforce-test-harness
+$env:HERDR_P4D_TEST_BIN = 'D:\Perforce\p4d.exe'
 cargo run -- doctor
 cargo run -- level-c
 ```
