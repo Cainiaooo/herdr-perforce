@@ -16,10 +16,10 @@ mod transport;
 
 pub use changelist::{
     ChangelistManagementError, CreateChangelistResult, DeleteChangelistResult, MoveFilesResult,
-    load_pending_changelist,
+    load_pending_changelist, load_pending_changelist_files_for_review,
 };
 pub use command::{P4Query, escape_p4_file_arg};
-pub(crate) use config::{WorkspaceCwdError, strip_verbatim_prefix, workspace_owning_cwd};
+pub(crate) use config::{WorkspaceCwdError, workspace_owning_cwd};
 pub use description::{
     AuthorizedDescriptionApply, DescriptionApplyBlockReason, DescriptionApplyError,
     DescriptionApplyIntent, DescriptionApplyPreview, DescriptionApplyResult, MAX_DESCRIPTION_BYTES,

@@ -15,9 +15,9 @@
 - Explorer/Review 共享一个最右侧的窄导航 pane；该 pane 不再渲染 File 或 Diff 正文。
 - 默认只有 `Agent CLI 80% | Navigation 20%`。
 - 首次打开 File 或 Diff 时，把导航 pane 的左邻 pane 一分为二，得到 `Agent CLI 40% | Content 40% | Navigation 20%`。
-- File 和 Diff 复用同一个 Content pane，通过插件私有 control file 原地切换，路径不经过 shell quoting。CL 文件在 Review 的 CL 行下直接按真实路径层级展开，不创建 Content pane。
-- Content pane 按当前宽度把长行稳定拆成多行并按显示行滚动，同时处理文本行号、文件语法高亮和 diff 语义颜色。
-- 在 Review 行内树中对具有本地 client path 的文件按 Enter，可在 Content pane 打开 Diff；文件勾选与跨 CL 移动始终留在导航树。
+- File 和 Diff 复用同一个 Content pane，通过插件私有 control file 原地切换，路径不经过 shell quoting。CL 文件在 Review 的可展开 CL 行下以单层 depot path 列表显示，不创建 Content pane，也不重复构造目录树。
+- Content pane 按当前宽度把长行稳定拆成多行并按显示行滚动，同时处理文本行号、文件语法高亮和 diff 语义颜色；应用内鼠标选区保留这些样式，并用 `Ctrl+C` 复制对应文本。
+- 在 Review 的可展开 CL 列表中对具有本地 client path 的文件按 Enter，可在 Content pane 打开 Diff；文件勾选与跨 CL 移动始终留在导航 pane。
 - 最后一次 File/Diff 请求由插件按 workspace 持久化；Herdr server 重启后先清理 session 恢复出的 Content shell，再以 `--no-focus` 重建中间 Content pane。
 
 ## Consequences

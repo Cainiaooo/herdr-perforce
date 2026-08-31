@@ -139,9 +139,9 @@ Submit overlay：
 
 overlay 打开时，背景列表不会响应 Submit 或导航快捷键。SubmitRunning 期间无法从插件内取消、关闭或启动第二次提交。
 
-内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭。CL 文件列表已移入 Review 行内树；在文件行按 `Enter` 才会复用 Content pane 打开 Diff。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 和 CL 树使用按文件类型区分的图标，例如 `🦀` Rust、`🔩` C/C++、`📝` Markdown、`📷` 图片，目录使用 `📂` / `📁`。
+内容 pane：长行始终根据 pane 当前宽度自动换成多行；文件行号使用固定 gutter，续行保留空白 gutter 并与上一行正文对齐。`↑` / `↓`、`PageUp` / `PageDown` 或鼠标滚轮滚动，`q` 关闭；File/Diff 正文可用鼠标拖拽选择，并按 `Ctrl+C` 复制。CL 本身可以展开，文件在 CL 下以单层列表显示完整 depot path、revision 和 file type；在文件行按 `Enter` 才会复用 Content pane 打开 Diff。文本文件按类型高亮，二进制文件显示有界 metadata card。Explorer 和 CL 文件行使用按类型区分的图标，例如 `🦀` Rust、`🔩` C/C++、`📝` Markdown、`📷` 图片，Explorer 目录使用 `📂` / `📁`。
 
-CL 管理操作都绑定当前 `p4 info` 的 user/client。新建 CL 使用服务器返回的 change form 并在写后回读验证；删除只允许 numbered、owned、pending 且再次检查为空的 CL；移动文件会在执行 `p4 reopen -c` 前确认所有选中文件仍属于同一个源 CL，并在写后同时回读源/目标 CL。连接、认证、权限、映射或验证失败不会显示为成功。单次移动最多 512 个文件。
+CL 管理操作都绑定当前 `p4 info` 的 user/client。新建 CL 使用服务器返回的 change form 并在写后回读验证；删除只允许 numbered、owned、pending 且再次检查为空的 CL；Move 目标同时显示 CL 号和按 pane 宽度省略的 Description。移动文件会在执行 `p4 reopen -c` 前确认所有选中文件仍属于同一个源 CL，并在写后同时回读源/目标 CL。连接、认证、权限、映射或验证失败不会显示为成功。单次移动最多 512 个文件。
 
 Explorer 的 P4 状态采用与 IDE Source Control 类似的颜色和短标记：
 

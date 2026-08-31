@@ -337,10 +337,10 @@ fixture 至少包含：
 
 期望：图标、标签、统计和排序稳定；未知动作以 unknown 显示，不当成 edit。
 
-### ACC-TREE-006（P0）Review 行内 CL/File 树
+### ACC-TREE-006（P0）Review 可展开 CL/File 列表
 
-步骤：单击或 Enter 一个 CL，再选择其中一个嵌套目录下的文件。
-期望：文件在该 CL 行下直接以真实 client-relative（缺失时 depot）目录层级展开，不创建 CL Content pane；文件显示动作/类型图标和 `[ ]`。单击或 Space 切换 `[x]`，Enter 才在复用的 Content pane 打开 Diff。旧 generation 的异步文件结果不得覆盖刷新后的树。
+步骤：单击或 Enter 一个 CL，再选择展开后的一个文件。
+期望：CL 行可以展开；文件在该 CL 下以单层列表显示完整 depot path、revision、file type、动作/类型图标和 `[ ]`，不创建 CL Content pane，也不按路径生成目录层级。单击或 Space 切换 `[x]`，Enter 才在复用的 Content pane 打开 Diff。旧 generation 的异步文件结果不得覆盖刷新后的列表。
 
 ### ACC-TREE-007（P0）新建与删除 CL
 
@@ -367,7 +367,7 @@ Explorer 是 Dogfood Gate 能力（ADR-0005）。不替代 ACC-TREE；CL 树与�
 ### ACC-EXPLORER-002（P0）文本预览
 
 步骤：单击文本文件。
-期望：中间 Content pane 显示工作区当前内容、行号和语法高亮；过大/超行数截断并说明原因；不得把读取失败显示成空文件。
+期望：中间 Content pane 显示工作区当前内容、行号和语法高亮；File/Diff 正文可以鼠标拖拽选择、显示选区并用 `Ctrl+C` 复制；过大/超行数截断并说明原因；不得把读取失败显示成空文件。
 
 ### ACC-EXPLORER-003（P0）只读 P4 装饰
 

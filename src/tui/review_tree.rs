@@ -1,22 +1,12 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Component, Path},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{
-    domain::{ChangedFile, Changelist, ChangelistId, WorkspaceIdentity},
-    p4::strip_verbatim_prefix,
-};
+use crate::domain::{ChangedFile, Changelist, ChangelistId, WorkspaceIdentity};
 
 use super::icons::explorer_icon;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReviewRowKey {
     Changelist(ChangelistId),
-    Directory {
-        change: ChangelistId,
-        path: String,
-    },
     File {
         change: ChangelistId,
         depot_path: String,
@@ -29,7 +19,6 @@ pub enum ReviewRowKey {
 #[derive(Debug, Clone)]
 pub enum ReviewRowKind {
     Changelist { expanded: bool },
-    Directory,
     File(ChangedFile),
     Status,
 }
@@ -148,7 +137,7 @@ impl ReviewTreeModel {
                     rows.push(status_row(change.id, change_index, "(empty changelist)"))
                 }
                 Some(FileState::Ready(files)) => {
-                    append_file_tree(&mut rows, workspace, change.id, change_index, files);
+                    append_flat_files(&mut rows, workspace, change.id, change_index, files);
                 }
                 Some(FileState::Failed(message)) => {
                     rows.push(status_row(change.id, change_index, &format!("! {message}")))
@@ -189,7 +178,7 @@ impl ReviewTreeModel {
                 }
             }
             ReviewRowKind::File(_) => ReviewActivation::OpenFile,
-            ReviewRowKind::Directory | ReviewRowKind::Status => ReviewActivation::None,
+            ReviewRowKind::Status => ReviewActivation::None,
         }
     }
 
@@ -382,10 +371,9 @@ impl ReviewTreeModel {
 impl ReviewRowKey {
     fn change(&self) -> ChangelistId {
         match self {
-            Self::Changelist(change)
-            | Self::Directory { change, .. }
-            | Self::File { change, .. }
-            | Self::Status { change } => *change,
+            Self::Changelist(change) | Self::File { change, .. } | Self::Status { change } => {
+                *change
+            }
         }
     }
 }
@@ -417,75 +405,20 @@ fn status_row(change: ChangelistId, change_index: usize, label: &str) -> ReviewR
     }
 }
 
-#[derive(Default)]
-struct TreeNode {
-    directories: BTreeMap<String, TreeNode>,
-    files: Vec<ChangedFile>,
-}
-
-fn append_file_tree(
+fn append_flat_files(
     rows: &mut Vec<ReviewRow>,
     workspace: &WorkspaceIdentity,
     change: ChangelistId,
     change_index: usize,
     files: &[ChangedFile],
 ) {
-    let mut root = TreeNode::default();
+    let mut files = files.iter().collect::<Vec<_>>();
+    files.sort_by_key(|file| workspace.case_handling.canonical_path_key(&file.depot_path));
     for file in files {
-        let mut segments = display_segments(workspace, file);
-        segments.pop();
-        let mut node = &mut root;
-        for segment in segments {
-            node = node.directories.entry(segment).or_default();
-        }
-        node.files.push(file.clone());
-        node.files.sort_by(|left, right| {
-            file_name_for(workspace, left)
-                .to_ascii_lowercase()
-                .cmp(&file_name_for(workspace, right).to_ascii_lowercase())
-        });
-    }
-    append_node(rows, workspace, change, change_index, &root, 1, "");
-}
-
-fn append_node(
-    rows: &mut Vec<ReviewRow>,
-    workspace: &WorkspaceIdentity,
-    change: ChangelistId,
-    change_index: usize,
-    node: &TreeNode,
-    depth: usize,
-    parent: &str,
-) {
-    for (name, child) in &node.directories {
-        let path = if parent.is_empty() {
-            name.clone()
-        } else {
-            format!("{parent}/{name}")
-        };
-        rows.push(ReviewRow {
-            key: ReviewRowKey::Directory {
-                change,
-                path: path.clone(),
-            },
-            change,
-            change_index,
-            depth,
-            label: format!("{} {name}", explorer_icon(name, true, true)),
-            kind: ReviewRowKind::Directory,
-        });
-        append_node(
-            rows,
-            workspace,
-            change,
-            change_index,
-            child,
-            depth + 1,
-            &path,
-        );
-    }
-    for file in &node.files {
-        let name = file_name_for(workspace, file);
+        let path = display_path_for(file);
+        let revision = file
+            .base_revision
+            .map_or_else(String::new, |revision| format!("#{revision}"));
         rows.push(ReviewRow {
             key: ReviewRowKey::File {
                 change,
@@ -493,65 +426,26 @@ fn append_node(
             },
             change,
             change_index,
-            depth,
+            depth: 1,
             label: format!(
-                "{}  {} {}",
+                "{}  {} {path}{revision} <{}>",
                 file.action.short_badge(),
-                explorer_icon(&name, false, false),
-                name
+                explorer_icon(&path, false, false),
+                file.file_type.as_str(),
             ),
             kind: ReviewRowKind::File(file.clone()),
         });
     }
 }
 
-fn display_segments(workspace: &WorkspaceIdentity, file: &ChangedFile) -> Vec<String> {
-    if let Some(path) = file.client_path.as_deref()
-        && let Some(segments) = client_relative_segments(workspace, path)
-        && !segments.is_empty()
-    {
-        return segments;
+fn display_path_for(file: &ChangedFile) -> String {
+    if file.depot_path.trim().is_empty() {
+        return file.client_path.as_deref().map_or_else(
+            || "<unknown path>".to_owned(),
+            |path| path.display().to_string(),
+        );
     }
-    file.depot_path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn file_name_for(workspace: &WorkspaceIdentity, file: &ChangedFile) -> String {
-    display_segments(workspace, file)
-        .pop()
-        .unwrap_or_else(|| file.depot_path.clone())
-}
-
-fn client_relative_segments(
-    workspace: &WorkspaceIdentity,
-    client_path: &Path,
-) -> Option<Vec<String>> {
-    let root = strip_verbatim_prefix(&workspace.root);
-    let path = strip_verbatim_prefix(client_path);
-    let mut path_components = path.components();
-    for root_component in root.components() {
-        let path_component = path_components.next()?;
-        let root_key = workspace
-            .case_handling
-            .canonical_path_key(&root_component.as_os_str().to_string_lossy());
-        let path_key = workspace
-            .case_handling
-            .canonical_path_key(&path_component.as_os_str().to_string_lossy());
-        if root_key != path_key {
-            return None;
-        }
-    }
-    path_components
-        .map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-            Component::CurDir => None,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir => None,
-        })
-        .collect()
+    file.depot_path.clone()
 }
 
 #[cfg(test)]
@@ -599,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_change_builds_directory_rows_inline() {
+    fn expanded_change_builds_a_flat_perforce_style_file_list() {
         let changes = vec![change(42)];
         let workspace = workspace("C:/ws");
         let mut tree = ReviewTreeModel::new();
@@ -617,12 +511,16 @@ mod tests {
             Ok(vec![file("src/ui/main.rs"), file("README.md")]),
         );
         let rows = tree.rows(&changes, &workspace);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 3);
         assert!(rows[0].label.starts_with("▾ CL 42"));
-        assert_eq!(rows[1].label, "📂 src");
-        assert_eq!(rows[2].label, "📂 ui");
-        assert!(rows[3].label.ends_with("main.rs"));
-        assert!(rows[4].label.ends_with("README.md"));
+        assert_eq!(rows[1].depth, 1);
+        assert!(rows[1].label.contains("//depot/README.md#1 <text>"));
+        assert!(rows[2].label.contains("//depot/src/ui/main.rs#1 <text>"));
+        assert!(
+            rows.iter()
+                .skip(1)
+                .all(|row| matches!(row.kind, ReviewRowKind::File(_)))
+        );
     }
 
     #[test]
@@ -659,7 +557,7 @@ mod tests {
             ChangelistId::Numbered(42),
             Ok(vec![file("src/main.rs")]),
         );
-        tree.move_selection(2, &changes, &workspace);
+        tree.move_selection(1, &changes, &workspace);
         assert!(matches!(
             tree.selected_key(),
             Some(ReviewRowKey::File { .. })
@@ -677,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn client_root_and_case_handling_define_the_display_tree() {
+    fn depot_paths_are_shown_even_when_client_path_casing_differs() {
         let changes = vec![change(42)];
         let workspace = workspace("C:/CLIENT");
         let mut changed_file = file("source/ui/main.rs");
@@ -696,8 +594,8 @@ mod tests {
             .into_iter()
             .map(|row| row.label)
             .collect::<Vec<_>>();
-        assert!(labels.iter().any(|label| label == "📂 source"));
-        assert!(labels.iter().any(|label| label == "📂 ui"));
-        assert!(!labels.iter().any(|label| label == "📂 depot"));
+        assert_eq!(labels.len(), 2);
+        assert!(labels[1].contains("//depot/source/ui/main.rs#1 <text>"));
+        assert!(!labels.iter().any(|label| label.starts_with("📂")));
     }
 }

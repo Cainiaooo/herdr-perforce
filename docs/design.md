@@ -81,10 +81,10 @@
 
 - File：显示行号和按扩展名/首行选择的语法高亮。
 - Diff：以当前文件为画布的内联叠加；增/删/行内修改用不同颜色和 gutter 符号；远距未改可折叠。
-- CL 文件不再创建独立 Content 文档；它们在 Review 的 CL 行下直接展开。文件行按 Enter 时，Diff 复用既有 Content pane。
-- File 和 Diff 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动。
+- CL 文件不再创建独立 Content 文档；CL 行可以展开，其文件以单层列表显示完整 depot path、revision 和 file type，不再把路径拆成目录树。文件行按 Enter 时，Diff 复用既有 Content pane。
+- File 和 Diff 长行始终按 Content pane 当前宽度自动换行；文件行号位于固定 gutter，续行使用等宽空白 gutter，使正文保持左对齐。`↑` / `↓`、`PageUp` / `PageDown` 和鼠标滚轮按换行后的显示行滚动；鼠标拖拽选择正文，`Ctrl+C` 复制选区。
 
-## 5. Changelist/File 树
+## 5. Changelist/File 列表
 
 ### 5.1 树结构
 
@@ -116,7 +116,7 @@
 - 刷新后尽量维持 CL、文件、hunk 和滚动位置。
 - 被删除、无权限或已经提交的选中 CL 应显示明确状态，并安全选择相邻节点。
 - `n` 创建 owned current-client numbered pending CL；删除只允许再次确认为空的 owned numbered pending CL。
-- 一次文件选择只绑定一个源 CL；`v` 选择另一个 owned current-client pending CL，写前重读源/目标及文件归属，`reopen` 后同时验证两侧。
+- 一次文件选择只绑定一个源 CL；`v` 打开的目标 picker 同时显示 CL 号和单行 Description，Description 按可用宽度加省略号；选择另一个 owned current-client pending CL 后，写前重读源/目标及文件归属，`reopen` 后同时验证两侧。
 
 ### 5.3 文件状态
 

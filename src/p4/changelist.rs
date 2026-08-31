@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, error::Error, ffi::OsString, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    ffi::OsString,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use crate::domain::{ChangedFile, Changelist, ChangelistId, ChangelistStatus, WorkspaceIdentity};
 
@@ -9,6 +15,7 @@ use super::{
 };
 
 pub const MAX_MANAGED_FILES: usize = 512;
+const CLIENT_PATH_QUERY_BATCH: usize = 32;
 
 #[derive(Debug)]
 pub enum ChangelistManagementError {
@@ -143,6 +150,69 @@ pub fn load_pending_changelist<T: P4Transport>(
     changelist.files = files;
     validate_owned_pending(workspace, &changelist)?;
     Ok(changelist)
+}
+
+/// Loads pending files for Review and resolves Perforce `//client/...` names
+/// to local filesystem paths before the Content pane tries to read them.
+pub fn load_pending_changelist_files_for_review<T: P4Transport>(
+    client: &P4Client<T>,
+    workspace: &WorkspaceIdentity,
+    change: ChangelistId,
+) -> Result<Vec<ChangedFile>, ChangelistManagementError> {
+    let mut files = load_pending_changelist(client, workspace, change)?.files;
+    let mut local_by_depot = BTreeMap::new();
+    let depot_paths = files
+        .iter()
+        .map(|file| PathBuf::from(&file.depot_path))
+        .collect::<Vec<_>>();
+
+    for paths in depot_paths.chunks(CLIENT_PATH_QUERY_BATCH) {
+        let mapped = client
+            .run_records(&P4Query::WhereMany {
+                paths: paths.to_vec(),
+            })
+            .map_err(|source| ChangelistManagementError::Query {
+                stage: "client path mapping",
+                source,
+            })?;
+        for record in mapped.records {
+            let Some(depot_path) = record.string("depotFile") else {
+                continue;
+            };
+            let Some(local_path) = record.string("path").map(PathBuf::from).or_else(|| {
+                record
+                    .string("clientFile")
+                    .map(PathBuf::from)
+                    .filter(|path| is_local_filesystem_path(path))
+            }) else {
+                continue;
+            };
+            local_by_depot.insert(
+                workspace.case_handling.canonical_path_key(&depot_path),
+                local_path,
+            );
+        }
+    }
+
+    for file in &mut files {
+        let key = workspace.case_handling.canonical_path_key(&file.depot_path);
+        if let Some(local_path) = local_by_depot.get(&key) {
+            file.client_path = Some(local_path.clone());
+        } else if file
+            .client_path
+            .as_deref()
+            .is_some_and(is_local_filesystem_path)
+        {
+            // Older servers may already return an OS path in `clientFile`.
+        } else {
+            file.client_path = None;
+        }
+    }
+    Ok(files)
+}
+
+fn is_local_filesystem_path(path: &Path) -> bool {
+    !path.as_os_str().to_string_lossy().starts_with("//")
 }
 
 impl<T: P4Transport> P4WriteService<T> {
@@ -352,6 +422,7 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     use super::*;
+    use crate::domain::CaseHandling;
     use crate::p4::{RawP4Output, fake::FakeP4Transport};
 
     const INFO: &[u8] = br#"{"clientName":"ExampleClient","clientRoot":"C:/ws","serverAddress":"p4:1666","userName":"me","caseHandling":"insensitive"}"#;
@@ -373,6 +444,65 @@ mod tests {
             PathBuf::from("C:/ws"),
             Default::default(),
         ))
+    }
+
+    fn workspace() -> WorkspaceIdentity {
+        WorkspaceIdentity {
+            server_id: "p4:1666".into(),
+            user: "me".into(),
+            client: "ExampleClient".into(),
+            root: PathBuf::from("C:/ws"),
+            stream: None,
+            case_handling: CaseHandling::Insensitive,
+        }
+    }
+
+    #[test]
+    fn review_files_resolve_client_syntax_to_local_paths() {
+        let fake = FakeP4Transport::default();
+        fake.push_output(output(br#"{"depotFile":"//D/a#b.txt","clientFile":"//ExampleClient/a#b.txt","action":"edit","change":"42","type":"text"}"#));
+        fake.push_output(output(br#"{"change":"42","status":"pending","user":"me","client":"ExampleClient","desc":"Work"}"#));
+        fake.push_output(output(br#"{"depotFile":"//d/A#B.txt","clientFile":"//ExampleClient/a#b.txt","path":"C:/ws/a#b.txt"}"#));
+        let client = P4Client::new_with_directory_environment(
+            fake.clone(),
+            "p4",
+            PathBuf::from("C:/ws"),
+            Default::default(),
+        );
+
+        let files = load_pending_changelist_files_for_review(
+            &client,
+            &workspace(),
+            ChangelistId::Numbered(42),
+        )
+        .expect("review files");
+
+        assert_eq!(files[0].client_path, Some(PathBuf::from("C:/ws/a#b.txt")));
+        assert_eq!(
+            fake.requests()[2].args,
+            ["-ztag", "-Mj", "where", "//D/a%23b.txt"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn review_files_do_not_expose_unresolved_client_syntax_as_a_local_path() {
+        let fake = FakeP4Transport::default();
+        fake.push_output(output(br#"{"depotFile":"//d/a.txt","clientFile":"//ExampleClient/a.txt","action":"edit","change":"default","type":"text"}"#));
+        fake.push_output(output(
+            br#"{"code":"error","data":"//d/a.txt - file(s) not in client view."}"#,
+        ));
+        let client = P4Client::new_with_directory_environment(
+            fake,
+            "p4",
+            PathBuf::from("C:/ws"),
+            Default::default(),
+        );
+
+        let files =
+            load_pending_changelist_files_for_review(&client, &workspace(), ChangelistId::Default)
+                .expect("per-path where miss remains a usable review result");
+
+        assert_eq!(files[0].client_path, None);
     }
 
     #[test]

@@ -49,8 +49,8 @@ use crate::{
         ExplorerError, LoadedDirectory, MoveFilesResult, P4Client, P4Error, P4Query, P4Transport,
         P4WriteService, StdProcessTransport, SubmitError, SubmitIntent, SubmitPreview,
         SubmitReconciliationResult, SubmitResult, WorkspaceCwdError, cwd_is_in_client_view,
-        load_explorer_directory, load_pending_changelist, pending_changelists_from_changes,
-        workspace_owning_cwd,
+        load_explorer_directory, load_pending_changelist_files_for_review,
+        pending_changelists_from_changes, workspace_owning_cwd,
     },
     panel_restore,
     submit_provider::{ExternalLaunchError, SubmitProvider},
@@ -440,9 +440,15 @@ enum NavOverlay {
     MoveFiles {
         source: ChangelistId,
         files: Vec<String>,
-        targets: Vec<ChangelistId>,
+        targets: Vec<MoveTarget>,
         selected: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MoveTarget {
+    change: ChangelistId,
+    description: String,
 }
 
 impl NavOverlay {
@@ -2062,7 +2068,7 @@ impl PaneModel {
                         targets,
                         selected,
                     } = state
-                        && let Some(target) = targets.get(selected).copied()
+                        && let Some(target) = targets.get(selected).map(|target| target.change)
                     {
                         self.start_move_files(service, sender, source, target, files);
                     }
@@ -2401,8 +2407,11 @@ impl PaneModel {
         let targets = overview
             .changes
             .iter()
-            .map(|change| change.id)
-            .filter(|change| *change != source)
+            .filter(|change| change.id != source)
+            .map(|change| MoveTarget {
+                change: change.id,
+                description: change.description.clone(),
+            })
             .collect::<Vec<_>>();
         if targets.is_empty() {
             self.status = "Create another changelist before moving files".to_owned();
@@ -2674,8 +2683,7 @@ fn request_changelist_files(
 ) {
     thread::spawn(move || {
         let client = P4Client::new(StdProcessTransport, "p4", &cwd);
-        let result = load_pending_changelist(&client, &identity, change)
-            .map(|changelist| changelist.files)
+        let result = load_pending_changelist_files_for_review(&client, &identity, change)
             .map_err(|error| error.to_string());
         let _ = sender.send(PaneMessage::ChangelistFiles {
             generation,
@@ -3073,9 +3081,6 @@ fn render_review(frame: &mut RenderedFrame, pane: &PaneModel, width: usize, heig
                     match &review_row.kind {
                         ReviewRowKind::File(file) => {
                             style.foreground = Some(file_action_terminal_color(&file.action));
-                        }
-                        ReviewRowKind::Directory => {
-                            style.foreground = Some(theme::HEADER.terminal());
                         }
                         ReviewRowKind::Status => {
                             style.foreground = Some(theme::MUTED.terminal());
@@ -3726,14 +3731,12 @@ fn render_nav_overlay(frame: &mut RenderedFrame, pane: &PaneModel, width: usize,
                 .enumerate()
             {
                 let marker = if index == *selected { "›" } else { " " };
+                let label = format_move_target(target, inner.saturating_sub(3));
                 put_display(
                     &mut frame.lines,
                     left,
                     top.saturating_add(2 + visible_index),
-                    &format!(
-                        "│{}│",
-                        pad_display(&format!(" {marker} CL {target}"), inner)
-                    ),
+                    &format!("│{}│", pad_display(&format!(" {marker} {label}"), inner)),
                 );
             }
             let bottom = top.saturating_add(popup_height.saturating_sub(1));
@@ -3745,6 +3748,33 @@ fn render_nav_overlay(frame: &mut RenderedFrame, pane: &PaneModel, width: usize,
             );
         }
     }
+}
+
+fn format_move_target(target: &MoveTarget, width: usize) -> String {
+    let description = target
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let description = if description.is_empty() {
+        "<no description>"
+    } else {
+        &description
+    };
+    ellipsize_display(&format!("CL {}  {description}", target.change), width)
+}
+
+fn ellipsize_display(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    format!("{}…", slice_display(text, 0, width - 1))
 }
 
 fn render_overlay(
@@ -4343,7 +4373,7 @@ mod tests {
     }
 
     #[test]
-    fn review_expands_changelist_files_as_an_inline_tree_and_marks_a_subset() {
+    fn review_expands_changelist_files_as_a_flat_path_list_and_marks_a_subset() {
         let mut pane = pane_with_changes();
         pane.view = PaneView::Review;
         let activation = match &pane.overview {
@@ -4371,13 +4401,13 @@ mod tests {
 
         let rendered = render_frame(&pane, 80, 24).lines.join("\n");
         assert!(rendered.contains("▾ CL 42"));
-        assert!(rendered.contains("📂 src"));
         assert!(rendered.contains("[ ] M"));
-        assert!(rendered.contains("ui.rs"));
+        assert!(rendered.contains("//depot/src/ui.rs#1 <text>"));
+        assert!(!rendered.contains("📂 src"));
 
         if let OverviewState::Ready(overview) = &pane.overview {
             pane.review_tree
-                .select_index(2, &overview.changes, &overview.identity);
+                .select_index(1, &overview.changes, &overview.identity);
         }
         assert!(pane.toggle_selected_review_file());
         let marked = render_frame(&pane, 80, 24).lines.join("\n");
@@ -4439,8 +4469,27 @@ mod tests {
                 source: ChangelistId::Numbered(1),
                 ref targets,
                 ..
-            } if targets == &[ChangelistId::Numbered(2)]
+            } if targets.len() == 1
+                && targets[0].change == ChangelistId::Numbered(2)
+                && targets[0].description == "Change 2"
         ));
+    }
+
+    #[test]
+    fn move_target_labels_include_and_ellipsize_descriptions() {
+        let target = MoveTarget {
+            change: ChangelistId::Numbered(4242),
+            description: "Fix the first problem\nthen cover the second path".into(),
+        };
+
+        assert_eq!(
+            format_move_target(&target, 80),
+            "CL 4242  Fix the first problem then cover the second path"
+        );
+        let narrow = format_move_target(&target, 24);
+        assert_eq!(display_width(&narrow), 24);
+        assert!(narrow.starts_with("CL 4242  Fix"));
+        assert!(narrow.ends_with('…'));
     }
 
     #[test]

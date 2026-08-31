@@ -26,8 +26,8 @@ use crate::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -43,7 +43,9 @@ use ratatui::{
 use serde_json::{Value, json};
 
 use super::{
+    actions::copy_to_clipboard,
     diff::{self, DiffToolbarAction, DiffViewState},
+    display::{char_width, display_width},
     syntax, theme, wrap,
 };
 
@@ -963,9 +965,39 @@ struct ViewerState {
     scroll_y: usize,
     body_width: usize,
     body_height: usize,
+    body_x: u16,
     body_y: u16,
     toolbar_hits: Vec<diff::ToolbarHit>,
     last_fold_click: Option<Instant>,
+    selection: Option<TextSelection>,
+    drag_anchor: Option<TextPoint>,
+    copy_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    row: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextSelection {
+    anchor: TextPoint,
+    head: TextPoint,
+}
+
+impl TextSelection {
+    fn ordered(self) -> (TextPoint, TextPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn is_extended(self) -> bool {
+        self.anchor != self.head
+    }
 }
 
 impl ViewerState {
@@ -978,9 +1010,13 @@ impl ViewerState {
             scroll_y: 0,
             body_width: 1,
             body_height: 1,
+            body_x: 0,
             body_y: 0,
             toolbar_hits: Vec::new(),
             last_fold_click: None,
+            selection: None,
+            drag_anchor: None,
+            copy_notice: None,
         }
     }
 
@@ -989,6 +1025,7 @@ impl ViewerState {
         self.request = request;
         self.scroll_y = 0;
         self.toolbar_hits.clear();
+        self.clear_selection();
         rename_own_pane(self.document.title());
     }
 
@@ -1106,6 +1143,97 @@ impl ViewerState {
         self.scroll_y = self.scroll_y.min(maximum);
     }
 
+    fn text_point_at(&self, column: u16, row: u16) -> Option<TextPoint> {
+        if row < self.body_y
+            || row >= self.body_y.saturating_add(self.body_height as u16)
+            || self.body_height == 0
+        {
+            return None;
+        }
+        let viewport_row = row
+            .saturating_sub(self.body_y)
+            .min(self.body_height.saturating_sub(1) as u16) as usize;
+        let rows = self.render_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let visual_row = self
+            .scroll_y
+            .saturating_add(viewport_row)
+            .min(rows.len().saturating_sub(1));
+        let body_column = column
+            .saturating_sub(self.body_x)
+            .min(self.body_width.saturating_sub(1) as u16) as usize;
+        Some(TextPoint {
+            row: visual_row,
+            column: body_column,
+        })
+    }
+
+    fn begin_text_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(anchor) = self.text_point_at(column, row) else {
+            return false;
+        };
+        self.selection = Some(TextSelection {
+            anchor,
+            head: anchor,
+        });
+        self.drag_anchor = Some(anchor);
+        self.copy_notice = None;
+        true
+    }
+
+    fn update_text_selection(&mut self, column: u16, row: u16) -> bool {
+        let (Some(anchor), Some(head)) = (self.drag_anchor, self.text_point_at(column, row)) else {
+            return false;
+        };
+        self.selection = Some(TextSelection { anchor, head });
+        true
+    }
+
+    fn finish_text_selection(&mut self, column: u16, row: u16) -> bool {
+        if self.drag_anchor.is_none() {
+            return false;
+        }
+        let _ = self.update_text_selection(column, row);
+        self.drag_anchor = None;
+        if self.selection.is_some_and(TextSelection::is_extended) {
+            return true;
+        }
+        self.selection = None;
+        false
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.drag_anchor = None;
+        self.copy_notice = None;
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.filter(|selection| selection.is_extended())?;
+        let rows = self.render_rows();
+        selected_text_from_rows(&rows, selection)
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.copy_notice = Some("Drag over text before copying".to_owned());
+            return;
+        };
+        self.copy_notice = Some(match copy_to_clipboard(&text) {
+            Ok(()) => "Copied selected text".to_owned(),
+            Err(error) => format!("Copy failed: {error}"),
+        });
+    }
+
+    fn rows_with_selection(&self, rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
+        let Some(selection) = self.selection.filter(|selection| selection.is_extended()) else {
+            return rows;
+        };
+        apply_text_selection(rows, selection)
+    }
+
     fn move_vertical(&mut self, delta: isize) {
         if let Document::Changelist {
             description,
@@ -1174,6 +1302,7 @@ impl ViewerState {
         self.document = load_document(&self.cwd, &request, Some(back));
         self.request = request;
         self.scroll_y = 0;
+        self.clear_selection();
         rename_own_pane(self.document.title());
     }
 
@@ -1217,6 +1346,7 @@ impl ViewerState {
         } else {
             self.clamp_scroll();
         }
+        self.clear_selection();
         true
     }
 
@@ -1253,6 +1383,7 @@ impl ViewerState {
         }
         self.last_fold_click = Some(now);
         self.clamp_scroll();
+        self.clear_selection();
         true
     }
 
@@ -1315,6 +1446,7 @@ impl ViewerState {
             }
             DiffToolbarAction::ToggleFolds => self.clamp_scroll(),
         }
+        self.clear_selection();
         true
     }
 
@@ -1329,6 +1461,109 @@ impl ViewerState {
         self.scroll_y = visual.saturating_sub(1);
         self.clamp_scroll();
     }
+}
+
+fn selected_text_from_rows(rows: &[Line<'static>], selection: TextSelection) -> Option<String> {
+    let (start, end) = selection.ordered();
+    if start == end || start.row >= rows.len() {
+        return None;
+    }
+    let end_row = end.row.min(rows.len().saturating_sub(1));
+    let mut selected = Vec::new();
+    for (row_index, row) in rows
+        .iter()
+        .enumerate()
+        .take(end_row.saturating_add(1))
+        .skip(start.row)
+    {
+        let text = line_text(row);
+        let content_width = display_width(text.trim_end_matches(' '));
+        let from = if row_index == start.row {
+            start.column.min(content_width)
+        } else {
+            0
+        };
+        let to = if row_index == end_row {
+            end.column.saturating_add(1).min(content_width)
+        } else {
+            content_width
+        };
+        selected.push(if to > from {
+            slice_overlapping_display(&text, from, to)
+        } else {
+            String::new()
+        });
+    }
+    Some(selected.join("\n"))
+}
+
+fn line_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn slice_overlapping_display(text: &str, from: usize, to: usize) -> String {
+    let mut column = 0usize;
+    text.chars()
+        .filter(|character| {
+            let width = char_width(*character);
+            let overlaps = column < to && column.saturating_add(width.max(1)) > from;
+            column = column.saturating_add(width);
+            overlaps
+        })
+        .collect()
+}
+
+fn apply_text_selection(rows: Vec<Line<'static>>, selection: TextSelection) -> Vec<Line<'static>> {
+    let (start, end) = selection.ordered();
+    rows.into_iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            if row_index < start.row || row_index > end.row {
+                return row;
+            }
+            let from = if row_index == start.row {
+                start.column
+            } else {
+                0
+            };
+            let to = if row_index == end.row {
+                end.column.saturating_add(1)
+            } else {
+                usize::MAX
+            };
+            highlight_line_range(row, from, to)
+        })
+        .collect()
+}
+
+fn highlight_line_range(line: Line<'static>, from: usize, to: usize) -> Line<'static> {
+    let mut output: Vec<Span<'static>> = Vec::new();
+    let mut column = 0usize;
+    for span in line.spans {
+        for character in span.content.chars() {
+            let width = char_width(character);
+            let selected = column < to && column.saturating_add(width.max(1)) > from;
+            let style = if selected {
+                span.style.bg(theme::SELECTION_BG.tui())
+            } else {
+                span.style
+            };
+            match output.last_mut() {
+                Some(previous) if previous.style == style => {
+                    previous.content.to_mut().push(character);
+                }
+                _ => output.push(Span::styled(character.to_string(), style)),
+            }
+            column = column.saturating_add(width);
+        }
+    }
+    let mut selected = Line::from(output);
+    selected.style = line.style;
+    selected.alignment = line.alignment;
+    selected
 }
 
 fn file_action_color(action: &FileAction) -> Color {
@@ -1694,40 +1929,8 @@ fn viewer_loop(
         terminal.draw(|frame| draw_viewer(frame, state))?;
         if event::poll(POLL)? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') => return Ok(true),
-                    KeyCode::Esc if !state.go_back() => return Ok(true),
-                    KeyCode::Esc => {}
-                    KeyCode::Enter => {
-                        if !state.handle_diff_key(KeyCode::Enter) {
-                            state.activate();
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => state.move_vertical(-1),
-                    KeyCode::Down | KeyCode::Char('j') => state.move_vertical(1),
-                    KeyCode::PageUp => state.move_vertical(-(state.body_height as isize)),
-                    KeyCode::PageDown => state.move_vertical(state.body_height as isize),
-                    KeyCode::Home => state.scroll_y = 0,
-                    KeyCode::End => {
-                        state.scroll_y = state.render_rows().len();
-                        state.clamp_scroll();
-                    }
-                    other => {
-                        let _ = state.handle_diff_key(other);
-                    }
-                },
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => state.move_vertical(-3),
-                    MouseEventKind::ScrollDown => state.move_vertical(3),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let _ = state.select_changelist_file_at(mouse.row)
-                            || state.handle_diff_click(mouse.column, mouse.row);
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        let _ = state.handle_diff_click(mouse.column, mouse.row);
-                    }
-                    _ => {}
-                },
+                Event::Key(key) if handle_viewer_key(state, key) => return Ok(true),
+                Event::Mouse(mouse) => handle_viewer_mouse(state, mouse),
                 Event::Resize(_, _)
                 | Event::FocusGained
                 | Event::FocusLost
@@ -1750,14 +1953,99 @@ fn viewer_loop(
     }
 }
 
+fn handle_viewer_key(state: &mut ViewerState, key: KeyEvent) -> bool {
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.copy_selection();
+        return false;
+    }
+    if state.handle_diff_key(key.code) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('q') => true,
+        KeyCode::Esc if !state.go_back() => true,
+        KeyCode::Esc => false,
+        KeyCode::Enter => {
+            state.activate();
+            false
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.move_vertical(-1);
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.move_vertical(1);
+            false
+        }
+        KeyCode::PageUp => {
+            state.move_vertical(-(state.body_height as isize));
+            false
+        }
+        KeyCode::PageDown => {
+            state.move_vertical(state.body_height as isize);
+            false
+        }
+        KeyCode::Home => {
+            state.scroll_y = 0;
+            false
+        }
+        KeyCode::End => {
+            state.scroll_y = state.render_rows().len();
+            state.clamp_scroll();
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_viewer_mouse(state: &mut ViewerState, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.drag_anchor = None;
+            state.move_vertical(-3);
+        }
+        MouseEventKind::ScrollDown => {
+            state.drag_anchor = None;
+            state.move_vertical(3);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let activated = state.select_changelist_file_at(mouse.row)
+                || state.handle_diff_click(mouse.column, mouse.row);
+            if activated {
+                state.clear_selection();
+            } else {
+                let _ = state.begin_text_selection(mouse.column, mouse.row);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let _ = state.update_text_selection(mouse.column, mouse.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) if state.drag_anchor.is_some() => {
+            let _ = state.finish_text_selection(mouse.column, mouse.row);
+        }
+        _ => {}
+    }
+}
+
 fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
     let header_height = state.document.header_height();
     let hints: &[(&str, &str)] = match &state.document {
-        Document::Changelist { .. } => &[("↑↓", "select"), ("⏎", "diff"), ("Esc", "close")],
+        Document::Changelist { .. } => &[
+            ("↑↓", "select"),
+            ("⏎", "diff"),
+            ("drag", "select text"),
+            ("Ctrl+C", "copy"),
+            ("Esc", "close"),
+        ],
         Document::Diff { back: Some(_), .. } => &[
             ("[/]", "hunks"),
             ("e", "unfold"),
             ("⏎", "expand"),
+            ("drag", "select text"),
+            ("Ctrl+C", "copy"),
             ("Esc", "back"),
             ("q", "close"),
         ],
@@ -1765,17 +2053,33 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
             ("[/]", "hunks"),
             ("e", "unfold"),
             ("⏎", "expand"),
+            ("drag", "select text"),
+            ("Ctrl+C", "copy"),
             ("q", "close"),
         ],
         Document::Text { back: Some(_), .. } => &[
             ("↑↓", "scroll"),
             ("PgUp/Dn", "page"),
+            ("drag", "select text"),
+            ("Ctrl+C", "copy"),
             ("Esc", "back"),
             ("q", "close"),
         ],
-        _ => &[("↑↓", "scroll"), ("PgUp/Dn", "page"), ("q", "close")],
+        _ => &[
+            ("↑↓", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("drag", "select text"),
+            ("Ctrl+C", "copy"),
+            ("q", "close"),
+        ],
     };
-    let footer_lines = theme::key_hint_lines(hints, frame.area().width);
+    let mut footer_lines = theme::key_hint_lines(hints, frame.area().width);
+    if let Some(notice) = &state.copy_notice {
+        footer_lines.push(Line::styled(
+            format!(" {notice}"),
+            Style::default().fg(theme::MUTED.tui()),
+        ));
+    }
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
@@ -1822,12 +2126,14 @@ fn draw_viewer(frame: &mut ratatui::Frame<'_>, state: &mut ViewerState) {
 
     state.body_width = chunks[1].width as usize;
     state.body_height = chunks[1].height as usize;
+    state.body_x = chunks[1].x;
     state.body_y = chunks[1].y;
     let mut rows = state.render_rows();
     if rows.len() > state.body_height && state.body_width > 1 {
         state.body_width -= 1;
         rows = state.render_rows();
     }
+    rows = state.rows_with_selection(rows);
     state.clamp_scroll();
     let total_rows = rows.len();
     let paragraph = Paragraph::new(rows).scroll((state.scroll_y.min(u16::MAX as usize) as u16, 0));
@@ -1906,6 +2212,15 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     #[test]
     fn content_viewer_uses_hierarchy_keycaps_and_a_real_scrollbar() {
         let request = ContentRequest::File {
@@ -1927,9 +2242,13 @@ mod tests {
             scroll_y: 0,
             body_width: 1,
             body_height: 1,
+            body_x: 0,
             body_y: 0,
             toolbar_hits: Vec::new(),
             last_fold_click: None,
+            selection: None,
+            drag_anchor: None,
+            copy_notice: None,
         };
         let backend = TestBackend::new(40, 12);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1977,6 +2296,94 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn dragging_across_content_rows_builds_copyable_text_and_highlights_it() {
+        let request = ContentRequest::File {
+            path: PathBuf::from("C:/ws/demo.txt"),
+        };
+        let mut state = ViewerState {
+            cwd: PathBuf::from("C:/ws"),
+            request,
+            document: Document::Text {
+                title: "demo.txt".into(),
+                context: "C:/ws/demo.txt".into(),
+                lines: vec![Line::raw("alpha beta"), Line::raw("gamma")],
+                gutter_width: None,
+                back: None,
+            },
+            scroll_y: 0,
+            body_width: 12,
+            body_height: 4,
+            body_x: 0,
+            body_y: 2,
+            toolbar_hits: Vec::new(),
+            last_fold_click: None,
+            selection: None,
+            drag_anchor: None,
+            copy_notice: None,
+        };
+
+        handle_viewer_mouse(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 2),
+        );
+        handle_viewer_mouse(
+            &mut state,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4, 3),
+        );
+        handle_viewer_mouse(
+            &mut state,
+            mouse(MouseEventKind::Up(MouseButton::Left), 4, 3),
+        );
+        assert_eq!(state.selected_text().as_deref(), Some("alpha beta\ngamma"));
+
+        let highlighted = state.rows_with_selection(state.render_rows());
+        assert!(
+            highlighted
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { span.style.bg == Some(theme::SELECTION_BG.tui()) })
+        );
+    }
+
+    #[test]
+    fn a_plain_body_click_does_not_leave_a_text_selection() {
+        let request = ContentRequest::File {
+            path: PathBuf::from("C:/ws/demo.txt"),
+        };
+        let mut state = ViewerState {
+            cwd: PathBuf::from("C:/ws"),
+            request,
+            document: Document::Text {
+                title: "demo.txt".into(),
+                context: "C:/ws/demo.txt".into(),
+                lines: vec![Line::raw("alpha")],
+                gutter_width: None,
+                back: None,
+            },
+            scroll_y: 0,
+            body_width: 12,
+            body_height: 2,
+            body_x: 0,
+            body_y: 2,
+            toolbar_hits: Vec::new(),
+            last_fold_click: None,
+            selection: None,
+            drag_anchor: None,
+            copy_notice: None,
+        };
+
+        assert!(state.begin_text_selection(2, 2));
+        assert!(!state.finish_text_selection(2, 2));
+        assert!(state.selected_text().is_none());
+    }
+
+    #[test]
+    fn selecting_either_cell_of_a_wide_glyph_copies_the_glyph() {
+        assert_eq!(slice_overlapping_display("A中B", 1, 2), "中");
+        assert_eq!(slice_overlapping_display("A中B", 2, 3), "中");
     }
 
     #[test]
@@ -2251,9 +2658,13 @@ mod tests {
             scroll_y: 0,
             body_width: 100,
             body_height: 20,
+            body_x: 0,
             body_y: 2,
             toolbar_hits: Vec::new(),
             last_fold_click: None,
+            selection: None,
+            drag_anchor: None,
+            copy_notice: None,
         };
 
         assert!(state.select_changelist_file_at(7));
@@ -2263,8 +2674,7 @@ mod tests {
         assert_eq!(selected, 1);
     }
 
-    #[test]
-    fn clicking_leading_diff_ellipsis_reveals_twenty_lines_toward_hunk() {
+    fn folding_diff_state() -> ViewerState {
         let mut file: Vec<String> = (1..=100).map(|index| format!("line-{index}")).collect();
         file[69] = "changed".into();
         let unified = vec![
@@ -2283,7 +2693,7 @@ mod tests {
             action: Some(FileAction::Edit),
             fold_context: 5,
         };
-        let mut state = ViewerState {
+        ViewerState {
             cwd: PathBuf::from("."),
             request,
             document: Document::Diff {
@@ -2295,34 +2705,52 @@ mod tests {
             scroll_y: 0,
             body_width: 120,
             body_height: 40,
+            body_x: 0,
             body_y: 3,
             toolbar_hits: Vec::new(),
             last_fold_click: None,
-        };
+            selection: None,
+            drag_anchor: None,
+            copy_notice: None,
+        }
+    }
+
+    fn visible_diff_line_count(state: &ViewerState) -> usize {
         let Document::Diff { view, .. } = &state.document else {
-            unreachable!();
+            panic!("expected diff");
         };
-        let fold_row = view
-            .body_lines()
+        view.visible_items()
+            .iter()
+            .filter(|item| matches!(item, diff::VisibleItem::Line(_)))
+            .count()
+    }
+
+    fn leading_fold_row(state: &ViewerState) -> u16 {
+        let Document::Diff { view, .. } = &state.document else {
+            panic!("expected diff");
+        };
+        view.body_lines()
             .iter()
             .position(|line| line.spans.iter().any(|span| span.content.contains("▲ 20")))
-            .expect("leading fold row") as u16;
-        let before = view
-            .visible_items()
-            .iter()
-            .filter(|item| matches!(item, diff::VisibleItem::Line(_)))
-            .count();
+            .expect("leading fold row") as u16
+    }
 
-        assert!(state.handle_diff_click(0, state.body_y + fold_row));
+    #[test]
+    fn mouse_down_on_leading_diff_ellipsis_expands_without_waiting_for_mouse_up() {
+        let mut state = folding_diff_state();
+        let fold_row = leading_fold_row(&state);
+        let mouse_row = state.body_y + fold_row;
+        let before = visible_diff_line_count(&state);
+
+        handle_viewer_mouse(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, mouse_row),
+        );
 
         let Document::Diff { view, .. } = &state.document else {
             unreachable!();
         };
-        let after = view
-            .visible_items()
-            .iter()
-            .filter(|item| matches!(item, diff::VisibleItem::Line(_)))
-            .count();
+        let after = visible_diff_line_count(&state);
         assert_eq!(after, before + crate::domain::EXPAND_CHUNK);
         assert!(view.body_lines().iter().any(|line| {
             line.spans
@@ -2331,5 +2759,32 @@ mod tests {
                 .collect::<String>()
                 .contains("line-47")
         }));
+
+        handle_viewer_mouse(
+            &mut state,
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, mouse_row),
+        );
+        assert_eq!(visible_diff_line_count(&state), after);
+    }
+
+    #[test]
+    fn enter_and_e_reach_diff_fold_actions_through_the_viewer_key_dispatch() {
+        let mut enter_state = folding_diff_state();
+        let before = visible_diff_line_count(&enter_state);
+        assert!(!handle_viewer_key(
+            &mut enter_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+        assert!(visible_diff_line_count(&enter_state) > before);
+
+        let mut fold_state = folding_diff_state();
+        assert!(!handle_viewer_key(
+            &mut fold_state,
+            KeyEvent::new_with_kind(KeyCode::Char('e'), KeyModifiers::NONE, KeyEventKind::Repeat,),
+        ));
+        let Document::Diff { view, .. } = &fold_state.document else {
+            panic!("expected diff");
+        };
+        assert!(view.folds_all_expanded());
     }
 }

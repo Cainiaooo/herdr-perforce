@@ -254,9 +254,9 @@ Submit 测试还应覆盖：
 ### 6.4 UI 与宿主集成
 
 - 默认保持 `Agent CLI | 最右导航`，导航约占 20%；打开内容后保持 `Agent CLI | Content | 最右导航`，前两栏近似等宽。
-- File/Diff 复用同一个 Content pane；CL files 保持在 Review 行内树。关闭 Content 后 split 正常折叠，不替换或关闭 Agent pane。
-- 验证 Content 按 pane 宽度自动换行、文件续行保留空白行号 gutter 并与正文对齐、换行后完整纵向滚动和语法高亮；验证 Review CL 行内展开目录/文件、点击/Space 切换 `[ ]/[x]`、Enter 打开 Diff，以及长行不会改变导航树宽度。
-- Explorer fixture 分目录验证 `A/M/D/R/U/↓/⊘/?`、head-deleted 同路径本地重建为 `U`、delete/move-delete 虚拟行、手动刷新和查询失败无装饰；用 fake transport 断言未展开目录不会产生 `where/fstat/opened` 请求。刷新必须先更新 workspace/client identity，再加载根与已展开目录；旧 generation 结果不能回填。窄 pane 验证完整图例能横向平移。Review 验证 CL 列表带 `changes -l`、行内文件树的懒加载/刷新 generation/真实路径分组、单源文件选择和移动目标 picker；fake transport 覆盖 new change form、空 CL 删除门禁、特殊字符 argv、写前归属复核和移动后源/目标校验。进入编辑时读取完整 change form，内嵌 Description 可以点击或按 `e` 聚焦，支持 UTF-8、多行和括号粘贴并显示真实光标；覆盖折行前的光标归属、按视觉行上下移动、空 buffer 不显示占位符、输入上限错误可见和 Apply 视口保持。编辑期间右键菜单、背景选择和 Submit 均被锁定，过期 load/apply 消息不能串线；`Ctrl+Enter` 或点击 Apply 一次即进入校验与写入，成功后更新描述并触发刷新。Review & Submit 只进入 preflight，并显示 Changelists / File History / Workspace History 同级 section。
+- File/Diff 复用同一个 Content pane，并覆盖正文拖拽选择、选区高亮与 `Ctrl+C` 复制；Diff fold 事件必须覆盖仅收到 `MouseDown` 时仍可点击展开，以及 `Enter` / `e` 经 viewer 键盘 dispatch 生效，避免文本选择吞掉原交互。CL files 保持在 Review 的可展开 CL 下，以单层 depot path 列表显示。关闭 Content 后 split 正常折叠，不替换或关闭 Agent pane。
+- 验证 Content 按 pane 宽度自动换行、文件续行保留空白行号 gutter 并与正文对齐、换行后完整纵向滚动和语法高亮；验证 Review CL 展开为单层文件路径列表、点击/Space 切换 `[ ]/[x]`、Enter 打开 Diff，以及长行不会改变导航 pane 宽度。
+- Explorer fixture 分目录验证 `A/M/D/R/U/↓/⊘/?`、head-deleted 同路径本地重建为 `U`、delete/move-delete 虚拟行、手动刷新和查询失败无装饰；用 fake transport 断言未展开目录不会产生 `where/fstat/opened` 请求。刷新必须先更新 workspace/client identity，再加载根与已展开目录；旧 generation 结果不能回填。窄 pane 验证完整图例能横向平移。Review 验证 CL 列表带 `changes -l`、CL 下单层 depot path 文件列表的懒加载/刷新 generation、单源文件选择，以及包含截断 Description 的移动目标 picker；fake transport 覆盖 new change form、空 CL 删除门禁、特殊字符 argv、写前归属复核和移动后源/目标校验。进入编辑时读取完整 change form，内嵌 Description 可以点击或按 `e` 聚焦，支持 UTF-8、多行和括号粘贴并显示真实光标；覆盖折行前的光标归属、按视觉行上下移动、空 buffer 不显示占位符、输入上限错误可见和 Apply 视口保持。编辑期间右键菜单、背景选择和 Submit 均被锁定，过期 load/apply 消息不能串线；`Ctrl+Enter` 或点击 Apply 一次即进入校验与写入，成功后更新描述并触发刷新。Review & Submit 只进入 preflight，并显示 Changelists / File History / Workspace History 同级 section。
 - 验证 Herdr 与插件的键位所有权：焦点进入/离开、`Esc`、关闭、搜索、滚动及文本输入。
 - 破坏性命令使用明确动作或组合键，并经过确认层；普通字符不应被无条件截获。
 - Windows Terminal 下覆盖常用字号、缩放、窗口宽度和高 DPI。
