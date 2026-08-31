@@ -4,6 +4,26 @@
 
 > 当前版本是开发预览。Submit 的产品写流程和隔离 `p4d` 闭环已经验证；独立内容 pane 的真实 Herdr 宿主 UI 验收仍在推进。
 
+## Herdr Marketplace
+
+这个仓库已经具备市场索引所需的文件：默认分支根目录有可解析的 [`herdr-plugin.toml`](herdr-plugin.toml)（`id` / `name` / `version` / `min_herdr_version`）。
+
+要出现在 [herdr.dev/plugins](https://herdr.dev/plugins/)，还需要给这个**公开仓库**加上 GitHub topic **`herdr-plugin`**。Topic 是仓库元数据，不在 git 提交里：打开仓库页右侧 **About** → ⚙️ → Topics，加上 `herdr-plugin`（建议同时加 `herdr`、`perforce`、`rust`）。索引每 30 分钟自动刷新，不需要单独投稿。
+
+从 GitHub 安装：
+
+```bash
+herdr plugin install Cainiaooo/herdr-perforce
+```
+
+Herdr 会克隆仓库、执行 manifest 里的 `cargo build --release`，然后注册插件。安装预览会列出将要运行的 build / action / pane 命令，确认后再执行。本地开发仍用下面的 `plugin link`。
+
+市场卡片会读取仓库 description。建议在 About 里写成：
+
+```text
+Compact Perforce review pane for Herdr, with explicit numbered changelist submit
+```
+
 ## 功能
 
 - 从 `HERDR_PLUGIN_CONTEXT_JSON` 读取打开插件前的 pane/workspace 路径，不依赖插件安装目录推断 P4 workspace。
@@ -33,7 +53,7 @@ Herdr local link 不会自动执行 manifest 中的 build command，因此首次
 克隆或进入仓库后先构建：
 
 ```powershell
-cd D:\Projects\herdr-perforce
+cd D:\\Projects\\herdr-perforce
 cargo build --release
 herdr plugin link .
 ```
@@ -78,7 +98,7 @@ herdr plugin action invoke open --plugin herdr.perforce
 
 ```powershell
 $config = herdr plugin config-dir herdr.perforce
-Copy-Item .\examples\panel.manual.json (Join-Path $config 'panel.json')
+Copy-Item .\\examples\\panel.manual.json (Join-Path $config 'panel.json')
 ```
 
 对应内容为：
@@ -197,7 +217,7 @@ herdr plugin config-dir herdr.perforce
 {
   "mode": "external",
   "label": "External submit tool",
-  "command": "C:\\absolute\\path\\to\\submit-tool.exe",
+  "command": "C:\\\\absolute\\\\path\\\\to\\\\submit-tool.exe",
   "args": ["--changelist", "{change}"]
 }
 ```
@@ -271,6 +291,12 @@ cargo build --release
 herdr plugin unlink herdr.perforce
 ```
 
+从 GitHub 安装的副本用：
+
+```bash
+herdr plugin uninstall herdr.perforce
+```
+
 ## 当前限制
 
 - 当前版本已接入本地目录树、Review 行内 CL/File 树、独立 File/Diff 内容 pane、CL 新建/空 CL 删除/选中文件跨 CL 移动、内联叠加 Diff（折叠/hunk 跳转/行内高亮）、滚动/高亮以及内联 Description Apply；review comment 与 Agent 描述生成 UI 尚未接完。
@@ -298,8 +324,8 @@ cargo run -- pane --cwd <mapped-workspace>
 真实写测试只能在仓库同级的隔离 harness 中运行，不能对生产 P4 Server 执行：
 
 ```powershell
-cd ..\herdr-perforce-test-harness
-$env:HERDR_P4D_TEST_BIN = 'D:\Perforce\p4d.exe'
+cd ..\\herdr-perforce-test-harness
+$env:HERDR_P4D_TEST_BIN = 'D:\\Perforce\\p4d.exe'
 cargo run -- doctor
 cargo run -- level-c
 ```
