@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -54,6 +54,9 @@ pub struct ExplorerModel {
     scroll_y: usize,
     scroll_x: usize,
     follow_selection: bool,
+    /// True between a manual `r` refresh and the matching overview install.
+    /// Overview must not bump generation again or in-flight disk reloads are dropped.
+    manual_refresh: bool,
 }
 
 impl ExplorerModel {
@@ -74,6 +77,7 @@ impl ExplorerModel {
             scroll_y: 0,
             scroll_x: 0,
             follow_selection: true,
+            manual_refresh: false,
         }
     }
 
@@ -100,6 +104,11 @@ impl ExplorerModel {
     #[must_use]
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_deref()
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> Option<&WorkspaceIdentity> {
+        self.identity.as_ref()
     }
 
     #[must_use]
@@ -140,13 +149,29 @@ impl ExplorerModel {
         self.listings.clear();
         self.jump = None;
         self.pending_load = None;
+        self.manual_refresh = true;
     }
 
     pub fn begin_workspace_load(&mut self, identity: WorkspaceIdentity) -> u64 {
+        if self.manual_refresh && self.identity.as_ref() == Some(&identity) {
+            // Disk listings were already invalidated for this `r` press. Keep
+            // the generation so the in-flight directory reload can install.
+            self.manual_refresh = false;
+            self.identity = Some(identity);
+            if self.pending_load.is_none() && !self.has_listing(&self.cwd) {
+                self.pending_load = Some(self.cwd.clone());
+            }
+            return self.generation;
+        }
+
         let keep_expanded = self.expanded.clone();
         let keep_selected = self.selected.clone();
+        let skip_generation_bump = self.manual_refresh && self.identity.is_none();
+        self.manual_refresh = false;
         self.identity = Some(identity);
-        self.generation = self.generation.wrapping_add(1);
+        if !skip_generation_bump {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.load = ExplorerLoadState::Checking;
         self.listings.clear();
         self.expanded = keep_expanded;
@@ -162,7 +187,7 @@ impl ExplorerModel {
     pub fn remaining_expanded_directories(&self) -> Vec<PathBuf> {
         self.expanded
             .iter()
-            .filter(|path| *path != &self.cwd && !self.listings.contains_key(*path))
+            .filter(|path| !self.paths_eq(path, &self.cwd) && !self.has_listing(path))
             .cloned()
             .collect()
     }
@@ -217,6 +242,7 @@ impl ExplorerModel {
         match result {
             Ok(listing) => self.install_listing(listing),
             Err(_) => {
+                let path = self.intern_directory_path(&path);
                 self.listings.insert(path, DirectoryState::Failed);
                 self.restore_selection_after_listing();
             }
@@ -224,7 +250,7 @@ impl ExplorerModel {
     }
 
     fn install_listing(&mut self, listing: LoadedDirectory) {
-        let path = listing.path.clone();
+        let path = self.intern_directory_path(&listing.path);
         self.listings.insert(
             path.clone(),
             DirectoryState::Ready {
@@ -332,7 +358,8 @@ impl ExplorerModel {
     }
 
     fn expand_directory(&mut self, path: PathBuf) -> ExplorerAction {
-        match self.listings.get(&path) {
+        let path = self.intern_directory_path(&path);
+        match self.listing_state(&path).cloned() {
             Some(DirectoryState::Ready { .. }) => {
                 self.expanded.insert(path);
                 ExplorerAction::None
@@ -473,15 +500,75 @@ impl ExplorerModel {
     }
 
     pub fn invalidate_directory(&mut self, path: PathBuf) {
-        self.listings
-            .retain(|listed, _| listed != &path && !listed.starts_with(&path));
-        self.expanded
-            .retain(|listed| listed == &path || !listed.starts_with(&path));
+        let path = self.intern_directory_path(&path);
+        let ignore_case = self.ignore_path_case();
+        // Drop in-flight listings for this directory. Otherwise a stale
+        // `opened`/`read_dir` result with the previous generation can put a
+        // just-deleted file back after the fresh reload.
+        self.generation = self.generation.wrapping_add(1);
+        self.listings.retain(|listed, _| {
+            !path_components_equal(listed, &path, ignore_case)
+                && !path_is_strict_descendant(listed, &path, ignore_case)
+        });
+        self.expanded.retain(|listed| {
+            path_components_equal(listed, &path, ignore_case)
+                || !path_is_strict_descendant(listed, &path, ignore_case)
+        });
         // A mutation inside this directory should reveal its result once the
         // asynchronous reload completes. Keeping the parent expanded also
         // prevents an invisible child selection from aliasing to row zero.
         self.expanded.insert(path.clone());
         self.pending_load = Some(path);
+    }
+
+    fn ignore_path_case(&self) -> bool {
+        if cfg!(windows) {
+            return true;
+        }
+        matches!(
+            self.identity
+                .as_ref()
+                .map(|identity| &identity.case_handling),
+            Some(crate::domain::CaseHandling::Insensitive | crate::domain::CaseHandling::Hybrid)
+                | None
+        )
+    }
+
+    fn paths_eq(&self, left: &Path, right: &Path) -> bool {
+        path_components_equal(left, right, self.ignore_path_case())
+    }
+
+    fn has_listing(&self, path: &Path) -> bool {
+        self.listings
+            .keys()
+            .any(|listed| self.paths_eq(listed, path))
+    }
+
+    fn listing_state(&self, path: &Path) -> Option<&DirectoryState> {
+        self.listings
+            .iter()
+            .find(|(listed, _)| self.paths_eq(listed, path))
+            .map(|(_, state)| state)
+    }
+
+    fn intern_directory_path(&self, path: &Path) -> PathBuf {
+        if self.paths_eq(path, &self.cwd) {
+            return self.cwd.clone();
+        }
+        for state in self.listings.values() {
+            if let DirectoryState::Ready { entries } = state
+                && let Some(entry) = entries
+                    .iter()
+                    .find(|entry| self.paths_eq(&entry.path, path))
+            {
+                return entry.path.clone();
+            }
+        }
+        self.expanded
+            .iter()
+            .find(|expanded| self.paths_eq(expanded, path))
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
     }
 
     #[must_use]
@@ -522,6 +609,36 @@ impl ExplorerModel {
         self.selected = Some(listing.path.clone());
         self.install_listing(listing);
     }
+}
+
+fn path_components_equal(left: &Path, right: &Path, ignore_case: bool) -> bool {
+    if left == right {
+        return true;
+    }
+    let left = left.components();
+    let right = right.components();
+    if left.clone().count() != right.clone().count() {
+        return false;
+    }
+    left.zip(right)
+        .all(|(left, right)| component_eq(&left, &right, ignore_case))
+}
+
+fn path_is_strict_descendant(path: &Path, ancestor: &Path, ignore_case: bool) -> bool {
+    let ancestor: Vec<_> = ancestor.components().collect();
+    let path: Vec<_> = path.components().collect();
+    path.len() > ancestor.len()
+        && ancestor
+            .iter()
+            .zip(path.iter())
+            .all(|(left, right)| component_eq(left, right, ignore_case))
+}
+
+fn component_eq(left: &Component, right: &Component, ignore_case: bool) -> bool {
+    if left == right {
+        return true;
+    }
+    ignore_case && left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
 }
 
 pub fn connection_message() -> &'static str {
@@ -863,6 +980,55 @@ mod tests {
             }),
         );
         assert_eq!(explorer.selected_row_info().map(|row| row.0), Some(created));
+    }
+
+    #[test]
+    fn invalidate_directory_ignores_stale_listings_from_the_previous_generation() {
+        let root = PathBuf::from("C:/ws");
+        let gone = root.join("gone.txt");
+        let mut explorer = ExplorerModel::new(root.clone());
+        explorer.install_ready_listing_for_test(LoadedDirectory {
+            path: root.clone(),
+            entries: vec![file_entry(&root, "gone.txt", None)],
+            truncated: false,
+        });
+        let stale_generation = explorer.generation();
+        explorer.invalidate_directory(root.clone());
+        assert_ne!(explorer.generation(), stale_generation);
+        assert!(
+            explorer
+                .visible_rows()
+                .iter()
+                .all(|row| row.name != "gone.txt")
+        );
+
+        explorer.install_directory(
+            stale_generation,
+            root.clone(),
+            Ok(LoadedDirectory {
+                path: root.clone(),
+                entries: vec![file_entry(&root, "gone.txt", None)],
+                truncated: false,
+            }),
+        );
+        assert!(
+            explorer
+                .visible_rows()
+                .iter()
+                .all(|row| row.name != "gone.txt"),
+            "stale generation must not restore a deleted file"
+        );
+
+        explorer.install_directory(
+            explorer.generation(),
+            root,
+            Ok(LoadedDirectory {
+                path: PathBuf::from("C:/ws"),
+                entries: Vec::new(),
+                truncated: false,
+            }),
+        );
+        assert!(explorer.visible_rows().iter().all(|row| row.path != gone));
     }
 
     fn identity_for_test(root: &Path) -> WorkspaceIdentity {

@@ -461,6 +461,7 @@ impl NavOverlay {
 enum MessageEffect {
     None,
     ReloadOverview,
+    RefreshExplorerAndOverview,
     LoadExplorerExpanded,
     LoadExplorerDirectory,
     LoadWorkspaceTrees,
@@ -865,7 +866,7 @@ impl PaneModel {
         self.overview = OverviewState::Loading;
         self.status =
             "Refreshing workspace identity, Explorer files, and Perforce status...".to_owned();
-        MessageEffect::ReloadOverview
+        MessageEffect::RefreshExplorerAndOverview
     }
 
     fn handle_message(&mut self, message: PaneMessage) -> MessageEffect {
@@ -1313,7 +1314,7 @@ impl PaneModel {
                 self.open_menu_for_selection();
                 false
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::F(5) => {
                 let effect = self.begin_active_refresh();
                 apply_message_effect(self, effect, sender);
                 false
@@ -1520,6 +1521,15 @@ impl PaneModel {
             MouseEventKind::ScrollRight => self.pan_active_view(4),
             MouseEventKind::Down(MouseButton::Right) => {
                 self.open_context_menu(mouse.column, mouse.row, hits);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits
+                    .nav_refresh
+                    .is_some_and(|target| target.contains(mouse.column, mouse.row)) =>
+            {
+                let effect = self.begin_active_refresh();
+                apply_message_effect(self, effect, sender);
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => self.handle_left_down(mouse, hits),
@@ -2565,12 +2575,15 @@ fn apply_message_effect(
     match effect {
         MessageEffect::None => {}
         MessageEffect::ReloadOverview => pane.reload_overview(sender),
+        MessageEffect::RefreshExplorerAndOverview => {
+            pane.reload_overview(sender);
+            request_explorer_root(pane, sender);
+        }
         MessageEffect::LoadExplorerExpanded => {
-            let generation = pane.explorer.generation();
-            let identity = match &pane.overview {
-                OverviewState::Ready(overview) => overview.identity.clone(),
-                OverviewState::Loading | OverviewState::Failed(_) => return,
+            let Some(identity) = explorer_query_identity(pane) else {
+                return;
             };
+            let generation = pane.explorer.generation();
             for path in pane.explorer.remaining_expanded_directories() {
                 request_explorer_directory(
                     pane.cwd.clone(),
@@ -2582,13 +2595,13 @@ fn apply_message_effect(
             }
         }
         MessageEffect::LoadExplorerDirectory => {
+            let Some(identity) = explorer_query_identity(pane) else {
+                return;
+            };
             if let Some(path) = pane.explorer.take_pending_directory() {
-                let OverviewState::Ready(overview) = &pane.overview else {
-                    return;
-                };
                 request_explorer_directory(
                     pane.cwd.clone(),
-                    overview.identity.clone(),
+                    identity,
                     pane.explorer.generation(),
                     path,
                     sender.clone(),
@@ -2614,13 +2627,23 @@ fn apply_message_effect(
     }
 }
 
+fn explorer_query_identity(pane: &PaneModel) -> Option<WorkspaceIdentity> {
+    pane.explorer
+        .identity()
+        .cloned()
+        .or_else(|| match &pane.overview {
+            OverviewState::Ready(overview) => Some(overview.identity.clone()),
+            OverviewState::Loading | OverviewState::Failed(_) => None,
+        })
+}
+
 fn request_explorer_root(pane: &PaneModel, sender: &mpsc::Sender<PaneMessage>) {
-    let OverviewState::Ready(overview) = &pane.overview else {
+    let Some(identity) = explorer_query_identity(pane) else {
         return;
     };
     request_explorer_root_with(
         pane.cwd.clone(),
-        overview.identity.clone(),
+        identity,
         pane.explorer.generation(),
         sender.clone(),
     );
@@ -2896,6 +2919,7 @@ struct HitTargets {
     view_review: Option<Rect>,
     explorer_rows: Vec<Rect>,
     explorer_offset: usize,
+    nav_refresh: Option<Rect>,
 }
 
 #[derive(Debug, Default)]
@@ -4099,9 +4123,9 @@ fn render_key_hints(frame: &mut RenderedFrame, row: usize, width: usize, hints: 
     let mut x = 1usize;
     for (key, label) in hints {
         let keycap = format!(" {key} ");
-        let label = format!(" {label}");
+        let caption = format!(" {label}");
         let needed = display_width(&keycap)
-            .saturating_add(display_width(&label))
+            .saturating_add(display_width(&caption))
             .saturating_add(2);
         if x.saturating_add(needed) > width {
             put_styled(
@@ -4117,6 +4141,7 @@ fn render_key_hints(frame: &mut RenderedFrame, row: usize, width: usize, hints: 
             );
             break;
         }
+        let hit_start = x;
         put_styled(
             frame,
             x,
@@ -4133,14 +4158,21 @@ fn render_key_hints(frame: &mut RenderedFrame, row: usize, width: usize, hints: 
             frame,
             x,
             row,
-            &label,
+            &caption,
             RowStyle {
                 foreground: Some(theme::MUTED.terminal()),
                 dim: true,
                 ..RowStyle::default()
             },
         );
-        x = x.saturating_add(display_width(&label)).saturating_add(2);
+        x = x.saturating_add(display_width(&caption)).saturating_add(2);
+        if *key == "r" {
+            frame.hits.nav_refresh = Some(Rect::row(
+                hit_start as u16,
+                row as u16,
+                (x.saturating_sub(hit_start).saturating_sub(2)) as u16,
+            ));
+        }
     }
 }
 
@@ -4344,7 +4376,10 @@ mod tests {
         pane.explorer.select_index(1);
         let previous_generation = pane.explorer.generation();
 
-        assert_eq!(pane.begin_active_refresh(), MessageEffect::ReloadOverview);
+        assert_eq!(
+            pane.begin_active_refresh(),
+            MessageEffect::RefreshExplorerAndOverview
+        );
         assert_eq!(pane.explorer.load_state(), &ExplorerLoadState::Checking);
         assert_ne!(pane.explorer.generation(), previous_generation);
         assert_eq!(pane.explorer.pending_directory(), None);
@@ -4354,6 +4389,95 @@ mod tests {
                 .visible_rows()
                 .iter()
                 .all(|row| row.name != "deleted-externally.txt")
+        );
+        assert!(pane.status.contains("Refreshing workspace identity"));
+    }
+
+    #[test]
+    fn explorer_refresh_round_trip_keeps_generation_and_drops_deleted_rows() {
+        let mut pane = pane_with_changes();
+        let root = PathBuf::from("C:/Example Workspace");
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: root.clone(),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "deleted-externally.txt".into(),
+                    path: root.join("deleted-externally.txt"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: Some(crate::domain::ExplorerDecoration::Unopened),
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        let overview = match &pane.overview {
+            OverviewState::Ready(overview) => WorkspaceOverview {
+                identity: overview.identity.clone(),
+                changes: overview.changes.clone(),
+            },
+            OverviewState::Loading | OverviewState::Failed(_) => {
+                panic!("overview starts ready in this fixture")
+            }
+        };
+        pane.begin_active_refresh();
+        let refresh_generation = pane.explorer.generation();
+        pane.overview_generation = pane.overview_generation.wrapping_add(1);
+
+        assert_eq!(
+            pane.handle_message(PaneMessage::Overview {
+                generation: pane.overview_generation,
+                result: Ok(overview),
+            }),
+            MessageEffect::LoadWorkspaceTrees
+        );
+        assert_eq!(pane.explorer.generation(), refresh_generation);
+
+        pane.handle_message(PaneMessage::ExplorerRoot {
+            generation: refresh_generation,
+            result: Ok(LoadedDirectory {
+                path: root,
+                entries: Vec::new(),
+                truncated: false,
+            }),
+        });
+        assert_eq!(pane.explorer.load_state(), &ExplorerLoadState::Ready);
+        assert!(
+            pane.explorer
+                .visible_rows()
+                .iter()
+                .all(|row| row.name != "deleted-externally.txt")
+        );
+    }
+
+    #[test]
+    fn r_key_starts_explorer_refresh() {
+        let mut pane = pane_with_changes();
+        let root = PathBuf::from("C:/Example Workspace");
+        pane.explorer
+            .install_ready_listing_for_test(LoadedDirectory {
+                path: root.clone(),
+                entries: vec![crate::domain::ExplorerEntry {
+                    name: "stale.txt".into(),
+                    path: root.join("stale.txt"),
+                    kind: crate::domain::ExplorerEntryKind::File,
+                    decoration: Some(crate::domain::ExplorerDecoration::Unopened),
+                    file_type: Some(crate::domain::FileType::new("text")),
+                    have_rev: Some(1),
+                    head_rev: Some(1),
+                }],
+                truncated: false,
+            });
+        dispatch_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert_eq!(pane.explorer.load_state(), &ExplorerLoadState::Checking);
+        assert!(
+            pane.explorer
+                .visible_rows()
+                .iter()
+                .all(|row| row.name != "stale.txt")
         );
         assert!(pane.status.contains("Refreshing workspace identity"));
     }
