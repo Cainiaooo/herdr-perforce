@@ -442,6 +442,7 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
     let mut stale_closed = 0usize;
     let mut duplicates_closed = 0usize;
     let mut unmapped_removed = 0usize;
+    let mut mapping_errors = 0usize;
     for entry in remembered.iter().filter(|entry| {
         requested_workspace
             .as_deref()
@@ -502,8 +503,10 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
                 continue;
             }
             Err(_) => {
-                failed += 1;
-                continue;
+                // Keep the remembered record. A network/auth/timeout during the
+                // client-view probe must not leave session-restored empty shells
+                // in place; the live pane can surface the error instead.
+                mapping_errors += 1;
             }
         }
         let Some(workspace) = matching_workspace(entry, &panes) else {
@@ -656,7 +659,7 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
     }
 
     println!(
-        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, duplicates-closed={duplicates_closed}, unmapped-removed={unmapped_removed}, unavailable={unavailable}, failed={failed}"
+        "Herdr Perforce pane restore: restored={restored}, already-open={already_open}, stale-closed={stale_closed}, duplicates-closed={duplicates_closed}, unmapped-removed={unmapped_removed}, unavailable={unavailable}, mapping-errors={mapping_errors}, failed={failed}"
     );
     if failed == 0 {
         ExitCode::SUCCESS
@@ -1422,6 +1425,19 @@ mod tests {
                 .map(|pair| pair[1].as_str()),
             Some("w1")
         );
+    }
+
+    #[test]
+    fn mapping_query_errors_still_restore_corpse_panes() {
+        assert!(restore_opens_after_mapping_check(Ok(true)));
+        assert!(!restore_opens_after_mapping_check(Ok(false)));
+        assert!(restore_opens_after_mapping_check(Err(
+            "Connect to server failed; check $P4PORT."
+        )));
+    }
+
+    fn restore_opens_after_mapping_check(mapped: Result<bool, &str>) -> bool {
+        mapped != Ok(false)
     }
 
     #[test]

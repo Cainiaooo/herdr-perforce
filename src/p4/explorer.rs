@@ -57,12 +57,22 @@ pub struct LoadedDirectory {
     pub truncated: bool,
 }
 
+/// One `p4 where` path for client-view membership.
+///
+/// Recursive `cwd/...` expands to every mapped file under a game workspace and
+/// blows restore/startup timeouts and stdout budgets. `p4 where` classifies a
+/// directory without listing descendants.
+#[must_use]
+pub fn client_view_probe_path(cwd: &Path) -> PathBuf {
+    cwd.to_path_buf()
+}
+
 pub fn cwd_is_in_client_view<T: P4Transport>(
     client: &P4Client<T>,
     cwd: &Path,
 ) -> Result<bool, P4Error> {
     match client.run(&P4Query::Where {
-        path: cwd.join("..."),
+        path: client_view_probe_path(cwd),
     }) {
         Ok(response) => Ok(response.records.iter().any(|record| {
             matches!(record.code, RecordCode::Stat) && record.field("depotFile").is_some()
@@ -1085,6 +1095,37 @@ mod tests {
         );
         let mapped = cwd_is_in_client_view(&client, Path::new("C:/Example")).expect("classified");
         assert!(!mapped);
+    }
+
+    #[test]
+    fn cwd_view_probe_queries_the_cwd_not_the_recursive_tree() {
+        let fake = FakeP4Transport::default();
+        fake.push_output(RawP4Output {
+            stdout: br#"{"code":"stat","depotFile":"//depot/Example"}"#.to_vec(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            elapsed: Duration::from_millis(1),
+        });
+        let client = P4Client::new_with_directory_environment(
+            fake.clone(),
+            "p4",
+            PathBuf::from("C:/Example"),
+            BTreeMap::new(),
+        );
+        assert!(cwd_is_in_client_view(&client, Path::new("C:/Example")).expect("mapped"));
+        let args = &fake.requests()[0].args;
+        assert_eq!(args[2], "where");
+        assert_eq!(args[3], "C:/Example");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.to_string_lossy().ends_with("...")),
+            "recursive where would exceed restore budgets on large workspaces"
+        );
+        assert_eq!(
+            client_view_probe_path(Path::new(r"E:\Project\NeonGame")),
+            PathBuf::from(r"E:\Project\NeonGame")
+        );
     }
 
     #[test]

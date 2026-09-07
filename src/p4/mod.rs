@@ -28,8 +28,9 @@ pub use description::{
 pub use env::{herdr_control_variable_names, is_herdr_control_variable};
 pub use error::{P4Error, P4ErrorKind};
 pub use explorer::{
-    ExplorerError, LoadedDirectory, cwd_is_in_client_view, decorate_entries, list_local_directory,
-    load_explorer_directory, load_opened_records, load_workspace_diff, read_workspace_preview,
+    ExplorerError, LoadedDirectory, client_view_probe_path, cwd_is_in_client_view,
+    decorate_entries, list_local_directory, load_explorer_directory, load_opened_records,
+    load_workspace_diff, read_workspace_preview,
 };
 pub use level_b::{
     LevelBError, LevelBIdentitySummary, LevelBReport, LevelBSampleStatus, LevelBWhereStatus,

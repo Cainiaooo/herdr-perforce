@@ -7,6 +7,7 @@ use crate::domain::ChangelistId;
 use super::{
     P4Query,
     error::{P4Error, P4ErrorKind},
+    explorer::client_view_probe_path,
     parser::{
         DomainMappingError, RecordCode, changed_files_from_opened, changelist_from_describe,
         changelists_from_changes, workspace_from_info,
@@ -205,7 +206,7 @@ pub fn run_level_b_read_only<T: P4Transport>(
     };
 
     let where_status = match client.run(&P4Query::Where {
-        path: cwd.join("..."),
+        path: client_view_probe_path(cwd),
     }) {
         Ok(response) => {
             let records = response
@@ -354,7 +355,7 @@ mod tests {
         assert_eq!(requests[1].args[5].to_string_lossy(), "8");
         assert_eq!(
             requests[4].args[3],
-            Path::new("C:/Secret Workspace").join("...").as_os_str()
+            Path::new("C:/Secret Workspace").as_os_str()
         );
         assert!(requests.iter().all(|request| request.stdin.is_empty()));
     }
@@ -381,7 +382,7 @@ mod tests {
         assert_eq!(fake.requests().len(), 3);
         assert_eq!(
             fake.requests()[2].args[3],
-            Path::new("D:/Outside").join("...").as_os_str()
+            Path::new("D:/Outside").as_os_str()
         );
         assert_eq!(fake.remaining_steps(), 0);
     }
