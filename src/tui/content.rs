@@ -789,6 +789,68 @@ pub fn rightmost_pane_id<'a>(
     })
 }
 
+pub fn layout_tab_id(layout: &Value) -> Option<&str> {
+    layout
+        .pointer("/result/layout/tab_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Panes whose left edge is at or past `pane_id`'s right edge.
+/// Sorted left-to-right, then top-to-bottom.
+pub fn panes_right_of(layout: &Value, pane_id: &str) -> Vec<String> {
+    let Some(nav) = pane_rect(layout, pane_id) else {
+        return Vec::new();
+    };
+    let Some(panes) = layout
+        .pointer("/result/layout/panes")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut found = panes
+        .iter()
+        .filter_map(|pane| {
+            let id = pane.get("pane_id").and_then(Value::as_str)?;
+            if id == pane_id {
+                return None;
+            }
+            let rect = rect_from(pane.get("rect")?)?;
+            (rect.x + LAYOUT_EPSILON >= nav.right() && rect.vertically_overlaps(nav))
+                .then(|| (rect.x, rect.y, id.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    found.sort_by_key(|(x, y, _)| (*x, *y));
+    found.into_iter().map(|(_, _, id)| id).collect()
+}
+
+pub fn navigation_is_right_docked(layout: &Value, pane_id: &str) -> bool {
+    let Some(nav) = pane_rect(layout, pane_id) else {
+        return false;
+    };
+    let Some(area) = layout.pointer("/result/layout/area").and_then(rect_from) else {
+        return false;
+    };
+    nav.height + LAYOUT_EPSILON >= area.height && panes_right_of(layout, pane_id).is_empty()
+}
+
+pub fn leftmost_pane_id(layout: &Value, excluding: &str) -> Option<String> {
+    layout
+        .pointer("/result/layout/panes")?
+        .as_array()?
+        .iter()
+        .filter_map(|pane| {
+            let id = pane.get("pane_id").and_then(Value::as_str)?;
+            if id == excluding {
+                return None;
+            }
+            let rect = rect_from(pane.get("rect")?)?;
+            Some((rect.x, rect.y, id.to_owned()))
+        })
+        .min_by_key(|(x, y, _)| (*x, *y))
+        .map(|(_, _, id)| id)
+}
+
 pub fn persist_navigator_share_from_host(workspace_cwd: &Path) {
     let Some(pane_id) = own_pane_id() else {
         return;
@@ -2515,6 +2577,42 @@ mod tests {
             rightmost_pane_id(&layout, ["w:left", "w:right"]),
             Some("w:right")
         );
+    }
+
+    #[test]
+    fn panes_right_of_a_middle_navigation_pane_are_the_crushed_stack() {
+        let layout = json!({"result":{"layout":{
+            "area":{"x":0,"y":0,"width":254,"height":69},
+            "tab_id":"w7:t1",
+            "panes":[
+                {"pane_id":"w7:p1W","rect":{"x":0,"y":0,"width":115,"height":69}},
+                {"pane_id":"w7:p2E","rect":{"x":115,"y":0,"width":114,"height":69}},
+                {"pane_id":"w7:p26","rect":{"x":229,"y":0,"width":25,"height":19}},
+                {"pane_id":"w7:p27","rect":{"x":229,"y":19,"width":25,"height":50}}
+            ]
+        }}});
+        assert_eq!(panes_right_of(&layout, "w7:p2E"), ["w7:p26", "w7:p27"]);
+        assert!(!navigation_is_right_docked(&layout, "w7:p2E"));
+        assert_eq!(
+            leftmost_pane_id(&layout, "w7:p2E").as_deref(),
+            Some("w7:p1W")
+        );
+        assert_eq!(layout_tab_id(&layout), Some("w7:t1"));
+    }
+
+    #[test]
+    fn right_docked_full_height_navigation_has_no_panes_to_its_right() {
+        let layout = json!({"result":{"layout":{
+            "area":{"x":0,"y":0,"width":254,"height":69},
+            "tab_id":"w1:t1",
+            "panes":[
+                {"pane_id":"w1:p8X","rect":{"x":0,"y":0,"width":210,"height":69}},
+                {"pane_id":"w1:p94","rect":{"x":210,"y":0,"width":44,"height":69}}
+            ]
+        }}});
+        assert!(panes_right_of(&layout, "w1:p94").is_empty());
+        assert!(navigation_is_right_docked(&layout, "w1:p94"));
+        assert!(!navigation_is_right_docked(&layout, "w1:p8X"));
     }
 
     #[test]

@@ -307,14 +307,11 @@ pub fn workspace_layout_exists(
         return Err("workspace layout cwd is invalid");
     }
     let path = workspace_layout_path(state_dir, workspace_cwd);
-    if !path.exists() {
-        return Ok(false);
+    if path.exists() {
+        parsed_workspace_layout(&path, workspace_cwd)?;
+        return Ok(true);
     }
-    let state = parse_workspace_layout(&path)?;
-    if !paths_equal(&state.workspace_cwd, workspace_cwd) {
-        return Err("workspace layout identity does not match its file");
-    }
-    Ok(true)
+    Ok(matching_layout_file(state_dir, workspace_cwd)?.is_some())
 }
 
 pub fn load_content_request(state_dir: Option<&Path>, workspace_cwd: &Path) -> Option<String> {
@@ -367,18 +364,42 @@ fn update_workspace_layout(
     let path = workspace_layout_path(state_dir, workspace_cwd);
     let mut entry = load_workspace_layout(state_dir, workspace_cwd)?;
     update(&mut entry);
+    entry.workspace_cwd = normalize_workspace_cwd(workspace_cwd);
     write_layout_state(&path, &entry)
 }
 
 fn workspace_layout_path(state_dir: &Path, workspace_cwd: &Path) -> PathBuf {
-    let path = strip_verbatim_prefix(workspace_cwd);
-    let text = path.to_string_lossy();
-    #[cfg(windows)]
-    let identity = text.replace('/', "\\").to_ascii_lowercase();
-    #[cfg(not(windows))]
-    let identity = text.into_owned();
-    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    let digest = blake3::hash(layout_identity_key(workspace_cwd).as_bytes()).to_hex();
     state_dir.join(format!("layout-{digest}.json"))
+}
+
+fn layout_identity_key(workspace_cwd: &Path) -> String {
+    let text = normalize_workspace_cwd(workspace_cwd)
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(windows)]
+    {
+        text.replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        text
+    }
+}
+
+fn normalize_workspace_cwd(workspace_cwd: &Path) -> PathBuf {
+    let path = strip_verbatim_prefix(workspace_cwd);
+    let mut text = path.to_string_lossy().into_owned();
+    while text.len() > 1 && (text.ends_with('\\') || text.ends_with('/')) {
+        let drive_root = text.len() == 3
+            && text.as_bytes().get(1) == Some(&b':')
+            && (text.ends_with('\\') || text.ends_with('/'));
+        if drive_root {
+            break;
+        }
+        text.pop();
+    }
+    PathBuf::from(text)
 }
 
 fn load_workspace_layout(
@@ -390,11 +411,10 @@ fn load_workspace_layout(
     }
     let path = workspace_layout_path(state_dir, workspace_cwd);
     if path.exists() {
-        let state = parse_workspace_layout(&path)?;
-        if !paths_equal(&state.workspace_cwd, workspace_cwd) {
-            return Err("workspace layout identity does not match its file");
-        }
-        return Ok(state);
+        return parsed_workspace_layout(&path, workspace_cwd);
+    }
+    if let Some(legacy_identity) = matching_layout_file(state_dir, workspace_cwd)? {
+        return parsed_workspace_layout(&legacy_identity, workspace_cwd);
     }
     let legacy_path = state_dir.join(LAYOUT_FILE);
     let navigator_share = legacy_path
@@ -402,11 +422,58 @@ fn load_workspace_layout(
         .then(|| parse_legacy_navigator_share(&legacy_path))
         .transpose()?;
     Ok(WorkspaceLayoutState {
-        workspace_cwd: strip_verbatim_prefix(workspace_cwd),
+        workspace_cwd: normalize_workspace_cwd(workspace_cwd),
         navigator_share,
         content_request: None,
         navigation_view: None,
     })
+}
+
+fn parsed_workspace_layout(
+    path: &Path,
+    workspace_cwd: &Path,
+) -> Result<WorkspaceLayoutState, &'static str> {
+    let mut state = parse_workspace_layout(path)?;
+    if !paths_equal(&state.workspace_cwd, workspace_cwd) {
+        return Err("workspace layout identity does not match its file");
+    }
+    state.workspace_cwd = normalize_workspace_cwd(workspace_cwd);
+    Ok(state)
+}
+
+fn matching_layout_file(
+    state_dir: &Path,
+    workspace_cwd: &Path,
+) -> Result<Option<PathBuf>, &'static str> {
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return Ok(None);
+    };
+    let canonical = workspace_layout_path(state_dir, workspace_cwd);
+    let mut found = None;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !name.starts_with("layout-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(state) = parse_workspace_layout(&path) else {
+            continue;
+        };
+        if !paths_equal(&state.workspace_cwd, workspace_cwd) {
+            continue;
+        }
+        if path == canonical {
+            return Ok(Some(path));
+        }
+        found = Some(path);
+    }
+    Ok(found)
 }
 
 fn write_layout_state(path: &Path, state: &WorkspaceLayoutState) -> Result<(), &'static str> {
@@ -1510,6 +1577,25 @@ mod tests {
             load_navigator_share(Some(&root), &other),
             DEFAULT_NAVIGATION_SHARE
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trailing_slash_workspace_cwd_reuses_the_same_layout_file() {
+        let root = temp_dir("layout-slash");
+        let neon = PathBuf::from(r"G:\Projects\NeonPerf\NeonGame");
+        let slashed = PathBuf::from(r"G:\Projects\NeonPerf\NeonGame\");
+        save_navigator_share(&root, &slashed, 0.216).expect("save slashed");
+        assert!(workspace_layout_exists(&root, &neon).expect("exists"));
+        assert!((load_navigator_share(Some(&root), &neon) - 0.216).abs() < 1e-9);
+        assert_eq!(
+            workspace_layout_path(&root, &neon),
+            workspace_layout_path(&root, &slashed)
+        );
+        save_content_request(&root, &neon, Some(r#"{"version":1,"kind":"file"}"#))
+            .expect("save canonical");
+        assert!(load_content_request(Some(&root), &slashed).is_some());
         fs::remove_dir_all(root).ok();
     }
 

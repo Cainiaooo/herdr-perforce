@@ -72,9 +72,9 @@ use self::explorer::{
 use self::review_tree::{ReviewActivation, ReviewRowKind, ReviewTreeModel};
 
 pub use self::content::{
-    navigation_resize_args_for_layout, navigation_resize_args_for_share,
-    navigation_share_from_layout, restore_content_pane, rightmost_pane_id, run_content_pane,
-    viewer_process_is_active,
+    layout_tab_id, leftmost_pane_id, navigation_is_right_docked, navigation_resize_args_for_layout,
+    navigation_resize_args_for_share, navigation_share_from_layout, panes_right_of,
+    restore_content_pane, rightmost_pane_id, run_content_pane, viewer_process_is_active,
 };
 
 const MAX_VISIBLE_CHANGELISTS: u16 = 4_096;

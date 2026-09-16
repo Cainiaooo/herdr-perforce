@@ -17,8 +17,9 @@ use herdr_perforce::panel_restore::{
     save_navigator_share, workspace_layout_exists,
 };
 use herdr_perforce::tui::{
-    navigation_resize_args_for_share, navigation_share_from_layout, restore_content_pane,
-    rightmost_pane_id, viewer_process_is_active,
+    layout_tab_id, leftmost_pane_id, navigation_is_right_docked, navigation_resize_args_for_share,
+    navigation_share_from_layout, panes_right_of, restore_content_pane, rightmost_pane_id,
+    viewer_process_is_active,
 };
 use serde_json::Value;
 
@@ -585,13 +586,14 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
                 )
                 .ok();
             }
-            resize_navigation_pane_id(&executable, &keep, &entry.workspace_cwd);
-            if leftover_cleanup.failed == 0
-                && session_content_cleanup.failed == 0
-                && restore_workspace_content(state_dir.as_deref(), entry, &keep).is_err()
-            {
-                failed += 1;
+            let parked = dock_and_resize_navigation(&executable, &keep, &entry.workspace_cwd);
+            if leftover_cleanup.failed == 0 && session_content_cleanup.failed == 0 {
+                if let Err(error) = restore_workspace_content(state_dir.as_deref(), entry, &keep) {
+                    eprintln!("Herdr Perforce content pane restore failed: {error}");
+                    failed += 1;
+                }
             }
+            finish_navigation_layout(&executable, &keep, &entry.workspace_cwd, &parked);
             already_open += 1;
             continue;
         }
@@ -629,32 +631,35 @@ fn restore_herdr_panes(requested_workspace: Option<PathBuf>) -> ExitCode {
                 continue;
             }
         };
-        resize_opened_navigation_pane(&executable, &output.stdout, &entry.workspace_cwd);
+        let pane_id = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .as_ref()
+            .and_then(opened_pane_id)
+            .map(ToOwned::to_owned);
+        let parked = pane_id
+            .as_deref()
+            .map(|pane_id| dock_and_resize_navigation(&executable, pane_id, &entry.workspace_cwd))
+            .unwrap_or_default();
         restored += 1;
-        if let (Some(state_dir), Ok(response)) = (
-            state_dir.as_deref(),
-            serde_json::from_slice::<Value>(&output.stdout),
-        ) {
-            let pane_id = opened_pane_id(&response);
+        if let (Some(state_dir), Some(pane_id)) = (state_dir.as_deref(), pane_id.as_deref()) {
             if remember_workspace(
                 state_dir,
                 &entry.cwd,
                 &entry.workspace_cwd,
                 Some(&workspace.id),
-                pane_id,
+                Some(pane_id),
             )
             .is_err()
             {
                 failed += 1;
             }
         }
-        if let Some(pane_id) = serde_json::from_slice::<Value>(&output.stdout)
-            .ok()
-            .as_ref()
-            .and_then(opened_pane_id)
-            && restore_workspace_content(state_dir.as_deref(), entry, pane_id).is_err()
-        {
-            failed += 1;
+        if let Some(pane_id) = pane_id.as_deref() {
+            if let Err(error) = restore_workspace_content(state_dir.as_deref(), entry, pane_id) {
+                eprintln!("Herdr Perforce content pane restore failed: {error}");
+                failed += 1;
+            }
+            finish_navigation_layout(&executable, pane_id, &entry.workspace_cwd, &parked);
         }
     }
 
@@ -723,7 +728,125 @@ fn resize_opened_navigation_pane(executable: &OsStr, stdout: &[u8], workspace_cw
     else {
         return;
     };
-    resize_navigation_pane_id(executable, &pane_id, workspace_cwd);
+    let parked = dock_and_resize_navigation(executable, &pane_id, workspace_cwd);
+    finish_navigation_layout(executable, &pane_id, workspace_cwd, &parked);
+}
+
+fn dock_and_resize_navigation(
+    executable: &OsStr,
+    pane_id: &str,
+    workspace_cwd: &Path,
+) -> Vec<String> {
+    let parked = park_panes_right_of_navigation(executable, pane_id);
+    resize_navigation_pane_id(executable, pane_id, workspace_cwd);
+    parked
+}
+
+fn finish_navigation_layout(
+    executable: &OsStr,
+    pane_id: &str,
+    workspace_cwd: &Path,
+    parked: &[String],
+) {
+    restore_parked_user_panes(executable, pane_id, parked);
+    resize_navigation_pane_id(executable, pane_id, workspace_cwd);
+}
+
+fn park_panes_right_of_navigation(executable: &OsStr, pane_id: &str) -> Vec<String> {
+    let Ok(layout) = run_herdr_json(executable, &herdr_navigation_layout_args(pane_id)) else {
+        return Vec::new();
+    };
+    if navigation_is_right_docked(&layout, pane_id) {
+        return Vec::new();
+    }
+    panes_right_of(&layout, pane_id)
+        .into_iter()
+        .filter(|id| move_pane_to_new_tab(executable, id))
+        .collect()
+}
+
+fn restore_parked_user_panes(executable: &OsStr, navigation_pane: &str, parked: &[String]) {
+    if parked.is_empty() {
+        return;
+    }
+    let Ok(layout) = run_herdr_json(executable, &herdr_navigation_layout_args(navigation_pane))
+    else {
+        return;
+    };
+    let Some(tab_id) = layout_tab_id(&layout).map(ToOwned::to_owned) else {
+        return;
+    };
+    let Some(leftmost) = leftmost_pane_id(&layout, navigation_pane) else {
+        return;
+    };
+    let mut anchor = None;
+    for pane_id in parked {
+        let (target, direction) = match anchor.as_deref() {
+            Some(anchor) => (anchor, "down"),
+            None => (leftmost.as_str(), "right"),
+        };
+        if !move_pane_into_split(executable, pane_id, &tab_id, target, direction) {
+            continue;
+        }
+        if anchor.is_none() {
+            anchor = Some(pane_id.clone());
+        }
+    }
+}
+
+fn move_pane_to_new_tab(executable: &OsStr, pane_id: &str) -> bool {
+    ProcessCommand::new(executable)
+        .args(herdr_pane_move_new_tab_args(pane_id))
+        .output()
+        .is_ok_and(|output| herdr_output_succeeded(&output))
+}
+
+fn move_pane_into_split(
+    executable: &OsStr,
+    pane_id: &str,
+    tab_id: &str,
+    target_pane: &str,
+    direction: &str,
+) -> bool {
+    ProcessCommand::new(executable)
+        .args(herdr_pane_move_split_args(
+            pane_id,
+            tab_id,
+            target_pane,
+            direction,
+        ))
+        .output()
+        .is_ok_and(|output| herdr_output_succeeded(&output))
+}
+
+fn herdr_pane_move_new_tab_args(pane_id: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("pane"),
+        OsString::from("move"),
+        OsString::from(pane_id),
+        OsString::from("--new-tab"),
+        OsString::from("--no-focus"),
+    ]
+}
+
+fn herdr_pane_move_split_args(
+    pane_id: &str,
+    tab_id: &str,
+    target_pane: &str,
+    direction: &str,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("pane"),
+        OsString::from("move"),
+        OsString::from(pane_id),
+        OsString::from("--tab"),
+        OsString::from(tab_id),
+        OsString::from("--split"),
+        OsString::from(direction),
+        OsString::from("--target-pane"),
+        OsString::from(target_pane),
+        OsString::from("--no-focus"),
+    ]
 }
 
 fn resize_navigation_pane_id(executable: &OsStr, pane_id: &str, workspace_cwd: &Path) {
@@ -929,11 +1052,11 @@ fn restore_workspace_content(
     state_dir: Option<&Path>,
     entry: &RememberedWorkspace,
     navigation_pane: &str,
-) -> Result<(), ()> {
+) -> Result<(), String> {
     let Some(request) = load_content_request(state_dir, &entry.workspace_cwd) else {
         return Ok(());
     };
-    restore_content_pane(navigation_pane, &entry.cwd, &request).map_err(|_| ())
+    restore_content_pane(navigation_pane, &entry.cwd, &request)
 }
 
 fn close_restored_pane(executable: &OsStr, pane_id: &str) -> bool {
@@ -1424,6 +1547,37 @@ mod tests {
                 .find(|pair| pair[0] == "--workspace")
                 .map(|pair| pair[1].as_str()),
             Some("w1")
+        );
+    }
+
+    #[test]
+    fn dock_repair_moves_obstructing_panes_through_a_temporary_tab() {
+        let bounce = herdr_pane_move_new_tab_args("w7:p26")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bounce,
+            ["pane", "move", "w7:p26", "--new-tab", "--no-focus"]
+        );
+        let restore = herdr_pane_move_split_args("w7:p26", "w7:t1", "w7:p1W", "right")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restore,
+            [
+                "pane",
+                "move",
+                "w7:p26",
+                "--tab",
+                "w7:t1",
+                "--split",
+                "right",
+                "--target-pane",
+                "w7:p1W",
+                "--no-focus"
+            ]
         );
     }
 
