@@ -57,14 +57,22 @@ pub struct LoadedDirectory {
     pub truncated: bool,
 }
 
+/// Synthetic child used by [`client_view_probe_path`].
+///
+/// `p4 where` maps this path when `cwd/...` is in the view, even if `cwd`
+/// itself is not a mapped depot file. The file does not need to exist.
+const CLIENT_VIEW_PROBE_FILE: &str = "__herdr_p4_probe__";
+
 /// One `p4 where` path for client-view membership.
 ///
 /// Recursive `cwd/...` expands to every mapped file under a game workspace and
-/// blows restore/startup timeouts and stdout budgets. `p4 where` classifies a
-/// directory without listing descendants.
+/// blows restore/startup timeouts and stdout budgets. `p4 where` on the
+/// directory itself is also wrong: some stream views map `dir/...` but not
+/// `dir`, so they report "file(s) not in client view" for a mapped workspace.
+/// A single synthetic child path is one mapping record either way.
 #[must_use]
 pub fn client_view_probe_path(cwd: &Path) -> PathBuf {
-    cwd.to_path_buf()
+    cwd.join(CLIENT_VIEW_PROBE_FILE)
 }
 
 pub fn cwd_is_in_client_view<T: P4Transport>(
@@ -1098,10 +1106,10 @@ mod tests {
     }
 
     #[test]
-    fn cwd_view_probe_queries_the_cwd_not_the_recursive_tree() {
+    fn cwd_view_probe_queries_a_single_child_path_not_the_recursive_tree() {
         let fake = FakeP4Transport::default();
         fake.push_output(RawP4Output {
-            stdout: br#"{"code":"stat","depotFile":"//depot/Example"}"#.to_vec(),
+            stdout: br#"{"code":"stat","depotFile":"//depot/Example/__herdr_p4_probe__"}"#.to_vec(),
             stderr: Vec::new(),
             exit_code: 0,
             elapsed: Duration::from_millis(1),
@@ -1114,8 +1122,9 @@ mod tests {
         );
         assert!(cwd_is_in_client_view(&client, Path::new("C:/Example")).expect("mapped"));
         let args = &fake.requests()[0].args;
+        let expected = PathBuf::from("C:/Example").join(CLIENT_VIEW_PROBE_FILE);
         assert_eq!(args[2], "where");
-        assert_eq!(args[3], "C:/Example");
+        assert_eq!(args[3], expected.as_os_str());
         assert!(
             !args
                 .iter()
@@ -1124,7 +1133,11 @@ mod tests {
         );
         assert_eq!(
             client_view_probe_path(Path::new(r"E:\Project\NeonGame")),
-            PathBuf::from(r"E:\Project\NeonGame")
+            PathBuf::from(r"E:\Project\NeonGame").join(CLIENT_VIEW_PROBE_FILE)
+        );
+        assert_eq!(
+            client_view_probe_path(Path::new(r"E:\Project\NeonGame\")),
+            PathBuf::from(r"E:\Project\NeonGame\").join(CLIENT_VIEW_PROBE_FILE)
         );
     }
 

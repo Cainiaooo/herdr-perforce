@@ -78,7 +78,7 @@ cargo run -- level-b --read-only
 cargo run -- level-b --read-only --cwd <mapped-workspace-path>
 ```
 
-`--read-only` 是必需的显式确认。相对 `--cwd` 会相对进程目录拼接为绝对路径，不 `canonicalize`。runner 固定限制 pending 查询最多返回 8 条，只对其中一条执行 `describe -s` 与 `opened -c`，并对 `<cwd>/...` 执行 `where`（探测 client view 内的路径，而不是 workspace 根目录本身）；输出中的 server、user 和 client 仅显示域分离的短指纹，不输出 changelist 编号、描述、文件名或本地路径。任何连接、认证、权限或解析错误都会停止，不尝试其他 P4 配置；cwd 未映射或 `where` 没有 Stat mapping record 则记录为 `completed-with-skip`。
+`--read-only` 是必需的显式确认。相对 `--cwd` 会相对进程目录拼接为绝对路径，不 `canonicalize`。runner 固定限制 pending 查询最多返回 8 条，只对其中一条执行 `describe -s` 与 `opened -c`，并对 `<cwd>/__herdr_p4_probe__` 执行 `where`（探测 client view 内的一条路径，而不是 workspace 根目录本身，也避免 `cwd/...` 展开整棵树）；输出中的 server、user 和 client 仅显示域分离的短指纹，不输出 changelist 编号、描述、文件名或本地路径。任何连接、认证、权限或解析错误都会停止，不尝试其他 P4 配置；cwd 未映射或 `where` 没有 Stat mapping record 则记录为 `completed-with-skip`。
 
 ### 2.3 Level C：一次性 loopback `p4d`
 
